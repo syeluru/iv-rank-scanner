@@ -1,0 +1,213 @@
+/* Schwab Trade Confirm - Overlay Styles */
+
+#schwab-confirm-overlay {
+  position: fixed !important;
+  top: 0 !important;
+  left: 0 !important;
+  width: 100vw !important;
+  height: 100vh !important;
+  background: rgba(0, 0, 0, 0.7) !important;
+  z-index: 2147483647 !important;
+  display: flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif !important;
+}
+
+.schwab-confirm-modal {
+  background: #1a1a2e !important;
+  border-radius: 12px !important;
+  padding: 0 !important;
+  max-width: 420px !important;
+  width: 90% !important;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5) !important;
+  overflow: hidden !important;
+  animation: schwab-slide-in 0.2s ease-out !important;
+}
+
+@keyframes schwab-slide-in {
+  from {
+    transform: translateY(-20px) scale(0.95);
+    opacity: 0;
+  }
+  to {
+    transform: translateY(0) scale(1);
+    opacity: 1;
+  }
+}
+
+/* Danger level borders */
+.schwab-confirm-modal.schwab-confirm-danger-high {
+  border: 2px solid #ff3333 !important;
+}
+
+.schwab-confirm-modal.schwab-confirm-danger-medium {
+  border: 2px solid #ff9900 !important;
+}
+
+.schwab-confirm-modal.schwab-confirm-danger-low {
+  border: 2px solid #4488ff !important;
+}
+
+/* Header */
+.schwab-confirm-header {
+  padding: 16px 20px !important;
+  display: flex !important;
+  align-items: center !important;
+  gap: 10px !important;
+}
+
+.schwab-confirm-danger-high .schwab-confirm-header {
+  background: linear-gradient(135deg, #660000, #990000) !important;
+}
+
+.schwab-confirm-danger-medium .schwab-confirm-header {
+  background: linear-gradient(135deg, #664400, #995500) !important;
+}
+
+.schwab-confirm-danger-low .schwab-confirm-header {
+  background: linear-gradient(135deg, #003366, #004488) !important;
+}
+
+.schwab-confirm-icon {
+  font-size: 24px !important;
+}
+
+.schwab-confirm-title {
+  font-size: 16px !important;
+  font-weight: 700 !important;
+  color: #ffffff !important;
+  letter-spacing: 1px !important;
+}
+
+/* Body */
+.schwab-confirm-body {
+  padding: 20px !important;
+}
+
+.schwab-confirm-label {
+  font-size: 13px !important;
+  color: #aaaacc !important;
+  margin-bottom: 8px !important;
+}
+
+.schwab-confirm-target {
+  background: #0d0d1a !important;
+  border-radius: 8px !important;
+  padding: 12px 16px !important;
+  display: flex !important;
+  flex-direction: column !important;
+  gap: 6px !important;
+}
+
+.schwab-confirm-type {
+  font-size: 11px !important;
+  color: #6666aa !important;
+  text-transform: uppercase !important;
+  letter-spacing: 1px !important;
+  font-weight: 600 !important;
+}
+
+.schwab-confirm-text {
+  font-size: 15px !important;
+  color: #ffffff !important;
+  font-weight: 500 !important;
+  word-break: break-word !important;
+}
+
+.schwab-confirm-warning {
+  margin-top: 14px !important;
+  padding: 10px 14px !important;
+  background: rgba(255, 50, 50, 0.15) !important;
+  border-left: 3px solid #ff3333 !important;
+  border-radius: 4px !important;
+  font-size: 13px !important;
+  color: #ff6666 !important;
+  font-weight: 600 !important;
+}
+
+/* Footer */
+.schwab-confirm-footer {
+  padding: 16px 20px !important;
+  display: flex !important;
+  gap: 12px !important;
+  justify-content: flex-end !important;
+  background: rgba(0, 0, 0, 0.2) !important;
+}
+
+.schwab-confirm-cancel {
+  padding: 10px 20px !important;
+  border: 1px solid #444466 !important;
+  background: transparent !important;
+  color: #aaaacc !important;
+  border-radius: 6px !important;
+  cursor: pointer !important;
+  font-size: 14px !important;
+  font-weight: 500 !important;
+  transition: all 0.15s !important;
+}
+
+.schwab-confirm-cancel:hover {
+  background: #2a2a44 !important;
+  color: #ffffff !important;
+}
+
+.schwab-confirm-ok {
+  padding: 10px 20px !important;
+  border: none !important;
+  border-radius: 6px !important;
+  cursor: pointer !important;
+  font-size: 14px !important;
+  font-weight: 600 !important;
+  transition: all 0.15s !important;
+  color: #ffffff !important;
+}
+
+.schwab-confirm-ok:disabled {
+  opacity: 0.4 !important;
+  cursor: not-allowed !important;
+  background: #333355 !important;
+}
+
+.schwab-confirm-ok.schwab-confirm-ready {
+  opacity: 1 !important;
+  cursor: pointer !important;
+}
+
+.schwab-confirm-ok.schwab-confirm-danger-high {
+  background: #cc2222 !important;
+}
+
+.schwab-confirm-ok.schwab-confirm-danger-high.schwab-confirm-ready:hover {
+  background: #ff3333 !important;
+}
+
+.schwab-confirm-ok.schwab-confirm-danger-medium {
+  background: #cc7700 !important;
+}
+
+.schwab-confirm-ok.schwab-confirm-danger-medium.schwab-confirm-ready:hover {
+  background: #ff9900 !important;
+}
+
+.schwab-confirm-ok.schwab-confirm-danger-low {
+  background: #2266cc !important;
+}
+
+.schwab-confirm-ok.schwab-confirm-danger-low.schwab-confirm-ready:hover {
+  background: #3388ff !important;
+}
+
+.schwab-confirm-countdown {
+  font-size: 12px !important;
+  opacity: 0.8 !important;
+}
+
+/* Highlight the target element */
+.schwab-confirm-highlight {
+  outline: 3px solid #ff3333 !important;
+  outline-offset: 2px !important;
+  box-shadow: 0 0 15px rgba(255, 50, 50, 0.4) !important;
+  position: relative !important;
+  z-index: 2147483646 !important;
+}
