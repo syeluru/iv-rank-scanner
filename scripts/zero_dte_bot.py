@@ -3,17 +3,28 @@
 0DTE Iron Condor Automated Trading Bot.
 
 Single-purpose bot that runs the full daily lifecycle:
-  11:25 AM  pre_flight_check()
-  11:30 AM  attempt_entry() -> wait_for_fill -> place TP -> monitor loop
-  Exit via: take-profit (native Schwab limit), stop-loss (bot-monitored),
-            or 3PM forced close (bot-monitored).
+  Pre-flight → Entry (v5/v4 dynamic or fixed-time) → Monitor → Exit
+
+Entry modes:
+  v5 dynamic (default): Scans 10:00-14:00 ET every 5 min using ML TP prediction
+                         models. Enters when P(hit 25% TP) >= threshold.
+                         Also shows P(hit 50% TP) for information.
+  v4 dynamic (fallback): Same scan loop but predicts P(profitable at 3PM close).
+                          Used when v5 models not loaded or --no-v5 flag set.
+  Fixed-time (fallback): Enters at BOT_ENTRY_TIME (noon ET) with v3 risk filter.
+                          Used when v4 model not loaded or --no-v4 flag set.
+
+Exit via: take-profit (native Schwab limit), stop-loss (bot-monitored),
+          SLTP trailing lock, or 3PM forced close (bot-monitored).
 
 Monitor mode: auto-detects multiple ICs from positions, monitors each with
 tiered TP/SL alerts (sound notifications + Schwab orders).
 
 Usage:
-  python scripts/zero_dte_bot.py --dry-run         # Paper: full time-based flow
+  python scripts/zero_dte_bot.py --dry-run         # Paper: v5 scan or fixed-time
   python scripts/zero_dte_bot.py --dry-run --skip-wait --skip-ml  # Instant test
+  python scripts/zero_dte_bot.py --dry-run --no-v5  # Force v4 or fixed-time entry
+  python scripts/zero_dte_bot.py --dry-run --no-v4  # Force fixed-time entry
   python scripts/zero_dte_bot.py --live             # Real money (careful!)
   python scripts/zero_dte_bot.py --monitor          # Auto-detect credits from orders
   python scripts/zero_dte_bot.py --monitor --credits 2.60,3.00  # Manual credits
@@ -187,10 +198,13 @@ class ZeroDTEBot:
 
     def __init__(self, dry_run: bool = True, skip_wait: bool = False, skip_ml: bool = False,
                  manual_strikes: tuple = None, monitor_mode: bool = False,
-                 monitor_credit: float = None, monitor_credits: list = None):
+                 monitor_credit: float = None, monitor_credits: list = None,
+                 no_v4: bool = False, no_v5: bool = False):
         self.dry_run = dry_run
         self.skip_wait = skip_wait
         self.skip_ml = skip_ml
+        self.no_v4 = no_v4
+        self.no_v5 = no_v5
         self.manual_strikes = manual_strikes  # (short_put, short_call) or None
         self.monitor_mode = monitor_mode
         self.monitor_credit = monitor_credit
@@ -208,6 +222,10 @@ class ZeroDTEBot:
         self.exit_reason = None
         self.portfolio_value = 0.0  # populated from Schwab at startup
 
+        # v4 entry timing state
+        self._v3_cached_confidence = None  # cache v3 day-level pre-screen
+        self._v4_daily_data_cache = None   # cache daily data for v4 features
+
         # Lazy-loaded components
         self._schwab_client = None
         self._predictor = None
@@ -220,6 +238,10 @@ class ZeroDTEBot:
             logger.info("Skip-wait enabled: bypassing time-based sleeping")
         if skip_ml:
             logger.info("Skip-ML enabled: bypassing ML confidence check")
+        if no_v5:
+            logger.info("v5 disabled: falling back to v4 or fixed-time entry")
+        if no_v4:
+            logger.info("v4 disabled: using fixed-time entry")
 
     @property
     def schwab_client(self):
@@ -301,14 +323,40 @@ class ZeroDTEBot:
                 logger.error("Pre-flight check failed. Aborting.")
                 return
 
-            # Step 2: Wait for entry time
-            if not self.skip_wait:
-                await self._wait_until(settings.BOT_ENTRY_TIME)
+            # Step 2+3: Entry — v5/v4 dynamic scanning or fixed-time
+            # Priority: v5 (TP models) → v4 (profitability) → fixed-time
+            use_v5 = (
+                settings.BOT_V5_ENABLED
+                and not self.no_v5
+                and not self.skip_ml
+                and self.predictor.v5_ready
+            )
+            use_v4 = (
+                not use_v5
+                and settings.BOT_V4_ENABLED
+                and not self.no_v4
+                and not self.skip_ml
+                and self.predictor.v4_ready
+            )
 
-            # Step 3: Attempt entry
-            if not await self.attempt_entry():
-                logger.warning("Entry attempt failed. No trade today.")
-                return
+            if use_v5 or use_v4:
+                version = "v5" if use_v5 else "v4"
+                logger.info(f"{version} entry timing enabled — scanning for optimal entry")
+                if not self.skip_wait:
+                    await self._wait_until(settings.BOT_V4_ENTRY_START)
+                entered = await self._entry_scan(use_v5=use_v5)
+                if not entered:
+                    logger.warning(f"{version} scan found no entry window. No trade today.")
+                    return
+            else:
+                # Fixed-time entry (original flow)
+                if not self.skip_ml:
+                    logger.info("ML scan models not loaded — using fixed-time entry")
+                if not self.skip_wait:
+                    await self._wait_until(settings.BOT_ENTRY_TIME)
+                if not await self.attempt_entry():
+                    logger.warning("Entry attempt failed. No trade today.")
+                    return
 
             # Step 4: Wait for entry fill
             filled = await self.wait_for_entry_fill()
@@ -457,7 +505,37 @@ class ZeroDTEBot:
             if not self.predictor.is_ready():
                 logger.error("ML model not loaded")
                 return False
-            logger.info(f"  ML model: loaded ({self.predictor.num_features} features) - OK")
+            logger.info(f"  ML v3 model: loaded ({self.predictor.num_features} features) - OK")
+
+            # v5 TP model status
+            if self.predictor.v5_ready and not self.no_v5 and settings.BOT_V5_ENABLED:
+                tp25_status = f"TP25={len(self.predictor.v5_tp25_feature_names)}f" if self.predictor.v5_tp25_ready else "TP25=N/A"
+                tp50_status = f"TP50={len(self.predictor.v5_tp50_feature_names)}f" if self.predictor.v5_tp50_ready else "TP50=N/A"
+                logger.info(f"  ML v5 model: loaded ({tp25_status}, {tp50_status}) - "
+                           f"scanning {settings.BOT_V4_ENTRY_START}-{settings.BOT_V4_ENTRY_END} ET")
+                # FOMC gate status
+                from ml.models.predictor import get_economic_calendar_features
+                cal = get_economic_calendar_features()
+                fomc_str = "FOMC DAY" if cal["is_fomc_day"] else ("FOMC week" if cal["is_fomc_week"] else "no FOMC")
+                logger.info(f"  FOMC gate: {'enabled' if settings.BOT_FOMC_GATE_ENABLED else 'disabled'} "
+                           f"({fomc_str}, skip_day={'ON' if settings.BOT_FOMC_SKIP_DAY else 'OFF'})")
+            elif self.no_v5:
+                logger.info("  ML v5 model: disabled (--no-v5 flag)")
+            elif not settings.BOT_V5_ENABLED:
+                logger.info("  ML v5 model: disabled (BOT_V5_ENABLED=False)")
+            else:
+                logger.info("  ML v5 model: not loaded — falling back to v4/fixed-time")
+
+            # v4 entry timing status
+            if self.predictor.v4_ready and not self.no_v4 and settings.BOT_V4_ENABLED:
+                logger.info(f"  ML v4 model: loaded ({len(self.predictor.v4_feature_names)} features) - "
+                           f"scanning {settings.BOT_V4_ENTRY_START}-{settings.BOT_V4_ENTRY_END} ET")
+            elif self.no_v4:
+                logger.info("  ML v4 model: disabled (--no-v4 flag)")
+            elif not settings.BOT_V4_ENABLED:
+                logger.info("  ML v4 model: disabled (BOT_V4_ENABLED=False)")
+            else:
+                logger.info("  ML v4 model: not loaded — using fixed-time entry")
         else:
             logger.info("  ML model: skipped (--skip-ml)")
 
@@ -483,9 +561,12 @@ class ZeroDTEBot:
         logger.info("--- Pre-flight Check PASSED ---")
         return True
 
-    async def attempt_entry(self) -> bool:
+    async def attempt_entry(self, chain: dict = None) -> bool:
         """
         Full entry flow: fetch chain -> ML prediction -> select strikes -> size -> place order.
+
+        Args:
+            chain: Optional pre-fetched option chain (from v4 scan). If None, fetches fresh.
 
         Returns True if entry order was placed, False otherwise.
         """
@@ -504,13 +585,16 @@ class ZeroDTEBot:
             logger.info(f"  Daily P&L: +${daily_pnl.realized_today:.2f}, "
                         f"need ${daily_pnl.remaining_to_target:.2f} more")
 
-        # Fetch 0DTE chain
-        chain = await self._fetch_0dte_chain()
-        if not chain:
-            return False
+        # Fetch 0DTE chain (skip if pre-fetched by v4 scan)
+        if chain is None:
+            chain = await self._fetch_0dte_chain()
+            if not chain:
+                return False
 
-        # ML prediction
-        if not self.skip_ml:
+        # ML prediction (skip if v4 already validated — v3 was pre-screened in _v4_entry_scan)
+        if self._v3_cached_confidence is not None:
+            logger.info(f"  ML v3 pre-screen: {self._v3_cached_confidence:.3f} (cached) - PASS")
+        elif not self.skip_ml:
             confidence = await self._run_ml_prediction(chain)
             if confidence is None:
                 logger.error("ML prediction failed")
@@ -712,6 +796,329 @@ class ZeroDTEBot:
         except Exception as e:
             logger.error(f"ML prediction error: {e}", exc_info=True)
             return None
+
+    # ===== v4 Entry Timing Methods =====
+
+    def _fetch_spx_5min_candles(self) -> 'pd.DataFrame | None':
+        """
+        Fetch today's SPX 5-min candles from ThetaData for v4 feature computation.
+
+        Uses the same /v3/index/history/ohlc endpoint as build_training_dataset.py.
+        Returns DataFrame with open/high/low/close columns, or None on error.
+        """
+        import pandas as pd
+        from datetime import date
+
+        today = date.today()
+
+        # Skip weekends (prevent forward-fill bug per memory notes)
+        if today.weekday() >= 5:
+            logger.warning("  Weekend: no intraday candles available")
+            return None
+
+        try:
+            url = "http://127.0.0.1:25503/v3/index/history/ohlc"
+            params = {
+                "symbol": "SPX",
+                "start_date": today.strftime("%Y%m%d"),
+                "end_date": today.strftime("%Y%m%d"),
+                "interval": "5m",
+                "start_time": "09:30:00",
+                "end_time": self._now_et().strftime("%H:%M:%S"),
+                "format": "json",
+            }
+
+            # Build URL with query params
+            query = "&".join(f"{k}={v}" for k, v in params.items())
+            full_url = f"{url}?{query}"
+
+            req = urllib.request.Request(full_url)
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read().decode())
+
+            response = data.get("response", data if isinstance(data, list) else [])
+
+            # Handle nested format
+            if response and isinstance(response[0], dict) and "data" in response[0]:
+                bars = []
+                for entry in response:
+                    for dp in entry.get("data", []):
+                        bars.append(dp)
+                response = bars
+
+            if not response:
+                logger.warning("  ThetaData returned no candle data")
+                return None
+
+            df = pd.DataFrame(response)
+
+            # Normalize column names (ThetaData may return various formats)
+            col_map = {}
+            for col in df.columns:
+                lower = col.lower()
+                if lower in ('open', 'high', 'low', 'close'):
+                    col_map[col] = lower
+            if col_map:
+                df = df.rename(columns=col_map)
+
+            # Ensure required columns exist
+            required = ['open', 'high', 'low', 'close']
+            if not all(c in df.columns for c in required):
+                logger.warning(f"  Candle data missing columns. Have: {list(df.columns)}")
+                return None
+
+            # Convert to float
+            for col in required:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+
+            # Drop NaN rows
+            df = df.dropna(subset=required)
+
+            if len(df) < 2:
+                logger.warning(f"  Only {len(df)} candle(s) — need at least 2")
+                return None
+
+            logger.debug(f"  Fetched {len(df)} 5-min SPX candles")
+            return df[required].reset_index(drop=True)
+
+        except Exception as e:
+            logger.warning(f"  Failed to fetch SPX candles from ThetaData: {e}")
+            return None
+
+    def _extract_atm_iv(self, chain: dict) -> float:
+        """
+        Extract ATM implied volatility from the option chain.
+
+        Averages the mid-IV of the nearest put and call to the underlying price.
+        Returns IV as a percentage (e.g. 15.0 for 15%).
+        """
+        underlying = chain.get('underlyingPrice', 0)
+        if not underlying:
+            return 15.0  # fallback
+
+        # Find nearest expiration
+        put_map = chain.get('putExpDateMap', {})
+        call_map = chain.get('callExpDateMap', {})
+        if not put_map or not call_map:
+            return 15.0
+
+        # Use first (nearest) expiration
+        put_strikes = next(iter(put_map.values()), {})
+        call_strikes = next(iter(call_map.values()), {})
+
+        # Find ATM strike (closest to underlying)
+        all_strikes = sorted(set(
+            [float(k) for k in put_strikes.keys()] +
+            [float(k) for k in call_strikes.keys()]
+        ))
+        if not all_strikes:
+            return 15.0
+
+        atm_strike = min(all_strikes, key=lambda s: abs(s - underlying))
+        atm_str = str(atm_strike)
+
+        # Get IV from put and call at ATM
+        ivs = []
+        for strike_map in [put_strikes, call_strikes]:
+            contracts = strike_map.get(atm_str, [])
+            if contracts:
+                contract = contracts[0] if isinstance(contracts, list) else contracts
+                iv = contract.get('volatility', 0)
+                if iv and iv > 0:
+                    ivs.append(iv)
+
+        if ivs:
+            return sum(ivs) / len(ivs)
+        return 15.0
+
+    async def _v4_entry_scan(self) -> bool:
+        """Legacy wrapper — delegates to _entry_scan(use_v5=False)."""
+        return await self._entry_scan(use_v5=False)
+
+    async def _entry_scan(self, use_v5: bool = False) -> bool:
+        """
+        Dynamic entry scanning loop (supports v5 and v4).
+
+        Scans every V4_SCAN_INTERVAL minutes from ENTRY_START to ENTRY_END:
+        1. v3 pre-screen (run once, cache result)
+        2. FOMC gate check (v5 only, if BOT_FOMC_SKIP_DAY enabled)
+        3. Fetch 5-min SPX candles
+        4. Compute v5/v4 features + predict
+        5. If score >= threshold → attempt_entry()
+        6. If no entry by ENTRY_END → skip day
+
+        Returns True if entry was placed, False otherwise.
+        """
+        import pandas as pd
+        from ml.models.predictor import get_economic_calendar_features
+
+        scan_start = self._parse_time(settings.BOT_V4_ENTRY_START)
+        scan_end = self._parse_time(settings.BOT_V4_ENTRY_END)
+        interval = settings.BOT_V4_SCAN_INTERVAL
+        version = "v5" if use_v5 else "v4"
+
+        if use_v5:
+            threshold = settings.BOT_V5_TP25_THRESHOLD
+        else:
+            threshold = settings.BOT_V4_MIN_CONFIDENCE
+
+        logger.info(f"--- {version} Entry Scan ---")
+        logger.info(f"  Window: {settings.BOT_V4_ENTRY_START} - {settings.BOT_V4_ENTRY_END} ET")
+        logger.info(f"  Interval: {interval} min | Threshold: {threshold:.0%}")
+
+        # FOMC gate check (v5 only)
+        if use_v5 and settings.BOT_FOMC_GATE_ENABLED:
+            cal = get_economic_calendar_features()
+            if cal["is_fomc_day"] and settings.BOT_FOMC_SKIP_DAY:
+                logger.info("  FOMC day detected — skipping per BOT_FOMC_SKIP_DAY=True")
+                return False
+            if cal["is_fomc_day"]:
+                logger.info("  FOMC day detected — proceeding (BOT_FOMC_SKIP_DAY=False)")
+            elif cal["is_fomc_week"]:
+                logger.info("  FOMC week — no gate action")
+
+        # Total number of scan slots for progress display
+        start_minutes = scan_start.hour * 60 + scan_start.minute
+        end_minutes = scan_end.hour * 60 + scan_end.minute
+        total_slots = (end_minutes - start_minutes) // interval
+        scan_count = 0
+
+        while True:
+            now = self._now_et()
+
+            # Check if past scan window
+            if now.time() >= scan_end and not self.skip_wait:
+                logger.info(f"  {version} scan window closed at {settings.BOT_V4_ENTRY_END} ET. No entry today.")
+                return False
+
+            scan_count += 1
+            slot_time = now.strftime('%H:%M')
+            progress = f"[{scan_count}/{total_slots}]" if total_slots > 0 else f"[{scan_count}]"
+
+            # Step 1: Fetch 0DTE chain
+            chain = await self._fetch_0dte_chain()
+            if not chain:
+                logger.warning(f"  {progress} {slot_time} — chain unavailable, skipping slot")
+                if self.skip_wait:
+                    return False
+                await asyncio.sleep(interval * 60)
+                continue
+
+            # Step 2: v3 pre-screen (run once per day, cache result)
+            if self._v3_cached_confidence is None and not self.skip_ml:
+                logger.info(f"  Running v3 day-level pre-screen...")
+                v3_conf = await self._run_ml_prediction(chain)
+                self._v3_cached_confidence = v3_conf
+
+                if v3_conf is None:
+                    logger.error(f"  v3 prediction failed — skipping day")
+                    return False
+                if v3_conf < settings.BOT_MIN_CONFIDENCE:
+                    logger.warning(
+                        f"  v3 pre-screen FAILED: {v3_conf:.3f} < {settings.BOT_MIN_CONFIDENCE} "
+                        f"— skipping entire day"
+                    )
+                    return False
+                logger.info(f"  v3 pre-screen PASSED: {v3_conf:.3f}")
+
+            # Step 3: Fetch 5-min SPX candles
+            candles = self._fetch_spx_5min_candles()
+            if candles is None or len(candles) < 6:
+                logger.info(f"  {progress} {slot_time} — insufficient candles ({0 if candles is None else len(candles)}), waiting...")
+                if self.skip_wait:
+                    # In skip-wait mode, try entry with fixed-time fallback
+                    logger.info("  [SKIP-WAIT] Falling back to direct entry attempt")
+                    return await self.attempt_entry(chain=chain)
+                await asyncio.sleep(interval * 60)
+                continue
+
+            # Step 4: Extract ATM IV and compute prediction
+            atm_iv = self._extract_atm_iv(chain)
+            underlying = chain.get('underlyingPrice', 0)
+
+            try:
+                if use_v5:
+                    # v5: predict both TP25 and TP50
+                    tp25_score = self.predictor.predict_v5(
+                        candles_5min=candles,
+                        daily_data=self._v4_daily_data_cache,
+                        option_atm_iv=atm_iv,
+                        target="tp25",
+                    ) if self.predictor.v5_tp25_ready else None
+
+                    tp50_score = self.predictor.predict_v5(
+                        candles_5min=candles,
+                        daily_data=self._v4_daily_data_cache,
+                        option_atm_iv=atm_iv,
+                        target="tp50",
+                    ) if self.predictor.v5_tp50_ready else None
+
+                    primary_score = tp25_score if tp25_score is not None else (tp50_score or 0.0)
+                else:
+                    # v4: predict P(profitable)
+                    primary_score = self.predictor.predict_v4(
+                        candles_5min=candles,
+                        daily_data=self._v4_daily_data_cache,
+                        option_atm_iv=atm_iv,
+                    )
+                    tp25_score = None
+                    tp50_score = None
+
+                # Cache daily data from predictor after first call
+                if self._v4_daily_data_cache is None and self.predictor._daily_cache:
+                    self._v4_daily_data_cache = self.predictor._daily_cache
+            except Exception as e:
+                logger.warning(f"  {progress} {slot_time} — {version} prediction error: {e}")
+                if self.skip_wait:
+                    return False
+                await asyncio.sleep(interval * 60)
+                continue
+
+            # Step 5: Display score(s) and check threshold
+            bar_len = 20
+            pass_mark = " >>> ENTRY" if primary_score >= threshold else ""
+
+            if use_v5 and tp25_score is not None:
+                # Dual-score display for v5
+                tp25_filled = int(tp25_score * bar_len)
+                tp25_bar = "█" * tp25_filled + "░" * (bar_len - tp25_filled)
+                tp50_str = ""
+                if tp50_score is not None:
+                    tp50_filled = int(tp50_score * bar_len)
+                    tp50_bar = "█" * tp50_filled + "░" * (bar_len - tp50_filled)
+                    tp50_str = f" TP50={tp50_score:.3f} |{tp50_bar}|"
+
+                logger.info(
+                    f"  {progress} {slot_time}  "
+                    f"v5: TP25={tp25_score:.3f} |{tp25_bar}|{tp50_str}  "
+                    f"SPX=${underlying:,.0f}"
+                    f"{pass_mark}"
+                )
+            else:
+                # Single-score display for v4
+                filled = int(primary_score * bar_len)
+                bar = "█" * filled + "░" * (bar_len - filled)
+                logger.info(
+                    f"  {progress} {slot_time}  "
+                    f"v4={primary_score:.3f} |{bar}| "
+                    f"ATM-IV={atm_iv:.1f}  SPX=${underlying:,.0f}"
+                    f"{pass_mark}"
+                )
+
+            if primary_score >= threshold:
+                logger.info(f"  {version} TRIGGERED at {slot_time} (score {primary_score:.3f} >= {threshold})")
+                # Pass the already-fetched chain to attempt_entry
+                result = await self.attempt_entry(chain=chain)
+                return result
+
+            # In skip-wait mode, only do one scan
+            if self.skip_wait:
+                logger.info(f"  [SKIP-WAIT] {version} score {primary_score:.3f} < {threshold}. "
+                           f"Falling back to direct entry attempt.")
+                return await self.attempt_entry(chain=chain)
+
+            # Wait for next scan interval
+            await asyncio.sleep(interval * 60)
 
     async def wait_for_entry_fill(self) -> bool:
         """
@@ -2104,6 +2511,10 @@ def main():
                              'Auto-detected from order history if omitted.')
     parser.add_argument('--skip-wait', action='store_true', help='Skip time-based waiting')
     parser.add_argument('--skip-ml', action='store_true', help='Bypass ML confidence check')
+    parser.add_argument('--no-v5', action='store_true',
+                        help='Disable v5 TP models — fall back to v4 or fixed-time entry')
+    parser.add_argument('--no-v4', action='store_true',
+                        help='Disable v4 entry timing — use fixed-time entry at BOT_ENTRY_TIME')
     parser.add_argument('--strikes', type=str, default=None,
                         help='Manual short strikes as "PUT,CALL" (e.g. "6750,6920"). Bypasses delta selection.')
 
@@ -2152,6 +2563,8 @@ def main():
         dry_run=args.dry_run if not args.monitor else False,
         skip_wait=args.skip_wait,
         skip_ml=args.skip_ml,
+        no_v4=args.no_v4,
+        no_v5=args.no_v5,
         manual_strikes=manual_strikes,
         monitor_mode=args.monitor,
         monitor_credit=args.credit,
