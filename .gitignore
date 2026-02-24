@@ -80,8 +80,10 @@ iv_rank_scan_*.json
 # Archive directories
 _archive*/
 
-# ML model artifacts
+# ML model artifacts and training data
 *.joblib
+ml/artifacts/
+ml/training_data/
 
 # DuckDB (any location)
 *.duckdb
