@@ -221,6 +221,7 @@ class ZeroDTEBot:
         self.fill_credit = 0.0
         self.exit_reason = None
         self.portfolio_value = 0.0  # populated from Schwab at startup
+        self._entry_filled = False  # True when _entry_scan handles fill internally
 
         # v4 entry timing state
         self._v3_cached_confidence = None  # cache v3 day-level pre-screen
@@ -304,6 +305,14 @@ class ZeroDTEBot:
                        f"falling back to BOT_PORTFOLIO_VALUE=${settings.BOT_PORTFOLIO_VALUE:,.0f}")
         return settings.BOT_PORTFOLIO_VALUE
 
+    def _reset_entry_state(self):
+        """Reset entry-related state after a failed fill so the bot can retry."""
+        self.already_traded_today = False
+        self.entry_order_id = None
+        self.strikes = None
+        self.quantity = 0
+        self.fill_credit = 0.0
+
     async def run(self):
         """Main bot lifecycle."""
         logger.info("=" * 60)
@@ -358,12 +367,13 @@ class ZeroDTEBot:
                     logger.warning("Entry attempt failed. No trade today.")
                     return
 
-            # Step 4: Wait for entry fill
-            filled = await self.wait_for_entry_fill()
-            if not filled:
-                logger.warning("Entry did not fill within timeout. Cancelling.")
-                await self._cancel_order_safe(self.entry_order_id)
-                return
+            # Step 4: Wait for entry fill (scan path handles this internally)
+            if not self._entry_filled:
+                filled = await self.wait_for_entry_fill()
+                if not filled:
+                    logger.warning("Entry did not fill within timeout. Cancelling.")
+                    await self._cancel_order_safe(self.entry_order_id)
+                    return
 
             # Step 5: Place take-profit order
             await self.place_take_profit_order()
@@ -1109,7 +1119,25 @@ class ZeroDTEBot:
                 logger.info(f"  {version} TRIGGERED at {slot_time} (score {primary_score:.3f} >= {threshold})")
                 # Pass the already-fetched chain to attempt_entry
                 result = await self.attempt_entry(chain=chain)
-                return result
+                if not result:
+                    # Hard failure (bad strikes, sizing, etc.) — skip this slot
+                    logger.warning(f"  Entry attempt failed. Will retry at next scan slot.")
+                    self._reset_entry_state()
+                    await asyncio.sleep(interval * 60)
+                    continue
+
+                # Order placed — wait for fill
+                filled = await self.wait_for_entry_fill()
+                if filled:
+                    self._entry_filled = True
+                    return True  # Order placed AND filled
+
+                # Fill timeout — cancel order, reset state, and keep scanning
+                logger.warning("  Entry did not fill within timeout. Cancelling and re-scanning.")
+                await self._cancel_order_safe(self.entry_order_id)
+                self._reset_entry_state()
+                # wait_for_entry_fill already consumed ~5 min, so we're at the next slot
+                continue
 
             # In skip-wait mode, only do one scan
             if self.skip_wait:
