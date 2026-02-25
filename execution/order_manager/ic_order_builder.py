@@ -93,7 +93,7 @@ class IronCondorOrderBuilder:
             'short_put': short_put,
             'short_call': short_call,
             'long_call': long_call,
-            'net_credit': round(round(net_credit * 20) / 20, 2),
+            'net_credit': round(math.floor(net_credit * 20) / 20, 2),
             'expiration': exp_date,
             'exp_key': exp_key,
         }
@@ -366,8 +366,8 @@ class IronCondorOrderBuilder:
         cost_adjustment = (cost_per_leg * 4) / 100
         debit = credit * (1.0 - tp_pct) - cost_adjustment
 
-        # Round to nearest 0.05 (Schwab pricing increment for spreads)
-        debit = round(debit * 20) / 20
+        # Ceil to $0.05 (fill-friendly: debit = buying back, higher = easier fill)
+        debit = math.ceil(debit * 20) / 20
 
         return max(debit, 0.05)  # Floor at minimum tick
 
@@ -488,7 +488,7 @@ class IronCondorOrderBuilder:
             'short_put': short_put,
             'short_call': short_call,
             'long_call': long_call,
-            'net_credit': round(round(net_credit * 20) / 20, 2),
+            'net_credit': round(math.floor(net_credit * 20) / 20, 2),
             'expiration': exp_date,
             'exp_key': exp_key,
         }

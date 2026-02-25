@@ -25,6 +25,7 @@ Usage:
   python scripts/zero_dte_bot.py --dry-run --skip-wait --skip-ml  # Instant test
   python scripts/zero_dte_bot.py --dry-run --no-v5  # Force v4 or fixed-time entry
   python scripts/zero_dte_bot.py --dry-run --no-v4  # Force fixed-time entry
+  python scripts/zero_dte_bot.py --dry-run --manual-approve  # Prompt when score < threshold
   python scripts/zero_dte_bot.py --live             # Real money (careful!)
   python scripts/zero_dte_bot.py --monitor          # Auto-detect credits from orders
   python scripts/zero_dte_bot.py --monitor --credits 2.60,3.00  # Manual credits
@@ -32,6 +33,8 @@ Usage:
 
 import sys
 import os
+import math
+import select
 import asyncio
 import argparse
 import json
@@ -199,12 +202,13 @@ class ZeroDTEBot:
     def __init__(self, dry_run: bool = True, skip_wait: bool = False, skip_ml: bool = False,
                  manual_strikes: tuple = None, monitor_mode: bool = False,
                  monitor_credit: float = None, monitor_credits: list = None,
-                 no_v4: bool = False, no_v5: bool = False):
+                 no_v4: bool = False, no_v5: bool = False, manual_approve: bool = False):
         self.dry_run = dry_run
         self.skip_wait = skip_wait
         self.skip_ml = skip_ml
         self.no_v4 = no_v4
         self.no_v5 = no_v5
+        self.manual_approve = manual_approve
         self.manual_strikes = manual_strikes  # (short_put, short_call) or None
         self.monitor_mode = monitor_mode
         self.monitor_credit = monitor_credit
@@ -243,6 +247,8 @@ class ZeroDTEBot:
             logger.info("v5 disabled: falling back to v4 or fixed-time entry")
         if no_v4:
             logger.info("v4 disabled: using fixed-time entry")
+        if manual_approve:
+            logger.info("Manual-approve enabled: will prompt when score is below threshold")
 
     @property
     def schwab_client(self):
@@ -312,6 +318,88 @@ class ZeroDTEBot:
         self.strikes = None
         self.quantity = 0
         self.fill_credit = 0.0
+
+    def _prompt_sync(self, prompt: str, timeout: int = 60) -> str:
+        """Blocking stdin prompt with timeout using select(). Returns '' on timeout."""
+        sys.stdout.write(prompt)
+        sys.stdout.flush()
+        ready, _, _ = select.select([sys.stdin], [], [], timeout)
+        if ready:
+            return sys.stdin.readline().strip()
+        print()  # newline after timeout
+        return ''
+
+    async def _async_prompt(self, prompt: str, timeout: int = 60) -> str:
+        """Non-blocking async wrapper around _prompt_sync."""
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, self._prompt_sync, prompt, timeout)
+
+    async def _compute_entry_preview(self, chain: dict) -> Optional[dict]:
+        """Compute order preview (strikes, sizing, TP/SL) without placing any orders."""
+        try:
+            # Select strikes
+            if self.manual_strikes:
+                sp_strike, sc_strike = self.manual_strikes
+                strikes = self.builder.select_strikes_manual(
+                    chain,
+                    short_put_strike=sp_strike,
+                    short_call_strike=sc_strike,
+                    wing_width=settings.BOT_WING_WIDTH,
+                )
+            else:
+                strikes = self.builder.select_strikes(
+                    chain,
+                    target_delta=settings.BOT_SHORT_DELTA,
+                    wing_width=settings.BOT_WING_WIDTH,
+                )
+            if not strikes:
+                return None
+
+            credit = strikes['net_credit']
+            if credit < settings.BOT_MIN_CREDIT:
+                return None
+
+            # Size the position
+            buying_power = await self.schwab_client.get_buying_power() if not self.dry_run else 1_000_000
+            quantity = self.builder.calculate_position_size(
+                credit=credit,
+                portfolio_value=self.portfolio_value,
+                daily_target_pct=settings.BOT_DAILY_TARGET_PCT,
+                tp_pct=settings.BOT_TAKE_PROFIT_PCT,
+                cost_per_leg=settings.BOT_COST_PER_LEG,
+                wing_width=settings.BOT_WING_WIDTH,
+                buying_power=buying_power,
+                max_contracts=settings.BOT_MAX_CONTRACTS,
+            )
+            if quantity <= 0:
+                return None
+
+            # Compute TP/SL debits: 5% ceiling TP (SLTP tiers are primary exit)
+            fee_dollars = settings.BOT_COST_PER_LEG * 8
+            max_gain = self.portfolio_value * settings.BOT_SLTP_MAX_PCT
+            tp_debit = credit - (max_gain / quantity + fee_dollars) / 100
+            tp_debit = round(math.ceil(tp_debit * 20) / 20, 2)
+            tp_debit = max(tp_debit, 0.05)
+            closing_fees = quantity * 4 * settings.BOT_COST_PER_LEG
+            max_loss = self.portfolio_value * settings.BOT_STOP_LOSS_PCT
+            sl_debit = round(credit + (max_loss - closing_fees) / (quantity * 100), 2)
+
+            # Estimated P&L (5% ceiling TP)
+            tp_profit = (credit - tp_debit) * quantity * 100 - closing_fees
+            sl_loss = (sl_debit - credit) * quantity * 100 + closing_fees
+
+            return {
+                'strikes': strikes,
+                'quantity': quantity,
+                'credit': credit,
+                'tp_debit': tp_debit,
+                'sl_debit': sl_debit,
+                'tp_profit': tp_profit,
+                'sl_loss': sl_loss,
+            }
+        except Exception as e:
+            logger.debug(f"  Preview computation failed: {e}")
+            return None
 
     async def run(self):
         """Main bot lifecycle."""
@@ -1139,6 +1227,50 @@ class ZeroDTEBot:
                 # wait_for_entry_fill already consumed ~5 min, so we're at the next slot
                 continue
 
+            # Manual approval: below threshold but user might override
+            if self.manual_approve and not self.skip_wait:
+                preview = await self._compute_entry_preview(chain)
+                if preview:
+                    s = preview['strikes']
+                    gap = threshold - primary_score
+                    logger.info(f"  --- MANUAL APPROVAL ---")
+                    logger.info(f"  Score: {primary_score:.3f}  (threshold {threshold:.3f}, gap {gap:.3f})")
+                    if use_v5 and tp25_score is not None:
+                        tp50_str = f"  TP50={tp50_score:.3f}" if tp50_score is not None else ""
+                        logger.info(f"  TP25={tp25_score:.3f}{tp50_str}")
+                    logger.info(f"  Put spread:  {s.get('long_put_strike',0):.0f}/{s.get('short_put_strike',0):.0f}p"
+                                f"  (delta {s.get('short_put_delta',0):.3f})")
+                    logger.info(f"  Call spread: {s.get('short_call_strike',0):.0f}/{s.get('long_call_strike',0):.0f}c"
+                                f"  (delta {s.get('short_call_delta',0):.3f})")
+                    logger.info(f"  Credit: ${preview['credit']:.2f}  x{preview['quantity']} contracts")
+                    logger.info(f"  TP: buy back ${preview['tp_debit']:.2f}  "
+                                f"(keep {settings.BOT_TAKE_PROFIT_PCT:.0%} -> +${preview['tp_profit']:,.0f})")
+                    logger.info(f"  SL: close at ${preview['sl_debit']:.2f}  "
+                                f"({settings.BOT_STOP_LOSS_PCT:.0%} portfolio -> -${preview['sl_loss']:,.0f})")
+
+                    answer = await self._async_prompt("  Override entry? [y/N] (60s timeout): ", timeout=60)
+                    if answer.lower() in ('y', 'yes'):
+                        logger.info(f"  Manual override APPROVED at {slot_time}")
+                        result = await self.attempt_entry(chain=chain)
+                        if not result:
+                            logger.warning(f"  Entry attempt failed after manual approval.")
+                            self._reset_entry_state()
+                            await asyncio.sleep(interval * 60)
+                            continue
+
+                        filled = await self.wait_for_entry_fill()
+                        if filled:
+                            self._entry_filled = True
+                            return True
+
+                        logger.warning("  Entry did not fill within timeout. Cancelling and re-scanning.")
+                        await self._cancel_order_safe(self.entry_order_id)
+                        self._reset_entry_state()
+                        continue
+                    else:
+                        reason = "timeout" if answer == '' else "declined"
+                        logger.info(f"  Manual override {reason}. Continuing scan.")
+
             # In skip-wait mode, only do one scan
             if self.skip_wait:
                 logger.info(f"  [SKIP-WAIT] {version} score {primary_score:.3f} < {threshold}. "
@@ -1188,23 +1320,18 @@ class ZeroDTEBot:
         return False
 
     async def place_take_profit_order(self):
-        """Place take-profit BUY_TO_CLOSE limit order on Schwab (dynamic TP)."""
-        # Compute dynamic TP based on daily P&L
-        daily_pnl = await self._fetch_daily_pnl(open_ics=[])
-        logger.info(f"  Daily P&L: realized ${daily_pnl.realized_today:.2f}, "
-                    f"remaining to {settings.BOT_DAILY_TARGET_PCT:.0%}: ${daily_pnl.remaining_to_target:.2f}")
-
-        # Create a stub IC for the math (no other ICs open at entry time)
-        stub_ic = TrackedIronCondor(
-            ic_id=0, label="IC-1", strikes=self.strikes,
-            quantity=self.quantity, fill_credit=self.fill_credit,
-            portfolio_value=self.portfolio_value,
-        )
-        tp_debit = self._compute_dynamic_tp_debit(stub_ic, daily_pnl.remaining_to_target, [stub_ic])
+        """Place take-profit BUY_TO_CLOSE limit order at 5% portfolio gain ceiling."""
+        # Compute 5% ceiling TP: same formula as SLTP max tier
+        fee_dollars = settings.BOT_COST_PER_LEG * 8
+        max_gain = self.portfolio_value * settings.BOT_SLTP_MAX_PCT
+        tp_debit = self.fill_credit - (max_gain / self.quantity + fee_dollars) / 100
+        tp_debit = round(math.ceil(tp_debit * 20) / 20, 2)
+        tp_debit = max(tp_debit, 0.05)
 
         logger.info(
             f"  TP target: buy back at ${tp_debit:.2f} debit "
-            f"(keeping ${self.fill_credit - tp_debit:.2f} = "
+            f"(5% portfolio = ${max_gain:.0f}, "
+            f"keeping ${self.fill_credit - tp_debit:.2f} = "
             f"{((self.fill_credit - tp_debit) / self.fill_credit * 100):.0f}% of credit)"
         )
 
@@ -1249,6 +1376,7 @@ class ZeroDTEBot:
 
         logger.info("--- Monitoring Loop Started ---")
         logger.info(f"  Credit: ${self.fill_credit:.2f}")
+        logger.info(f"  Exit strategy: SLTP tiers (primary) | 5% ceiling TP on Schwab | 3PM close")
         logger.info(f"  SL threshold: ${sl_threshold:.2f} (debit to close = {settings.BOT_STOP_LOSS_PCT:.0%} portfolio loss)")
         logger.info(f"  Max loss: ${max_loss:,.0f} ({self.quantity} contracts)")
         logger.info(f"  Exit time: {settings.BOT_EXIT_TIME} ET")
@@ -1613,45 +1741,6 @@ class ZeroDTEBot:
                 daily_target=daily_target,
             )
 
-    def _compute_dynamic_tp_debit(self, ic: TrackedIronCondor, remaining: float,
-                                   all_open_ics: List[TrackedIronCondor]) -> float:
-        """
-        Compute dynamic TP debit for one IC based on remaining daily target.
-
-        Distributes remaining target proportionally across ICs by gross notional
-        (fill_credit * quantity). Accounts for closing fees.
-
-        Returns debit price (rounded to $0.05).
-        """
-        # If target already met, close ASAP at near-credit debit
-        if remaining <= 0:
-            return round(round((ic.fill_credit - 0.05) * 20) / 20, 2)
-
-        # Total gross notional across all open ICs
-        total_gross = sum(o.fill_credit * o.quantity for o in all_open_ics)
-        if total_gross <= 0:
-            return round(round(ic.tp_25_debit * 20) / 20, 2)  # fallback to 25%
-
-        # This IC's proportional share of the remaining target
-        ic_gross = ic.fill_credit * ic.quantity
-        ic_share = remaining * (ic_gross / total_gross)
-
-        # Closing fees: 4 legs per contract
-        closing_fees = ic.quantity * 4 * settings.BOT_COST_PER_LEG
-
-        # Debit = credit - (target_profit + closing_fees) / (quantity * 100)
-        # target_profit = ic_share, but we need net profit per share
-        raw_debit = ic.fill_credit - (ic_share + closing_fees) / (ic.quantity * 100)
-
-        # Floor: minimum tick ($0.05)
-        raw_debit = max(raw_debit, 0.05)
-        # Ceiling: must retain some profit (at least $0.05 below credit)
-        raw_debit = min(raw_debit, ic.fill_credit - 0.05)
-
-        # Round to nearest $0.05
-        rounded = round(round(raw_debit * 20) / 20, 2)
-        return max(rounded, 0.05)
-
     async def _get_spx_positions(self) -> list:
         """Fetch SPX option positions. Returns list (empty if none)."""
         try:
@@ -1717,23 +1806,23 @@ class ZeroDTEBot:
                 for act_pct, flr_pct, act_debit, flr_debit in ic.sltp_tiers:
                     logger.info(f"      {act_pct:.1%} -> {flr_pct:.1%}: activate @ ${act_debit:.2f}, floor @ ${flr_debit:.2f}")
 
-        # Fetch daily P&L for dynamic TP computation
-        daily_pnl = await self._fetch_daily_pnl(open_ics=tracked_ics)
-        logger.info(f"  Daily P&L: realized ${daily_pnl.realized_today:.2f}, "
-                    f"remaining to {settings.BOT_DAILY_TARGET_PCT:.0%}: ${daily_pnl.remaining_to_target:.2f}")
-
-        # Detect existing TP orders per IC, place dynamic TP if missing
+        # Detect existing TP orders per IC, place 5% ceiling TP if missing
         for ic in tracked_ics:
             existing_tp = await self._detect_tp_order_for_ic(ic)
             if existing_tp:
                 ic.tp_order_id = existing_tp
                 logger.info(f"  {ic.label}: existing TP order found: ID={existing_tp}")
             else:
-                dynamic_debit = self._compute_dynamic_tp_debit(ic, daily_pnl.remaining_to_target, tracked_ics)
-                ic.target_tp_debit = dynamic_debit
-                logger.info(f"  {ic.label}: dynamic TP ${dynamic_debit:.2f} "
-                            f"(fixed 25% would be ${ic.tp_25_debit:.2f})")
-                await self._place_tp_limit_order(ic, dynamic_debit)
+                # Compute 5% ceiling TP: same formula as SLTP max tier
+                fee_dollars = settings.BOT_COST_PER_LEG * 8
+                max_gain = ic.portfolio_value * settings.BOT_SLTP_MAX_PCT
+                tp_debit = ic.fill_credit - (max_gain / ic.quantity + fee_dollars) / 100
+                tp_debit = round(math.ceil(tp_debit * 20) / 20, 2)
+                tp_debit = max(tp_debit, 0.05)
+                ic.target_tp_debit = tp_debit
+                logger.info(f"  {ic.label}: 5% ceiling TP ${tp_debit:.2f} "
+                            f"(SLTP tiers are primary exit)")
+                await self._place_tp_limit_order(ic, tp_debit)
 
         # Enter multi-IC monitoring loop (returns when all ICs close)
         await self.multi_ic_monitoring_loop(tracked_ics)
@@ -2390,8 +2479,6 @@ class ZeroDTEBot:
                         ic.alerts_fired.add(AlertLevel.TP_50)
                         ic.alerts_fired.add(AlertLevel.TP_25)  # skip 25 if already at 50
                         alert_tp(ic, AlertLevel.TP_50, debit)
-                        if not ic.tp_order_id:
-                            await self._place_tp_limit_order(ic, ic.tp_50_debit)
 
                     elif debit <= ic.tp_25_debit and AlertLevel.TP_25 not in ic.alerts_fired:
                         ic.alerts_fired.add(AlertLevel.TP_25)
@@ -2419,8 +2506,8 @@ class ZeroDTEBot:
 
     async def _place_tp_limit_order(self, ic: TrackedIronCondor, debit: float):
         """Place a BUY_TO_CLOSE limit order for a specific IC."""
-        # Round to nearest 0.05
-        debit = round(round(debit * 20) / 20, 2)
+        # Ceil to $0.05 (fill-friendly: we're buying back, higher = more likely to fill)
+        debit = round(math.ceil(debit * 20) / 20, 2)
         debit = max(debit, 0.05)
 
         close_order = self.builder.build_close_order(ic.strikes, ic.quantity, debit)
@@ -2543,6 +2630,8 @@ def main():
                         help='Disable v5 TP models — fall back to v4 or fixed-time entry')
     parser.add_argument('--no-v4', action='store_true',
                         help='Disable v4 entry timing — use fixed-time entry at BOT_ENTRY_TIME')
+    parser.add_argument('--manual-approve', action='store_true',
+                        help='Prompt for manual approval when ML score is below threshold')
     parser.add_argument('--strikes', type=str, default=None,
                         help='Manual short strikes as "PUT,CALL" (e.g. "6750,6920"). Bypasses delta selection.')
 
@@ -2597,6 +2686,7 @@ def main():
         monitor_mode=args.monitor,
         monitor_credit=args.credit,
         monitor_credits=monitor_credits,
+        manual_approve=args.manual_approve,
     )
 
     asyncio.run(bot.run())
