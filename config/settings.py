@@ -115,7 +115,7 @@ class Settings(BaseSettings):
     # v3 model: confidence = 1 - P(big_loss). 0.50 = skip if >50% risk.
     # v2 model: confidence = P(win). 0.80 = trade only if >80% win probability.
     BOT_MIN_CONFIDENCE: float = 0.50  # Minimum ML confidence for entry
-    BOT_MONITOR_INTERVAL: int = 30  # Seconds between monitoring checks
+    BOT_MONITOR_INTERVAL: int = 5  # Seconds between monitoring checks
     BOT_ENTRY_POLL_INTERVAL: int = 30  # Seconds between entry fill polls
     BOT_ENTRY_TIMEOUT: int = 300  # Seconds to wait for entry fill
     BOT_MIN_CREDIT: float = 1.00  # Minimum net credit to enter trade
