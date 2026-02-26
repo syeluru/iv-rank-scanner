@@ -1,34 +1,30 @@
 #!/usr/bin/env python3
 """
-0DTE Iron Condor Automated Trading Bot.
+0DTE Iron Condor Automated Trading Bot — Unified Mode.
 
-Single-purpose bot that runs the full daily lifecycle:
-  Pre-flight → Entry (v5/v4 dynamic or fixed-time) → Monitor → Exit
+Single adaptive flow that auto-detects Schwab state:
+  - No positions → ML scan entry → monitor
+  - Positions exist → reconstruct ICs → monitor
+  - Adapts to manual changes (rolls, closes, new ICs) mid-monitoring
 
-Entry modes:
+Entry modes (automatic fallback chain):
   v5 dynamic (default): Scans 10:00-14:00 ET every 5 min using ML TP prediction
                          models. Enters when P(hit 25% TP) >= threshold.
-                         Also shows P(hit 50% TP) for information.
   v4 dynamic (fallback): Same scan loop but predicts P(profitable at 3PM close).
-                          Used when v5 models not loaded or --no-v5 flag set.
+                          Used when v5 models not loaded.
   Fixed-time (fallback): Enters at BOT_ENTRY_TIME (noon ET) with v3 risk filter.
-                          Used when v4 model not loaded or --no-v4 flag set.
+                          Used when v4 model not loaded.
 
-Exit via: take-profit (native Schwab limit), stop-loss (bot-monitored),
-          SLTP trailing lock, or 3PM forced close (bot-monitored).
+Exit via: SLTP trailing lock (primary), 5% ceiling TP (Schwab limit),
+          stop-loss (bot-monitored), or 3PM forced close.
 
-Monitor mode: auto-detects multiple ICs from positions, monitors each with
-tiered TP/SL alerts (sound notifications + Schwab orders).
+Manual-approve is always on: prompts when ML score is below threshold.
 
 Usage:
-  python scripts/zero_dte_bot.py --dry-run         # Paper: v5 scan or fixed-time
-  python scripts/zero_dte_bot.py --dry-run --skip-wait --skip-ml  # Instant test
-  python scripts/zero_dte_bot.py --dry-run --no-v5  # Force v4 or fixed-time entry
-  python scripts/zero_dte_bot.py --dry-run --no-v4  # Force fixed-time entry
-  python scripts/zero_dte_bot.py --dry-run --manual-approve  # Prompt when score < threshold
-  python scripts/zero_dte_bot.py --live             # Real money (careful!)
-  python scripts/zero_dte_bot.py --monitor          # Auto-detect credits from orders
-  python scripts/zero_dte_bot.py --monitor --credits 2.60,3.00  # Manual credits
+  python scripts/zero_dte_bot.py                          # Paper mode (default)
+  python scripts/zero_dte_bot.py --live                    # Real money
+  python scripts/zero_dte_bot.py --skip-wait --skip-ml     # Testing shortcuts
+  python scripts/zero_dte_bot.py --strikes 6875,6945       # Manual strikes
 """
 
 import sys
@@ -197,22 +193,14 @@ def alert_sl(ic: TrackedIronCondor, level: AlertLevel, debit: float):
 
 
 class ZeroDTEBot:
-    """Automated 0DTE iron condor trading bot."""
+    """Automated 0DTE iron condor trading bot — unified adaptive mode."""
 
-    def __init__(self, dry_run: bool = True, skip_wait: bool = False, skip_ml: bool = False,
-                 manual_strikes: tuple = None, monitor_mode: bool = False,
-                 monitor_credit: float = None, monitor_credits: list = None,
-                 no_v4: bool = False, no_v5: bool = False, manual_approve: bool = False):
+    def __init__(self, dry_run: bool = True, skip_wait: bool = False,
+                 skip_ml: bool = False, manual_strikes: tuple = None):
         self.dry_run = dry_run
         self.skip_wait = skip_wait
         self.skip_ml = skip_ml
-        self.no_v4 = no_v4
-        self.no_v5 = no_v5
-        self.manual_approve = manual_approve
         self.manual_strikes = manual_strikes  # (short_put, short_call) or None
-        self.monitor_mode = monitor_mode
-        self.monitor_credit = monitor_credit
-        self.monitor_credits = monitor_credits  # list of floats for multi-IC
 
         self.builder = IronCondorOrderBuilder()
 
@@ -225,7 +213,6 @@ class ZeroDTEBot:
         self.fill_credit = 0.0
         self.exit_reason = None
         self.portfolio_value = 0.0  # populated from Schwab at startup
-        self._entry_filled = False  # True when _entry_scan handles fill internally
 
         # v4 entry timing state
         self._v3_cached_confidence = None  # cache v3 day-level pre-screen
@@ -237,18 +224,12 @@ class ZeroDTEBot:
         self._candle_loader = None
         self._feature_pipeline = None
 
-        mode = "MONITOR" if monitor_mode else ("DRY-RUN" if dry_run else "LIVE")
+        mode = "PAPER" if dry_run else "LIVE"
         logger.info(f"ZeroDTEBot initialized in {mode} mode")
         if skip_wait:
             logger.info("Skip-wait enabled: bypassing time-based sleeping")
         if skip_ml:
             logger.info("Skip-ML enabled: bypassing ML confidence check")
-        if no_v5:
-            logger.info("v5 disabled: falling back to v4 or fixed-time entry")
-        if no_v4:
-            logger.info("v4 disabled: using fixed-time entry")
-        if manual_approve:
-            logger.info("Manual-approve enabled: will prompt when score is below threshold")
 
     @property
     def schwab_client(self):
@@ -401,89 +382,427 @@ class ZeroDTEBot:
             logger.debug(f"  Preview computation failed: {e}")
             return None
 
+    # ===== Unified Bot Lifecycle =====
+
     async def run(self):
-        """Main bot lifecycle."""
+        """Unified bot lifecycle: detect state -> entry or monitor -> shutdown."""
         logger.info("=" * 60)
         logger.info("0DTE Iron Condor Bot Starting")
         logger.info(f"Date: {date.today()}")
-        logger.info(f"Mode: {'DRY-RUN' if self.dry_run else 'LIVE'}")
+        logger.info(f"Mode: {'PAPER' if self.dry_run else 'LIVE'}")
         logger.info("=" * 60)
 
         try:
-            # Monitor mode: attach to existing position
-            if self.monitor_mode:
-                await self.run_monitor_mode()
-                return
-
-            # Step 1: Pre-flight check
-            if not await self.pre_flight_check():
+            # Step 1: Merged pre-flight
+            if not await self.pre_flight():
                 logger.error("Pre-flight check failed. Aborting.")
                 return
 
-            # Step 2+3: Entry — v5/v4 dynamic scanning or fixed-time
-            # Priority: v5 (TP models) → v4 (profitability) → fixed-time
-            use_v5 = (
-                settings.BOT_V5_ENABLED
-                and not self.no_v5
-                and not self.skip_ml
-                and self.predictor.v5_ready
-            )
-            use_v4 = (
-                not use_v5
-                and settings.BOT_V4_ENABLED
-                and not self.no_v4
-                and not self.skip_ml
-                and self.predictor.v4_ready
-            )
+            # Step 2: Detect existing positions
+            positions = await self._get_spx_positions()
 
-            if use_v5 or use_v4:
-                version = "v5" if use_v5 else "v4"
-                logger.info(f"{version} entry timing enabled — scanning for optimal entry")
-                if not self.skip_wait:
-                    await self._wait_until(settings.BOT_V4_ENTRY_START)
-                entered = await self._entry_scan(use_v5=use_v5)
-                if not entered:
-                    logger.warning(f"{version} scan found no entry window. No trade today.")
+            if positions:
+                # MONITOR PATH: reconstruct ICs from live positions
+                tracked_ics = await self._reconstruct_and_assign(positions)
+                if not tracked_ics:
+                    logger.error("Failed to reconstruct ICs from positions")
                     return
+                logger.info(f"Detected {len(tracked_ics)} existing IC(s) — entering monitoring")
+
+                # Log IC details
+                for ic in tracked_ics:
+                    logger.info(f"  {ic.label}: "
+                                f"{ic.strikes['long_put']['strike']}/{ic.strikes['short_put']['strike']}p - "
+                                f"{ic.strikes['short_call']['strike']}/{ic.strikes['long_call']['strike']}c "
+                                f"x{ic.quantity}  Credit: ${ic.fill_credit:.2f}")
+                    logger.info(f"    SL exit:  debit >= ${ic.sl_exit_debit:.2f} -> MARKET CLOSE "
+                                f"({settings.BOT_STOP_LOSS_PCT:.0%} portfolio)")
+                    if ic.sltp_tiers:
+                        logger.info(f"    SLTP Tiers ({len(ic.sltp_tiers)} tiers):")
+                        for act_pct, flr_pct, act_debit, flr_debit in ic.sltp_tiers:
+                            logger.info(f"      {act_pct:.1%} -> {flr_pct:.1%}: "
+                                        f"activate @ ${act_debit:.2f}, floor @ ${flr_debit:.2f}")
             else:
-                # Fixed-time entry (original flow)
-                if not self.skip_ml:
-                    logger.info("ML scan models not loaded — using fixed-time entry")
-                if not self.skip_wait:
-                    await self._wait_until(settings.BOT_ENTRY_TIME)
-                if not await self.attempt_entry():
-                    logger.warning("Entry attempt failed. No trade today.")
+                # ENTRY PATH: ML scan -> entry -> build IC
+                entry_ic = await self._entry_phase()
+                if not entry_ic:
+                    logger.info("No entry today. Shutting down.")
                     return
+                tracked_ics = [entry_ic]
 
-            # Step 4: Wait for entry fill (scan path handles this internally)
-            if not self._entry_filled:
+            # Step 3: Place 5% ceiling TP for any IC missing a TP order
+            for ic in tracked_ics:
+                existing_tp = await self._detect_tp_order_for_ic(ic)
+                if existing_tp:
+                    ic.tp_order_id = existing_tp
+                    logger.info(f"  {ic.label}: existing TP order: ID={existing_tp}")
+                else:
+                    await self._place_ceiling_tp(ic)
+
+            # Step 4: Unified monitoring loop (handles 1 or N ICs)
+            await self._monitoring_loop(tracked_ics)
+
+            logger.info("All positions closed. Shutting down.")
+
+        except KeyboardInterrupt:
+            logger.warning("Bot interrupted by user (Ctrl+C)")
+        except Exception as e:
+            logger.error(f"Unhandled error in bot lifecycle: {e}", exc_info=True)
+        finally:
+            self.log_trade_result()
+            logger.info("Bot shutdown complete.")
+
+    async def pre_flight(self) -> bool:
+        """
+        Merged pre-flight check for both entry and monitoring paths.
+
+        Checks: weekday, ThetaData, Schwab connection + portfolio value, ML models.
+        Does NOT gate on existing/missing positions (unified flow handles that).
+        """
+        logger.info("--- Pre-flight Check ---")
+        now = self._now_et()
+
+        # Check trading day (weekday)
+        if now.weekday() >= 5:
+            logger.error(f"Not a trading day (weekday={now.weekday()})")
+            return False
+        logger.info(f"  Trading day: {now.strftime('%A')} - OK")
+
+        # Check ThetaData Terminal (start if needed — must be up before ML)
+        if not self.skip_ml:
+            if not self._ensure_thetadata_running():
+                logger.error("ThetaData Terminal required for ML features. Aborting.")
+                return False
+        else:
+            logger.info("  ThetaData: skipped (--skip-ml)")
+
+        # Check Schwab credentials configured
+        if not settings.validate_schwab_credentials():
+            logger.error("Schwab credentials not configured in .env")
+            return False
+        logger.info("  Schwab credentials: configured - OK")
+
+        # Check Schwab connection + extract live portfolio value
+        try:
+            account = await self.schwab_client.get_account()
+            bp = (
+                account.get('securitiesAccount', {})
+                .get('currentBalances', {})
+                .get('buyingPower', 0.0)
+            )
+            self.portfolio_value = self._extract_portfolio_value(account)
+            logger.info(f"  Schwab connection: OK (buying power: ${bp:,.2f})")
+            logger.info(f"  Portfolio value: ${self.portfolio_value:,.2f} (live from Schwab)")
+
+            if bp < 5000:
+                logger.error(f"Insufficient buying power: ${bp:,.2f}")
+                return False
+        except Exception as e:
+            logger.error(f"  Schwab connection failed: {e}")
+            return False
+
+        # Check ML model (graceful — not a hard gate)
+        if not self.skip_ml:
+            if not self.predictor.is_ready():
+                logger.warning("ML v3 model not loaded — entry will use fixed-time only")
+            else:
+                logger.info(f"  ML v3 model: loaded ({self.predictor.num_features} features) - OK")
+
+            # v5 TP model status
+            if self.predictor.v5_ready and settings.BOT_V5_ENABLED:
+                tp25_status = f"TP25={len(self.predictor.v5_tp25_feature_names)}f" if self.predictor.v5_tp25_ready else "TP25=N/A"
+                tp50_status = f"TP50={len(self.predictor.v5_tp50_feature_names)}f" if self.predictor.v5_tp50_ready else "TP50=N/A"
+                logger.info(f"  ML v5 model: loaded ({tp25_status}, {tp50_status}) - "
+                           f"scanning {settings.BOT_V4_ENTRY_START}-{settings.BOT_V4_ENTRY_END} ET")
+                # FOMC gate status
+                from ml.models.predictor import get_economic_calendar_features
+                cal = get_economic_calendar_features()
+                fomc_str = "FOMC DAY" if cal["is_fomc_day"] else ("FOMC week" if cal["is_fomc_week"] else "no FOMC")
+                logger.info(f"  FOMC gate: {'enabled' if settings.BOT_FOMC_GATE_ENABLED else 'disabled'} "
+                           f"({fomc_str}, skip_day={'ON' if settings.BOT_FOMC_SKIP_DAY else 'OFF'})")
+            elif not settings.BOT_V5_ENABLED:
+                logger.info("  ML v5 model: disabled (BOT_V5_ENABLED=False)")
+            else:
+                logger.info("  ML v5 model: not loaded — falling back to v4/fixed-time")
+
+            # v4 entry timing status
+            if self.predictor.v4_ready and settings.BOT_V4_ENABLED:
+                logger.info(f"  ML v4 model: loaded ({len(self.predictor.v4_feature_names)} features) - "
+                           f"scanning {settings.BOT_V4_ENTRY_START}-{settings.BOT_V4_ENTRY_END} ET")
+            elif not settings.BOT_V4_ENABLED:
+                logger.info("  ML v4 model: disabled (BOT_V4_ENABLED=False)")
+            else:
+                logger.info("  ML v4 model: not loaded — using fixed-time entry")
+        else:
+            logger.info("  ML model: skipped (--skip-ml)")
+
+        logger.info("--- Pre-flight Check PASSED ---")
+        return True
+
+    async def _entry_phase(self) -> Optional[TrackedIronCondor]:
+        """Run ML scan entry, wait for fill, return TrackedIronCondor or None."""
+        # Determine entry method (v5 -> v4 -> fixed-time, automatic)
+        use_v5 = (
+            settings.BOT_V5_ENABLED
+            and not self.skip_ml
+            and self.predictor.v5_ready
+        )
+        use_v4 = (
+            not use_v5
+            and settings.BOT_V4_ENABLED
+            and not self.skip_ml
+            and self.predictor.v4_ready
+        )
+
+        entered = False
+        entry_filled = False
+
+        if use_v5 or use_v4:
+            version = "v5" if use_v5 else "v4"
+            logger.info(f"{version} entry timing enabled — scanning for optimal entry")
+            if not self.skip_wait:
+                await self._wait_until(settings.BOT_V4_ENTRY_START)
+            entered = await self._entry_scan(use_v5=use_v5)
+            # _entry_scan handles attempt_entry + wait_for_fill internally
+            entry_filled = entered
+        else:
+            # Fixed-time entry (original flow)
+            if not self.skip_ml:
+                logger.info("ML scan models not loaded — using fixed-time entry")
+            if not self.skip_wait:
+                await self._wait_until(settings.BOT_ENTRY_TIME)
+            entered = await self.attempt_entry()
+            if entered:
                 filled = await self.wait_for_entry_fill()
                 if not filled:
                     logger.warning("Entry did not fill within timeout. Cancelling.")
                     await self._cancel_order_safe(self.entry_order_id)
+                    return None
+                entry_filled = True
+
+        if not entry_filled or self.fill_credit <= 0:
+            return None
+
+        return TrackedIronCondor(
+            ic_id=0, label="IC-1", strikes=self.strikes,
+            quantity=self.quantity, fill_credit=self.fill_credit,
+            portfolio_value=self.portfolio_value,
+        )
+
+    async def _place_ceiling_tp(self, ic: TrackedIronCondor):
+        """Place 5% portfolio ceiling TP for an IC."""
+        fee_dollars = settings.BOT_COST_PER_LEG * 8
+        max_gain = ic.portfolio_value * settings.BOT_SLTP_MAX_PCT
+        tp_debit = ic.fill_credit - (max_gain / ic.quantity + fee_dollars) / 100
+        tp_debit = round(math.ceil(tp_debit * 20) / 20, 2)
+        tp_debit = max(tp_debit, 0.05)
+        ic.target_tp_debit = tp_debit
+
+        logger.info(
+            f"  {ic.label}: 5% ceiling TP ${tp_debit:.2f} "
+            f"(SLTP tiers are primary exit)"
+        )
+        await self._place_tp_limit_order(ic, tp_debit)
+
+    async def _reconstruct_and_assign(self, positions=None) -> Optional[List[TrackedIronCondor]]:
+        """Reconstruct ICs from Schwab positions and assign credits."""
+        if positions is None:
+            positions = await self._get_spx_positions()
+        if not positions:
+            return None
+        tracked_ics = await self.reconstruct_multiple_ics_from_positions(positions)
+        if not tracked_ics:
+            return None
+        if not await self._assign_credits(tracked_ics):
+            logger.error("Credit detection failed for reconstructed ICs.")
+            return None
+        return tracked_ics
+
+    # ===== Unified Monitoring Loop =====
+
+    def _get_tracked_symbols(self, ics: List[TrackedIronCondor]) -> frozenset:
+        """Get set of all option symbols across tracked ICs."""
+        symbols = set()
+        for ic in ics:
+            for leg in ['long_put', 'short_put', 'short_call', 'long_call']:
+                symbols.add(ic.strikes[leg]['symbol'])
+        return frozenset(symbols)
+
+    async def _get_current_position_symbols(self) -> frozenset:
+        """Get set of current SPX option symbols from Schwab positions."""
+        positions = await self._get_spx_positions()
+        return frozenset(p.get('instrument', {}).get('symbol', '') for p in positions)
+
+    def _merge_sltp_state(self, old_ics: List[TrackedIronCondor],
+                          new_ics: List[TrackedIronCondor]):
+        """Carry forward SLTP state for ICs that haven't changed."""
+        old_by_symbols = {}
+        for ic in old_ics:
+            key = self._get_tracked_symbols([ic])
+            old_by_symbols[key] = ic
+        for new_ic in new_ics:
+            key = self._get_tracked_symbols([new_ic])
+            if key in old_by_symbols:
+                old = old_by_symbols[key]
+                new_ic.sltp_active_tier_idx = old.sltp_active_tier_idx
+                new_ic.sltp_floor_debit = old.sltp_floor_debit
+                new_ic.alerts_fired = old.alerts_fired
+                new_ic.tp_order_id = old.tp_order_id
+
+    async def _monitoring_loop(self, tracked_ics: List[TrackedIronCondor]):
+        """Unified monitoring loop for 1 or N ICs with position change detection."""
+        exit_time = self._parse_time(settings.BOT_EXIT_TIME)
+
+        # Snapshot tracked symbols for change detection
+        tracked_symbols = self._get_tracked_symbols(tracked_ics)
+
+        logger.info("--- Monitoring Loop Started ---")
+        logger.info(f"  Monitoring {len(tracked_ics)} IC(s)")
+        logger.info(f"  Exit time: {settings.BOT_EXIT_TIME} ET")
+        logger.info(f"  Check interval: {settings.BOT_MONITOR_INTERVAL}s")
+
+        while True:
+            try:
+                # Check for position changes (rolls, manual closes, new ICs)
+                current_symbols = await self._get_current_position_symbols()
+                if current_symbols != tracked_symbols:
+                    if not current_symbols:
+                        logger.info("No positions remaining. Exiting monitoring.")
+                        return
+
+                    logger.info("Position change detected — re-reconstructing ICs")
+                    new_positions = await self._get_spx_positions()
+                    new_ics = await self._reconstruct_and_assign(new_positions)
+                    if not new_ics:
+                        logger.warning("Re-reconstruction failed. Continuing with existing state.")
+                    else:
+                        # Carry forward SLTP state for unchanged ICs
+                        self._merge_sltp_state(tracked_ics, new_ics)
+                        tracked_ics = new_ics
+                        tracked_symbols = current_symbols
+                        # Place TP for any new IC missing one
+                        for ic in tracked_ics:
+                            if not ic.tp_order_id:
+                                existing_tp = await self._detect_tp_order_for_ic(ic)
+                                if existing_tp:
+                                    ic.tp_order_id = existing_tp
+                                else:
+                                    await self._place_ceiling_tp(ic)
+                        continue
+
+                # Filter to open ICs
+                open_ics = [ic for ic in tracked_ics if not ic.is_closed]
+                if not open_ics:
+                    logger.info("=== All ICs closed. Monitoring complete. ===")
                     return
 
-            # Step 5: Place take-profit order
-            await self.place_take_profit_order()
+                now = self._now_et()
 
-            # Step 6: Monitoring loop
-            await self.monitoring_loop()
+                # Time exit check
+                if now.time() >= exit_time and not self.skip_wait:
+                    logger.info(f"=== TIME EXIT: Past {settings.BOT_EXIT_TIME} ET ===")
+                    for ic in open_ics:
+                        await self._close_ic(ic, "time_exit")
+                    return
 
-        except KeyboardInterrupt:
-            logger.warning("Bot interrupted by user (Ctrl+C)")
-            if self.entry_order_id and not self.exit_reason:
-                logger.warning("Attempting emergency close due to interrupt...")
-                await self.emergency_close("keyboard_interrupt")
-        except Exception as e:
-            logger.error(f"Unhandled error in bot lifecycle: {e}", exc_info=True)
-            if self.entry_order_id and not self.exit_reason:
-                try:
-                    await self.emergency_close("unhandled_error")
-                except Exception as e2:
-                    logger.critical(f"Emergency close also failed: {e2}")
-        finally:
-            self.log_trade_result()
-            logger.info("Bot shutdown complete.")
+                # Fetch chain once for all ICs
+                chain = await self._fetch_0dte_chain()
+                if not chain:
+                    logger.warning("  Could not fetch chain this cycle, retrying...")
+                    await asyncio.sleep(settings.BOT_MONITOR_INTERVAL)
+                    continue
+
+                for ic in open_ics:
+                    # Check if TP limit order filled
+                    if ic.tp_order_id:
+                        if await self._check_order_filled(ic.tp_order_id):
+                            ic.exit_reason = "take_profit"
+                            ic.is_closed = True
+                            logger.info(f"  === {ic.label}: TP limit order FILLED ===")
+                            continue
+
+                    # Get current debit
+                    debit = self.builder.get_current_position_value(chain, ic.strikes)
+                    if debit is None:
+                        logger.debug(f"  {ic.label}: could not get position value")
+                        continue
+
+                    pnl_pct = round((1 - debit / ic.fill_credit) * 100) if ic.fill_credit > 0 else 0
+                    if ic.sltp_active_tier_idx >= 0:
+                        act_pct = ic.sltp_tiers[ic.sltp_active_tier_idx][0]
+                        flr_pct = ic.sltp_tiers[ic.sltp_active_tier_idx][1]
+                        sltp_tag = f" [SLTP {act_pct:.1%}->{flr_pct:.1%} floor@${ic.sltp_floor_debit:.2f}]"
+                    else:
+                        sltp_tag = ""
+                    logger.info(
+                        f"  [{now.strftime('%H:%M:%S')}] {ic.label}: "
+                        f"debit ${debit:.2f}  P/L {pnl_pct:+d}%{sltp_tag}"
+                    )
+
+                    # --- Tiered SLTP: ratcheting profit lock ---
+                    if ic.sltp_tiers:
+                        # Check if we've reached a higher tier (scan from highest to current+1)
+                        for idx in range(len(ic.sltp_tiers) - 1, ic.sltp_active_tier_idx, -1):
+                            act_pct, flr_pct, act_debit, flr_debit = ic.sltp_tiers[idx]
+                            if debit <= act_debit:
+                                ic.sltp_active_tier_idx = idx
+                                ic.sltp_floor_debit = flr_debit
+                                logger.info(
+                                    f"  >>> {ic.label}: SLTP TIER {act_pct:.1%} ACTIVATED "
+                                    f"(debit ${debit:.2f} <= ${act_debit:.2f})"
+                                )
+                                logger.info(
+                                    f"      Floor raised to ${flr_debit:.2f} (locks in {flr_pct:.1%} gain)"
+                                )
+                                play_sound(TP_SOUND)
+                                send_notification(
+                                    f"Profit Lock {act_pct:.1%} - {ic.label}",
+                                    f"Floor ${flr_debit:.2f} ({flr_pct:.1%})"
+                                )
+                                break  # Only need highest matching tier
+
+                        # Check if floor breached (debit reversed up past lock-in)
+                        if ic.sltp_active_tier_idx >= 0 and debit >= ic.sltp_floor_debit:
+                            flr_pct = ic.sltp_tiers[ic.sltp_active_tier_idx][1]
+                            logger.warning(
+                                f"  === {ic.label}: SLTP TRIGGERED at {flr_pct:.1%} floor "
+                                f"(debit ${debit:.2f} >= floor ${ic.sltp_floor_debit:.2f}) ==="
+                            )
+                            play_sound(SL_SOUND)
+                            await self._close_ic(ic, f"sltp_lock_{flr_pct:.1%}")
+                            continue
+
+                    # TP checks (debit falling = good)
+                    if debit <= ic.tp_50_debit and AlertLevel.TP_50 not in ic.alerts_fired:
+                        ic.alerts_fired.add(AlertLevel.TP_50)
+                        ic.alerts_fired.add(AlertLevel.TP_25)  # skip 25 if already at 50
+                        alert_tp(ic, AlertLevel.TP_50, debit)
+
+                    elif debit <= ic.tp_25_debit and AlertLevel.TP_25 not in ic.alerts_fired:
+                        ic.alerts_fired.add(AlertLevel.TP_25)
+                        alert_tp(ic, AlertLevel.TP_25, debit)
+
+                    # SL checks (debit rising = bad) — exit first, then warning
+                    if debit >= ic.sl_exit_debit and AlertLevel.SL_EXIT not in ic.alerts_fired:
+                        ic.alerts_fired.add(AlertLevel.SL_EXIT)
+                        ic.alerts_fired.add(AlertLevel.SL_WARNING)
+                        alert_sl(ic, AlertLevel.SL_EXIT, debit)
+                        await self._close_ic(ic, "stop_loss_portfolio")
+
+                    elif debit >= ic.sl_warning_debit and AlertLevel.SL_WARNING not in ic.alerts_fired:
+                        ic.alerts_fired.add(AlertLevel.SL_WARNING)
+                        alert_sl(ic, AlertLevel.SL_WARNING, debit)
+
+            except Exception as e:
+                logger.error(f"Error in monitoring loop: {e}", exc_info=True)
+
+            if self.skip_wait:
+                logger.info("[SKIP-WAIT] Exiting monitoring loop after one check.")
+                break
+
+            await asyncio.sleep(settings.BOT_MONITOR_INTERVAL)
+
+    # ===== ThetaData =====
 
     def _ensure_thetadata_running(self) -> bool:
         """
@@ -549,115 +868,7 @@ class ZeroDTEBot:
         logger.error(f"  ThetaData Terminal did not respond after {STARTUP_TIMEOUT}s")
         return False
 
-    async def pre_flight_check(self) -> bool:
-        """
-        Verify all prerequisites before trading.
-
-        Checks: Schwab connection, ML model, buying power, trading day,
-        ThetaData Terminal, no existing SPX positions.
-        """
-        logger.info("--- Pre-flight Check ---")
-        now = self._now_et()
-
-        # Check trading day (weekday)
-        if now.weekday() >= 5:
-            logger.error(f"Not a trading day (weekday={now.weekday()})")
-            return False
-        logger.info(f"  Trading day: {now.strftime('%A')} - OK")
-
-        # Check ThetaData Terminal (start if needed — must be up before ML)
-        if not self.skip_ml:
-            if not self._ensure_thetadata_running():
-                logger.error("ThetaData Terminal required for ML features. Aborting.")
-                return False
-        else:
-            logger.info("  ThetaData: skipped (--skip-ml)")
-
-        # Check Schwab credentials configured
-        if not settings.validate_schwab_credentials():
-            logger.error("Schwab credentials not configured in .env")
-            return False
-        logger.info("  Schwab credentials: configured - OK")
-
-        # Check Schwab connection + extract live portfolio value
-        try:
-            account = await self.schwab_client.get_account()
-            bp = (
-                account.get('securitiesAccount', {})
-                .get('currentBalances', {})
-                .get('buyingPower', 0.0)
-            )
-            self.portfolio_value = self._extract_portfolio_value(account)
-            logger.info(f"  Schwab connection: OK (buying power: ${bp:,.2f})")
-            logger.info(f"  Portfolio value: ${self.portfolio_value:,.2f} (live from Schwab)")
-
-            if bp < 5000:
-                logger.error(f"Insufficient buying power: ${bp:,.2f}")
-                return False
-        except Exception as e:
-            logger.error(f"  Schwab connection failed: {e}")
-            return False
-
-        # Check ML model
-        if not self.skip_ml:
-            if not self.predictor.is_ready():
-                logger.error("ML model not loaded")
-                return False
-            logger.info(f"  ML v3 model: loaded ({self.predictor.num_features} features) - OK")
-
-            # v5 TP model status
-            if self.predictor.v5_ready and not self.no_v5 and settings.BOT_V5_ENABLED:
-                tp25_status = f"TP25={len(self.predictor.v5_tp25_feature_names)}f" if self.predictor.v5_tp25_ready else "TP25=N/A"
-                tp50_status = f"TP50={len(self.predictor.v5_tp50_feature_names)}f" if self.predictor.v5_tp50_ready else "TP50=N/A"
-                logger.info(f"  ML v5 model: loaded ({tp25_status}, {tp50_status}) - "
-                           f"scanning {settings.BOT_V4_ENTRY_START}-{settings.BOT_V4_ENTRY_END} ET")
-                # FOMC gate status
-                from ml.models.predictor import get_economic_calendar_features
-                cal = get_economic_calendar_features()
-                fomc_str = "FOMC DAY" if cal["is_fomc_day"] else ("FOMC week" if cal["is_fomc_week"] else "no FOMC")
-                logger.info(f"  FOMC gate: {'enabled' if settings.BOT_FOMC_GATE_ENABLED else 'disabled'} "
-                           f"({fomc_str}, skip_day={'ON' if settings.BOT_FOMC_SKIP_DAY else 'OFF'})")
-            elif self.no_v5:
-                logger.info("  ML v5 model: disabled (--no-v5 flag)")
-            elif not settings.BOT_V5_ENABLED:
-                logger.info("  ML v5 model: disabled (BOT_V5_ENABLED=False)")
-            else:
-                logger.info("  ML v5 model: not loaded — falling back to v4/fixed-time")
-
-            # v4 entry timing status
-            if self.predictor.v4_ready and not self.no_v4 and settings.BOT_V4_ENABLED:
-                logger.info(f"  ML v4 model: loaded ({len(self.predictor.v4_feature_names)} features) - "
-                           f"scanning {settings.BOT_V4_ENTRY_START}-{settings.BOT_V4_ENTRY_END} ET")
-            elif self.no_v4:
-                logger.info("  ML v4 model: disabled (--no-v4 flag)")
-            elif not settings.BOT_V4_ENABLED:
-                logger.info("  ML v4 model: disabled (BOT_V4_ENABLED=False)")
-            else:
-                logger.info("  ML v4 model: not loaded — using fixed-time entry")
-        else:
-            logger.info("  ML model: skipped (--skip-ml)")
-
-        # Check no existing SPX positions
-        try:
-            positions = await self.schwab_client.get_account_positions()
-            spx_positions = [
-                p for p in positions
-                if 'SPX' in p.get('instrument', {}).get('symbol', '').upper()
-            ]
-            if spx_positions:
-                logger.error(f"Existing SPX positions found: {len(spx_positions)}")
-                for p in spx_positions:
-                    sym = p.get('instrument', {}).get('symbol', '?')
-                    qty = p.get('longQuantity', 0) - p.get('shortQuantity', 0)
-                    logger.error(f"    {sym}: {qty}")
-                return False
-            logger.info("  No existing SPX positions - OK")
-        except Exception as e:
-            logger.error(f"  Position check failed: {e}")
-            return False
-
-        logger.info("--- Pre-flight Check PASSED ---")
-        return True
+    # ===== Entry Methods =====
 
     async def attempt_entry(self, chain: dict = None) -> bool:
         """
@@ -689,7 +900,7 @@ class ZeroDTEBot:
             if not chain:
                 return False
 
-        # ML prediction (skip if v4 already validated — v3 was pre-screened in _v4_entry_scan)
+        # ML prediction (skip if v4 already validated — v3 was pre-screened in _entry_scan)
         if self._v3_cached_confidence is not None:
             logger.info(f"  ML v3 pre-screen: {self._v3_cached_confidence:.3f} (cached) - PASS")
         elif not self.skip_ml:
@@ -895,7 +1106,7 @@ class ZeroDTEBot:
             logger.error(f"ML prediction error: {e}", exc_info=True)
             return None
 
-    # ===== v4 Entry Timing Methods =====
+    # ===== v4/v5 Entry Timing Methods =====
 
     def _fetch_spx_5min_candles(self) -> 'pd.DataFrame | None':
         """
@@ -997,6 +1208,7 @@ class ZeroDTEBot:
         # Find nearest expiration
         put_map = chain.get('putExpDateMap', {})
         call_map = chain.get('callExpDateMap', {})
+
         if not put_map or not call_map:
             return 15.0
 
@@ -1029,10 +1241,6 @@ class ZeroDTEBot:
             return sum(ivs) / len(ivs)
         return 15.0
 
-    async def _v4_entry_scan(self) -> bool:
-        """Legacy wrapper — delegates to _entry_scan(use_v5=False)."""
-        return await self._entry_scan(use_v5=False)
-
     async def _entry_scan(self, use_v5: bool = False) -> bool:
         """
         Dynamic entry scanning loop (supports v5 and v4).
@@ -1042,10 +1250,12 @@ class ZeroDTEBot:
         2. FOMC gate check (v5 only, if BOT_FOMC_SKIP_DAY enabled)
         3. Fetch 5-min SPX candles
         4. Compute v5/v4 features + predict
-        5. If score >= threshold → attempt_entry()
-        6. If no entry by ENTRY_END → skip day
+        5. If score >= threshold -> attempt_entry()
+        6. If no entry by ENTRY_END -> skip day
 
-        Returns True if entry was placed, False otherwise.
+        Manual-approve is always on: prompts when score < threshold.
+
+        Returns True if entry was placed and filled, False otherwise.
         """
         import pandas as pd
         from ml.models.predictor import get_economic_calendar_features
@@ -1179,11 +1389,11 @@ class ZeroDTEBot:
             if use_v5 and tp25_score is not None:
                 # Dual-score display for v5
                 tp25_filled = int(tp25_score * bar_len)
-                tp25_bar = "█" * tp25_filled + "░" * (bar_len - tp25_filled)
+                tp25_bar = "\u2588" * tp25_filled + "\u2591" * (bar_len - tp25_filled)
                 tp50_str = ""
                 if tp50_score is not None:
                     tp50_filled = int(tp50_score * bar_len)
-                    tp50_bar = "█" * tp50_filled + "░" * (bar_len - tp50_filled)
+                    tp50_bar = "\u2588" * tp50_filled + "\u2591" * (bar_len - tp50_filled)
                     tp50_str = f" TP50={tp50_score:.3f} |{tp50_bar}|"
 
                 logger.info(
@@ -1195,7 +1405,7 @@ class ZeroDTEBot:
             else:
                 # Single-score display for v4
                 filled = int(primary_score * bar_len)
-                bar = "█" * filled + "░" * (bar_len - filled)
+                bar = "\u2588" * filled + "\u2591" * (bar_len - filled)
                 logger.info(
                     f"  {progress} {slot_time}  "
                     f"v4={primary_score:.3f} |{bar}| "
@@ -1217,7 +1427,6 @@ class ZeroDTEBot:
                 # Order placed — wait for fill
                 filled = await self.wait_for_entry_fill()
                 if filled:
-                    self._entry_filled = True
                     return True  # Order placed AND filled
 
                 # Fill timeout — cancel order, reset state, and keep scanning
@@ -1227,8 +1436,8 @@ class ZeroDTEBot:
                 # wait_for_entry_fill already consumed ~5 min, so we're at the next slot
                 continue
 
-            # Manual approval: below threshold but user might override
-            if self.manual_approve and not self.skip_wait:
+            # Manual approval: always-on when below threshold (skip in skip-wait mode)
+            if not self.skip_wait:
                 preview = await self._compute_entry_preview(chain)
                 if preview:
                     s = preview['strikes']
@@ -1260,7 +1469,6 @@ class ZeroDTEBot:
 
                         filled = await self.wait_for_entry_fill()
                         if filled:
-                            self._entry_filled = True
                             return True
 
                         logger.warning("  Entry did not fill within timeout. Cancelling and re-scanning.")
@@ -1319,357 +1527,7 @@ class ZeroDTEBot:
         logger.warning("Entry fill timeout reached")
         return False
 
-    async def place_take_profit_order(self):
-        """Place take-profit BUY_TO_CLOSE limit order at 5% portfolio gain ceiling."""
-        # Compute 5% ceiling TP: same formula as SLTP max tier
-        fee_dollars = settings.BOT_COST_PER_LEG * 8
-        max_gain = self.portfolio_value * settings.BOT_SLTP_MAX_PCT
-        tp_debit = self.fill_credit - (max_gain / self.quantity + fee_dollars) / 100
-        tp_debit = round(math.ceil(tp_debit * 20) / 20, 2)
-        tp_debit = max(tp_debit, 0.05)
-
-        logger.info(
-            f"  TP target: buy back at ${tp_debit:.2f} debit "
-            f"(5% portfolio = ${max_gain:.0f}, "
-            f"keeping ${self.fill_credit - tp_debit:.2f} = "
-            f"{((self.fill_credit - tp_debit) / self.fill_credit * 100):.0f}% of credit)"
-        )
-
-        tp_order = self.builder.build_close_order(self.strikes, self.quantity, tp_debit)
-        self._log_order("TAKE-PROFIT", tp_order)
-
-        if self.dry_run:
-            logger.info("[DRY-RUN] TP order NOT placed.")
-            self.tp_order_id = "DRY_RUN_TP"
-            return
-
-        try:
-            result = await self.schwab_client.place_order(tp_order)
-            self.tp_order_id = result.get('orderId')
-            logger.info(f"  TP order placed: ID={self.tp_order_id}")
-        except Exception as e:
-            logger.error(f"Failed to place TP order: {e}")
-            # Continue monitoring even without TP - bot will handle exit
-
-    async def monitoring_loop(self):
-        """
-        Main monitoring loop. Every BOT_MONITOR_INTERVAL seconds:
-        1. Check if TP order filled
-        2. Fetch chain and check stop-loss
-        3. Check if past exit time
-        """
-        # Portfolio-based SL: max loss = BOT_STOP_LOSS_PCT × portfolio
-        max_loss = self.portfolio_value * settings.BOT_STOP_LOSS_PCT
-        closing_fees = self.quantity * 4 * settings.BOT_COST_PER_LEG
-        sl_threshold = round(
-            self.fill_credit + (max_loss - closing_fees) / (self.quantity * 100), 2
-        )
-
-        exit_time = self._parse_time(settings.BOT_EXIT_TIME)
-
-        # Build a TrackedIronCondor for SLTP tier tracking
-        sltp_ic = TrackedIronCondor(
-            ic_id=0, label="IC-1", strikes=self.strikes,
-            quantity=self.quantity, fill_credit=self.fill_credit,
-            portfolio_value=self.portfolio_value,
-        )
-
-        logger.info("--- Monitoring Loop Started ---")
-        logger.info(f"  Credit: ${self.fill_credit:.2f}")
-        logger.info(f"  Exit strategy: SLTP tiers (primary) | 5% ceiling TP on Schwab | 3PM close")
-        logger.info(f"  SL threshold: ${sl_threshold:.2f} (debit to close = {settings.BOT_STOP_LOSS_PCT:.0%} portfolio loss)")
-        logger.info(f"  Max loss: ${max_loss:,.0f} ({self.quantity} contracts)")
-        logger.info(f"  Exit time: {settings.BOT_EXIT_TIME} ET")
-        logger.info(f"  Check interval: {settings.BOT_MONITOR_INTERVAL}s")
-        if sltp_ic.sltp_tiers:
-            logger.info(f"  SLTP Tiers ({len(sltp_ic.sltp_tiers)} tiers):")
-            for act_pct, flr_pct, act_debit, flr_debit in sltp_ic.sltp_tiers:
-                logger.info(f"    {act_pct:.1%} -> {flr_pct:.1%}: activate @ ${act_debit:.2f}, floor @ ${flr_debit:.2f}")
-
-        while True:
-            try:
-                now = self._now_et()
-
-                # Check 1: TP filled?
-                if await self._check_tp_filled():
-                    self.exit_reason = "take_profit"
-                    logger.info("=== EXIT: Take-profit filled ===")
-                    break
-
-                # Check 2: Time exit?
-                if now.time() >= exit_time and not self.skip_wait:
-                    self.exit_reason = "time_exit"
-                    logger.info(f"=== EXIT: Past {settings.BOT_EXIT_TIME} ET ===")
-                    await self.emergency_close("time_exit")
-                    break
-
-                # Check 3: Stop-loss?
-                current_debit = await self._get_current_position_value()
-                if current_debit is not None:
-                    logger.info(
-                        f"  [{now.strftime('%H:%M:%S')}] "
-                        f"Debit to close: ${current_debit:.2f} "
-                        f"(SL @ ${sl_threshold:.2f})"
-                    )
-
-                    if current_debit >= sl_threshold:
-                        self.exit_reason = "stop_loss"
-                        logger.warning(
-                            f"=== EXIT: Stop-loss triggered "
-                            f"(${current_debit:.2f} >= ${sl_threshold:.2f}) ==="
-                        )
-                        await self.emergency_close("stop_loss")
-                        break
-
-                    # Check 4: Tiered SLTP
-                    if sltp_ic.sltp_tiers:
-                        # Check if we've reached a higher tier
-                        for idx in range(len(sltp_ic.sltp_tiers) - 1, sltp_ic.sltp_active_tier_idx, -1):
-                            act_pct, flr_pct, act_debit, flr_debit = sltp_ic.sltp_tiers[idx]
-                            if current_debit <= act_debit:
-                                sltp_ic.sltp_active_tier_idx = idx
-                                sltp_ic.sltp_floor_debit = flr_debit
-                                logger.info(
-                                    f"  >>> SLTP TIER {act_pct:.1%} ACTIVATED "
-                                    f"(debit ${current_debit:.2f} <= ${act_debit:.2f})"
-                                )
-                                logger.info(
-                                    f"      Floor raised to ${flr_debit:.2f} (locks in {flr_pct:.1%} gain)"
-                                )
-                                play_sound(TP_SOUND)
-                                send_notification(
-                                    f"Profit Lock {act_pct:.1%}",
-                                    f"Floor ${flr_debit:.2f} ({flr_pct:.1%})"
-                                )
-                                break
-
-                        # Check if floor breached
-                        if sltp_ic.sltp_active_tier_idx >= 0 and current_debit >= sltp_ic.sltp_floor_debit:
-                            flr_pct = sltp_ic.sltp_tiers[sltp_ic.sltp_active_tier_idx][1]
-                            logger.warning(
-                                f"=== EXIT: SLTP TRIGGERED at {flr_pct:.1%} floor "
-                                f"(debit ${current_debit:.2f} >= floor ${sltp_ic.sltp_floor_debit:.2f}) ==="
-                            )
-                            play_sound(SL_SOUND)
-                            await self.emergency_close(f"sltp_lock_{flr_pct:.1%}")
-                            self.exit_reason = f"sltp_lock_{flr_pct:.1%}"
-                            break
-                else:
-                    logger.debug(f"  [{now.strftime('%H:%M:%S')}] Could not get position value")
-
-            except Exception as e:
-                logger.error(f"Error in monitoring loop: {e}", exc_info=True)
-                # Continue monitoring - don't crash on transient errors
-
-            if self.skip_wait:
-                # In skip-wait mode, simulate one check and exit
-                logger.info("[SKIP-WAIT] Exiting monitoring loop after one check.")
-                self.exit_reason = "skip_wait_test"
-                break
-
-            await asyncio.sleep(settings.BOT_MONITOR_INTERVAL)
-
-    async def _check_tp_filled(self) -> bool:
-        """Check if the take-profit order has filled."""
-        if self.dry_run:
-            return False  # In dry-run, TP never auto-fills
-
-        if not self.tp_order_id:
-            return False
-
-        try:
-            order_data = await self.schwab_client.get_order(self.tp_order_id)
-            status = order_data.get('status', '')
-            if status == 'FILLED':
-                return True
-        except Exception as e:
-            logger.warning(f"Error checking TP order: {e}")
-
-        return False
-
-    async def _get_current_position_value(self) -> float:
-        """Fetch fresh chain and calculate current debit to close."""
-        if self.dry_run:
-            # Simulate a value between 0 and credit (healthy position)
-            return round(self.fill_credit * 0.6, 2)
-
-        try:
-            chain = await self._fetch_0dte_chain()
-            if not chain:
-                return None
-            return self.builder.get_current_position_value(chain, self.strikes)
-        except Exception as e:
-            logger.warning(f"Error getting position value: {e}")
-            return None
-
-    async def emergency_close(self, reason: str):
-        """Cancel TP order and market-close the position."""
-        logger.warning(f"Emergency close triggered: {reason}")
-
-        # Cancel TP order
-        if self.tp_order_id and not self.dry_run:
-            try:
-                await self.schwab_client.cancel_order(self.tp_order_id)
-                logger.info(f"  TP order {self.tp_order_id} cancelled")
-            except Exception as e:
-                logger.warning(f"  Failed to cancel TP order: {e}")
-
-        # Place market close order
-        close_order = self.builder.build_market_close_order(self.strikes, self.quantity)
-        self._log_order("EMERGENCY_CLOSE", close_order)
-
-        if self.dry_run:
-            logger.info("[DRY-RUN] Emergency close NOT placed.")
-            return
-
-        try:
-            result = await self.schwab_client.place_order(close_order)
-            close_id = result.get('orderId', '?')
-            logger.info(f"  Market close order placed: ID={close_id}")
-        except Exception as e:
-            logger.critical(f"FAILED TO PLACE EMERGENCY CLOSE ORDER: {e}")
-            logger.critical("MANUAL INTERVENTION REQUIRED!")
-
-    def log_trade_result(self):
-        """Write trade result to JSON log file."""
-        if not self.strikes:
-            logger.info("No trade to log (no entry).")
-            return
-
-        log_dir = Path("logs")
-        log_dir.mkdir(exist_ok=True)
-
-        result = {
-            "date": str(date.today()),
-            "timestamp": self._now_et().isoformat(),
-            "mode": "dry_run" if self.dry_run else "live",
-            "symbol": settings.BOT_SYMBOL,
-            "strikes": {
-                "long_put": self.strikes['long_put']['strike'],
-                "short_put": self.strikes['short_put']['strike'],
-                "short_call": self.strikes['short_call']['strike'],
-                "long_call": self.strikes['long_call']['strike'],
-            },
-            "expiration": self.strikes['expiration'],
-            "quantity": self.quantity,
-            "credit": self.fill_credit,
-            "exit_reason": self.exit_reason,
-            "settings": {
-                "target_delta": settings.BOT_SHORT_DELTA,
-                "wing_width": settings.BOT_WING_WIDTH,
-                "tp_pct": settings.BOT_TAKE_PROFIT_PCT,
-                "sl_pct": settings.BOT_STOP_LOSS_PCT,
-                "portfolio_value": self.portfolio_value,
-                "daily_target_pct": settings.BOT_DAILY_TARGET_PCT,
-            }
-        }
-
-        log_path = log_dir / f"zero_dte_bot_{date.today()}.json"
-        with open(log_path, 'w') as f:
-            json.dump(result, f, indent=2, default=str)
-
-        logger.info(f"Trade result logged: {log_path}")
-
-    # ===== Monitor Mode (Multi-IC) =====
-
-    async def run_monitor_mode(self):
-        """
-        Persistent multi-IC monitor daemon.
-
-        Outer loop runs forever:
-        1. Check Schwab connection
-        2. If SPX positions exist → reconstruct ICs, assign credits, monitor
-        3. When all ICs close → loop back to waiting
-        4. If no positions → sleep and re-check
-        5. Only exits on Ctrl+C
-        """
-        IDLE_POLL = 60  # seconds between checks when no positions
-
-        logger.info("=" * 60)
-        logger.info("Monitor Mode - Persistent Daemon")
-        logger.info("=" * 60)
-
-        # Verify Schwab connection + extract live portfolio value
-        try:
-            account = await self.schwab_client.get_account()
-            bp = (
-                account.get('securitiesAccount', {})
-                .get('currentBalances', {})
-                .get('buyingPower', 0.0)
-            )
-            self.portfolio_value = self._extract_portfolio_value(account)
-            logger.info(f"  Schwab connection: OK (buying power: ${bp:,.2f})")
-            logger.info(f"  Portfolio value: ${self.portfolio_value:,.2f} (live from Schwab)")
-        except Exception as e:
-            logger.error(f"  Schwab connection failed: {e}")
-            logger.error("  Cannot start monitor daemon without Schwab. Aborting.")
-            return
-
-        logger.info(f"  Polling for positions every {IDLE_POLL}s when idle")
-        logger.info("  Press Ctrl+C to stop")
-        logger.info("")
-
-        consecutive_failures = 0
-        MAX_FAILURE_BACKOFF = 300  # cap backoff at 5 minutes
-
-        while True:
-            try:
-                now = self._now_et()
-
-                # Check for SPX positions
-                positions = await self._get_spx_positions()
-                if not positions:
-                    consecutive_failures = 0
-                    # Show what a 10-delta IC would look like right now
-                    try:
-                        chain = await self._fetch_0dte_chain()
-                        if chain:
-                            strikes = self.builder.select_strikes(
-                                chain,
-                                target_delta=settings.BOT_SHORT_DELTA,
-                                wing_width=settings.BOT_WING_WIDTH,
-                            )
-                            if strikes:
-                                underlying = chain.get('underlyingPrice', 0)
-                                logger.info(
-                                    f"  [{now.strftime('%H:%M:%S')}] No positions. "
-                                    f"Current IC @ {settings.BOT_SHORT_DELTA:.0%}Δ: "
-                                    f"{strikes['long_put']['strike']:.0f}/{strikes['short_put']['strike']:.0f}p - "
-                                    f"{strikes['short_call']['strike']:.0f}/{strikes['long_call']['strike']:.0f}c  "
-                                    f"Credit: ${strikes['net_credit']:.2f}  "
-                                    f"SPX: ${underlying:,.2f}"
-                                )
-                            else:
-                                logger.info(f"  [{now.strftime('%H:%M:%S')}] No positions. Could not find IC strikes.")
-                        else:
-                            logger.info(f"  [{now.strftime('%H:%M:%S')}] No positions. Chain unavailable.")
-                    except Exception as e:
-                        logger.debug(f"  [{now.strftime('%H:%M:%S')}] No positions. Quote fetch failed: {e}")
-                    await asyncio.sleep(IDLE_POLL)
-                    continue
-
-                # Positions found — enter active monitoring cycle
-                logger.info(f"  [{now.strftime('%H:%M:%S')}] SPX positions detected! Starting monitor cycle.")
-                success = await self._run_monitor_cycle()
-                logger.info(f"  [{self._now_et().strftime('%H:%M:%S')}] Monitor cycle ended. Returning to idle.")
-                logger.info("")
-                if success:
-                    consecutive_failures = 0
-                else:
-                    consecutive_failures += 1
-                    backoff = min(IDLE_POLL * consecutive_failures, MAX_FAILURE_BACKOFF)
-                    logger.info(f"  Setup failed ({consecutive_failures}x). Retrying in {backoff}s.")
-                    logger.info(f"  Hint: use --monitor --credits <credit1,credit2,...> for manually-placed positions.")
-                    await asyncio.sleep(backoff)
-
-            except KeyboardInterrupt:
-                raise  # let it propagate to exit
-            except Exception as e:
-                consecutive_failures += 1
-                backoff = min(IDLE_POLL * consecutive_failures, MAX_FAILURE_BACKOFF)
-                logger.error(f"  Monitor daemon error: {e}", exc_info=True)
-                logger.info(f"  Retrying in {backoff}s...")
-                await asyncio.sleep(backoff)
+    # ===== Daily P&L =====
 
     async def _fetch_daily_pnl(self, open_ics: List[TrackedIronCondor] = None) -> DailyPnLState:
         """
@@ -1741,6 +1599,8 @@ class ZeroDTEBot:
                 daily_target=daily_target,
             )
 
+    # ===== Position Management =====
+
     async def _get_spx_positions(self) -> list:
         """Fetch SPX option positions. Returns list (empty if none)."""
         try:
@@ -1753,144 +1613,9 @@ class ZeroDTEBot:
             logger.warning(f"  Failed to fetch positions: {e}")
             return []
 
-    async def _run_monitor_cycle(self) -> bool:
+    async def reconstruct_multiple_ics_from_positions(self, positions: list = None) -> Optional[List[TrackedIronCondor]]:
         """
-        One full monitor cycle: reconstruct ICs, assign credits, monitor until done.
-        Returns True on successful cycle, False on setup failure.
-        """
-        # Log positions
-        positions = await self._get_spx_positions()
-        if not positions:
-            return False
-
-        if len(positions) % 4 != 0:
-            logger.warning(
-                f"  {len(positions)} SPX legs (not a multiple of 4). "
-                f"Waiting for complete IC..."
-            )
-            return False
-
-        for p in positions:
-            sym = p.get('instrument', {}).get('symbol', '?')
-            lq = p.get('longQuantity', 0)
-            sq = p.get('shortQuantity', 0)
-            logger.info(f"    {sym}: long={lq} short={sq}")
-
-        # Reconstruct all ICs from positions
-        tracked_ics = await self.reconstruct_multiple_ics_from_positions()
-        if not tracked_ics:
-            logger.warning("  Could not reconstruct ICs from positions. Will retry.")
-            return False
-
-        # Assign credits: manual --credits/--credit, or auto-detect from orders
-        if not await self._assign_credits(tracked_ics):
-            logger.error(
-                "  Credit detection failed. If positions were placed manually "
-                "(not via this bot), use: --monitor --credits <credit1,credit2,...>"
-            )
-            return False
-
-        # Log all detected ICs with thresholds
-        for ic in tracked_ics:
-            logger.info(f"  {ic.label}: "
-                        f"{ic.strikes['long_put']['strike']}/{ic.strikes['short_put']['strike']}p - "
-                        f"{ic.strikes['short_call']['strike']}/{ic.strikes['long_call']['strike']}c "
-                        f"x{ic.quantity}  Credit: ${ic.fill_credit:.2f}")
-            logger.info(f"    TP 25%: debit <= ${ic.tp_25_debit:.2f}  -> sound")
-            logger.info(f"    TP 50%: debit <= ${ic.tp_50_debit:.2f}  -> limit order")
-            logger.info(f"    SL warn:  debit >= ${ic.sl_warning_debit:.2f} -> sound")
-            logger.info(f"    SL exit:  debit >= ${ic.sl_exit_debit:.2f} -> MARKET CLOSE "
-                        f"({settings.BOT_STOP_LOSS_PCT:.0%} portfolio)")
-            if ic.sltp_tiers:
-                logger.info(f"    SLTP Tiers ({len(ic.sltp_tiers)} tiers):")
-                for act_pct, flr_pct, act_debit, flr_debit in ic.sltp_tiers:
-                    logger.info(f"      {act_pct:.1%} -> {flr_pct:.1%}: activate @ ${act_debit:.2f}, floor @ ${flr_debit:.2f}")
-
-        # Detect existing TP orders per IC, place 5% ceiling TP if missing
-        for ic in tracked_ics:
-            existing_tp = await self._detect_tp_order_for_ic(ic)
-            if existing_tp:
-                ic.tp_order_id = existing_tp
-                logger.info(f"  {ic.label}: existing TP order found: ID={existing_tp}")
-            else:
-                # Compute 5% ceiling TP: same formula as SLTP max tier
-                fee_dollars = settings.BOT_COST_PER_LEG * 8
-                max_gain = ic.portfolio_value * settings.BOT_SLTP_MAX_PCT
-                tp_debit = ic.fill_credit - (max_gain / ic.quantity + fee_dollars) / 100
-                tp_debit = round(math.ceil(tp_debit * 20) / 20, 2)
-                tp_debit = max(tp_debit, 0.05)
-                ic.target_tp_debit = tp_debit
-                logger.info(f"  {ic.label}: 5% ceiling TP ${tp_debit:.2f} "
-                            f"(SLTP tiers are primary exit)")
-                await self._place_tp_limit_order(ic, tp_debit)
-
-        # Enter multi-IC monitoring loop (returns when all ICs close)
-        await self.multi_ic_monitoring_loop(tracked_ics)
-
-        # Log results
-        logger.info("--- Monitor Cycle Results ---")
-        for ic in tracked_ics:
-            status = ic.exit_reason or ("open" if not ic.is_closed else "closed")
-            logger.info(f"  {ic.label}: {status}")
-
-        return True
-
-    async def pre_flight_check_monitor(self) -> bool:
-        """
-        Pre-flight for monitor mode. Like pre_flight_check but REQUIRES existing SPX positions.
-        """
-        logger.info("--- Monitor Pre-flight Check ---")
-        now = self._now_et()
-
-        # Check trading day
-        if now.weekday() >= 5:
-            logger.error(f"Not a trading day (weekday={now.weekday()})")
-            return False
-        logger.info(f"  Trading day: {now.strftime('%A')} - OK")
-
-        # Check Schwab connection
-        try:
-            account = await self.schwab_client.get_account()
-            bp = (
-                account.get('securitiesAccount', {})
-                .get('currentBalances', {})
-                .get('buyingPower', 0.0)
-            )
-            logger.info(f"  Schwab connection: OK (buying power: ${bp:,.2f})")
-        except Exception as e:
-            logger.error(f"  Schwab connection failed: {e}")
-            return False
-
-        # REQUIRE existing SPX positions (opposite of normal pre-flight)
-        try:
-            positions = await self.schwab_client.get_account_positions()
-            spx_positions = [
-                p for p in positions
-                if 'SPX' in p.get('instrument', {}).get('symbol', '').upper()
-            ]
-            if not spx_positions:
-                logger.error("No existing SPX option positions found. Nothing to monitor.")
-                for p in positions:
-                    sym = p.get('instrument', {}).get('symbol', '?')
-                    asset_type = p.get('instrument', {}).get('assetType', '?')
-                    logger.info(f"  Non-SPX position found: {sym} (type={asset_type})")
-                return False
-            logger.info(f"  Found {len(spx_positions)} SPX positions - OK")
-            for p in spx_positions:
-                sym = p.get('instrument', {}).get('symbol', '?')
-                long_qty = p.get('longQuantity', 0)
-                short_qty = p.get('shortQuantity', 0)
-                logger.info(f"    {sym}: long={long_qty} short={short_qty}")
-        except Exception as e:
-            logger.error(f"  Position check failed: {e}")
-            return False
-
-        logger.info("--- Monitor Pre-flight Check PASSED ---")
-        return True
-
-    async def reconstruct_multiple_ics_from_positions(self) -> Optional[List[TrackedIronCondor]]:
-        """
-        Fetch all SPX positions from Schwab, group into multiple iron condors.
+        Group SPX positions into multiple iron condors.
 
         Algorithm:
         1. Parse all OCC symbols, classify into long_puts, short_puts, short_calls, long_calls
@@ -1900,31 +1625,31 @@ class ZeroDTEBot:
 
         Returns list of TrackedIronCondor (without credits assigned yet), or None on error.
         """
-        try:
-            positions = await self.schwab_client.get_account_positions()
-        except Exception as e:
-            logger.error(f"Failed to fetch positions: {e}")
-            return None
+        if positions is None:
+            try:
+                all_positions = await self.schwab_client.get_account_positions()
+            except Exception as e:
+                logger.error(f"Failed to fetch positions: {e}")
+                return None
+            positions = [
+                p for p in all_positions
+                if 'SPX' in p.get('instrument', {}).get('symbol', '').upper()
+            ]
 
-        spx_positions = [
-            p for p in positions
-            if 'SPX' in p.get('instrument', {}).get('symbol', '').upper()
-        ]
-
-        if not spx_positions:
+        if not positions:
             logger.error("No SPX option positions found.")
             return None
 
-        if len(spx_positions) % 4 != 0:
+        if len(positions) % 4 != 0:
             logger.error(
-                f"Expected a multiple of 4 SPX legs, found {len(spx_positions)}. "
+                f"Expected a multiple of 4 SPX legs, found {len(positions)}. "
                 f"Cannot group into iron condors."
             )
             return None
 
         # Parse each position
         legs = []
-        for p in spx_positions:
+        for p in positions:
             symbol = p.get('instrument', {}).get('symbol', '')
             parsed = self.builder.parse_option_symbol(symbol)
             if not parsed:
@@ -2015,47 +1740,14 @@ class ZeroDTEBot:
                     portfolio_value=self.portfolio_value,
                 ))
 
-        logger.info(f"  Detected {len(tracked_ics)} iron condor(s) from {len(spx_positions)} positions")
+        logger.info(f"  Detected {len(tracked_ics)} iron condor(s) from {len(positions)} positions")
         return tracked_ics
 
     async def _assign_credits(self, tracked_ics: List[TrackedIronCondor]) -> bool:
         """
-        Assign fill credits to tracked ICs from CLI args or auto-detect from order history.
-
-        Priority:
-        1. --credits (comma-separated, multi-IC)
-        2. --credit (single IC backward compat)
-        3. Auto-detect from recent FILLED IRON_CONDOR orders
+        Assign fill credits to tracked ICs via auto-detection from order history
+        or position averagePrice fallback.
         """
-        if self.monitor_credits:
-            # --credits provided
-            if len(self.monitor_credits) != len(tracked_ics):
-                logger.error(
-                    f"--credits has {len(self.monitor_credits)} values but "
-                    f"found {len(tracked_ics)} ICs. Must match."
-                )
-                return False
-            for ic, credit in zip(tracked_ics, self.monitor_credits):
-                ic.fill_credit = credit
-                ic.strikes['net_credit'] = credit
-                ic.__post_init__()  # recompute thresholds
-            logger.info(f"  Credits assigned from --credits: {self.monitor_credits}")
-            return True
-
-        if self.monitor_credit is not None:
-            # --credit (single) backward compat
-            if len(tracked_ics) != 1:
-                logger.error(
-                    f"--credit is for single IC but found {len(tracked_ics)} ICs. "
-                    f"Use --credits with comma-separated values."
-                )
-                return False
-            tracked_ics[0].fill_credit = self.monitor_credit
-            tracked_ics[0].strikes['net_credit'] = self.monitor_credit
-            tracked_ics[0].__post_init__()
-            logger.info(f"  Credit assigned from --credit: ${self.monitor_credit:.2f}")
-            return True
-
         # Auto-detect from order history (primary: traces entries + rolls)
         logger.info("  Auto-detecting credits from order history...")
         if await self._detect_credits_from_orders(tracked_ics):
@@ -2067,8 +1759,7 @@ class ZeroDTEBot:
             return True
 
         logger.error(
-            "Could not auto-detect credits from order history or position data. "
-            "Use --credits 2.60,3.00 to specify manually."
+            "Could not auto-detect credits from order history or position data."
         )
         return False
 
@@ -2374,136 +2065,6 @@ class ZeroDTEBot:
 
         return None
 
-    async def multi_ic_monitoring_loop(self, tracked_ics: List[TrackedIronCondor]):
-        """
-        Monitor multiple ICs with tiered TP/SL alerts.
-
-        Each cycle:
-        1. Fetch chain ONCE (shared across all ICs)
-        2. For each non-closed IC: check TP fill, evaluate debit, fire alerts
-        3. Time exit: close all remaining ICs at BOT_EXIT_TIME
-        4. Exit when all ICs closed
-        """
-        exit_time = self._parse_time(settings.BOT_EXIT_TIME)
-
-        logger.info("--- Multi-IC Monitoring Loop Started ---")
-        logger.info(f"  Monitoring {len(tracked_ics)} IC(s)")
-        logger.info(f"  Exit time: {settings.BOT_EXIT_TIME} ET")
-        logger.info(f"  Check interval: {settings.BOT_MONITOR_INTERVAL}s")
-
-        while True:
-            try:
-                now = self._now_et()
-                open_ics = [ic for ic in tracked_ics if not ic.is_closed]
-
-                if not open_ics:
-                    logger.info("=== All ICs closed. Monitoring complete. ===")
-                    break
-
-                # Time exit check
-                if now.time() >= exit_time and not self.skip_wait:
-                    logger.info(f"=== TIME EXIT: Past {settings.BOT_EXIT_TIME} ET ===")
-                    for ic in open_ics:
-                        await self._close_ic(ic, "time_exit")
-                    break
-
-                # Fetch chain once for all ICs
-                chain = await self._fetch_0dte_chain()
-                if not chain:
-                    logger.warning("  Could not fetch chain this cycle, retrying...")
-                    await asyncio.sleep(settings.BOT_MONITOR_INTERVAL)
-                    continue
-
-                for ic in open_ics:
-                    # Check if TP limit order filled
-                    if ic.tp_order_id:
-                        if await self._check_order_filled(ic.tp_order_id):
-                            ic.exit_reason = "take_profit_50"
-                            ic.is_closed = True
-                            logger.info(f"  === {ic.label}: TP limit order FILLED ===")
-                            continue
-
-                    # Get current debit
-                    debit = self.builder.get_current_position_value(chain, ic.strikes)
-                    if debit is None:
-                        logger.debug(f"  {ic.label}: could not get position value")
-                        continue
-
-                    pnl_pct = round((1 - debit / ic.fill_credit) * 100) if ic.fill_credit > 0 else 0
-                    if ic.sltp_active_tier_idx >= 0:
-                        act_pct = ic.sltp_tiers[ic.sltp_active_tier_idx][0]
-                        flr_pct = ic.sltp_tiers[ic.sltp_active_tier_idx][1]
-                        sltp_tag = f" [SLTP {act_pct:.1%}->{flr_pct:.1%} floor@${ic.sltp_floor_debit:.2f}]"
-                    else:
-                        sltp_tag = ""
-                    logger.info(
-                        f"  [{now.strftime('%H:%M:%S')}] {ic.label}: "
-                        f"debit ${debit:.2f}  P/L {pnl_pct:+d}%{sltp_tag}"
-                    )
-
-                    # --- Tiered SLTP: ratcheting profit lock ---
-                    if ic.sltp_tiers:
-                        # Check if we've reached a higher tier (scan from highest to current+1)
-                        for idx in range(len(ic.sltp_tiers) - 1, ic.sltp_active_tier_idx, -1):
-                            act_pct, flr_pct, act_debit, flr_debit = ic.sltp_tiers[idx]
-                            if debit <= act_debit:
-                                ic.sltp_active_tier_idx = idx
-                                ic.sltp_floor_debit = flr_debit
-                                logger.info(
-                                    f"  >>> {ic.label}: SLTP TIER {act_pct:.1%} ACTIVATED "
-                                    f"(debit ${debit:.2f} <= ${act_debit:.2f})"
-                                )
-                                logger.info(
-                                    f"      Floor raised to ${flr_debit:.2f} (locks in {flr_pct:.1%} gain)"
-                                )
-                                play_sound(TP_SOUND)
-                                send_notification(
-                                    f"Profit Lock {act_pct:.1%} - {ic.label}",
-                                    f"Floor ${flr_debit:.2f} ({flr_pct:.1%})"
-                                )
-                                break  # Only need highest matching tier
-
-                        # Check if floor breached (debit reversed up past lock-in)
-                        if ic.sltp_active_tier_idx >= 0 and debit >= ic.sltp_floor_debit:
-                            flr_pct = ic.sltp_tiers[ic.sltp_active_tier_idx][1]
-                            logger.warning(
-                                f"  === {ic.label}: SLTP TRIGGERED at {flr_pct:.1%} floor "
-                                f"(debit ${debit:.2f} >= floor ${ic.sltp_floor_debit:.2f}) ==="
-                            )
-                            play_sound(SL_SOUND)
-                            await self._close_ic(ic, f"sltp_lock_{flr_pct:.1%}")
-                            continue
-
-                    # TP checks (debit falling = good)
-                    if debit <= ic.tp_50_debit and AlertLevel.TP_50 not in ic.alerts_fired:
-                        ic.alerts_fired.add(AlertLevel.TP_50)
-                        ic.alerts_fired.add(AlertLevel.TP_25)  # skip 25 if already at 50
-                        alert_tp(ic, AlertLevel.TP_50, debit)
-
-                    elif debit <= ic.tp_25_debit and AlertLevel.TP_25 not in ic.alerts_fired:
-                        ic.alerts_fired.add(AlertLevel.TP_25)
-                        alert_tp(ic, AlertLevel.TP_25, debit)
-
-                    # SL checks (debit rising = bad) — exit first, then warning
-                    if debit >= ic.sl_exit_debit and AlertLevel.SL_EXIT not in ic.alerts_fired:
-                        ic.alerts_fired.add(AlertLevel.SL_EXIT)
-                        ic.alerts_fired.add(AlertLevel.SL_WARNING)
-                        alert_sl(ic, AlertLevel.SL_EXIT, debit)
-                        await self._close_ic(ic, "stop_loss_portfolio")
-
-                    elif debit >= ic.sl_warning_debit and AlertLevel.SL_WARNING not in ic.alerts_fired:
-                        ic.alerts_fired.add(AlertLevel.SL_WARNING)
-                        alert_sl(ic, AlertLevel.SL_WARNING, debit)
-
-            except Exception as e:
-                logger.error(f"Error in monitoring loop: {e}", exc_info=True)
-
-            if self.skip_wait:
-                logger.info("[SKIP-WAIT] Exiting monitoring loop after one check.")
-                break
-
-            await asyncio.sleep(settings.BOT_MONITOR_INTERVAL)
-
     async def _place_tp_limit_order(self, ic: TrackedIronCondor, debit: float):
         """Place a BUY_TO_CLOSE limit order for a specific IC."""
         # Ceil to $0.05 (fill-friendly: we're buying back, higher = more likely to fill)
@@ -2599,6 +2160,46 @@ class ZeroDTEBot:
 
         logger.info(f"Reached {time_str} ET. Proceeding.")
 
+    def log_trade_result(self):
+        """Write trade result to JSON log file."""
+        if not self.strikes:
+            logger.info("No trade to log (no entry).")
+            return
+
+        log_dir = Path("logs")
+        log_dir.mkdir(exist_ok=True)
+
+        result = {
+            "date": str(date.today()),
+            "timestamp": self._now_et().isoformat(),
+            "mode": "dry_run" if self.dry_run else "live",
+            "symbol": settings.BOT_SYMBOL,
+            "strikes": {
+                "long_put": self.strikes['long_put']['strike'],
+                "short_put": self.strikes['short_put']['strike'],
+                "short_call": self.strikes['short_call']['strike'],
+                "long_call": self.strikes['long_call']['strike'],
+            },
+            "expiration": self.strikes['expiration'],
+            "quantity": self.quantity,
+            "credit": self.fill_credit,
+            "exit_reason": self.exit_reason,
+            "settings": {
+                "target_delta": settings.BOT_SHORT_DELTA,
+                "wing_width": settings.BOT_WING_WIDTH,
+                "tp_pct": settings.BOT_TAKE_PROFIT_PCT,
+                "sl_pct": settings.BOT_STOP_LOSS_PCT,
+                "portfolio_value": self.portfolio_value,
+                "daily_target_pct": settings.BOT_DAILY_TARGET_PCT,
+            }
+        }
+
+        log_path = log_dir / f"zero_dte_bot_{date.today()}.json"
+        with open(log_path, 'w') as f:
+            json.dump(result, f, indent=2, default=str)
+
+        logger.info(f"Trade result logged: {log_path}")
+
     def _log_order(self, label: str, order: dict):
         """Log an order structure for debugging."""
         logger.info(f"  [{label}] Order:")
@@ -2614,36 +2215,16 @@ class ZeroDTEBot:
 
 def main():
     parser = argparse.ArgumentParser(description="0DTE Iron Condor Trading Bot")
-    mode_group = parser.add_mutually_exclusive_group(required=True)
-    mode_group.add_argument('--dry-run', action='store_true', help='Paper trading mode')
-    mode_group.add_argument('--live', action='store_true', help='Real money trading')
-    mode_group.add_argument('--monitor', action='store_true',
-                            help='Monitor existing position(s) with tiered TP/SL alerts')
-    parser.add_argument('--credit', type=float, default=None,
-                        help='Fill credit for single-IC --monitor mode')
-    parser.add_argument('--credits', type=str, default=None,
-                        help='Comma-separated credits for multi-IC --monitor (e.g. "2.60,3.00"). '
-                             'Auto-detected from order history if omitted.')
-    parser.add_argument('--skip-wait', action='store_true', help='Skip time-based waiting')
-    parser.add_argument('--skip-ml', action='store_true', help='Bypass ML confidence check')
-    parser.add_argument('--no-v5', action='store_true',
-                        help='Disable v5 TP models — fall back to v4 or fixed-time entry')
-    parser.add_argument('--no-v4', action='store_true',
-                        help='Disable v4 entry timing — use fixed-time entry at BOT_ENTRY_TIME')
-    parser.add_argument('--manual-approve', action='store_true',
-                        help='Prompt for manual approval when ML score is below threshold')
+    parser.add_argument('--live', action='store_true',
+                        help='Real money mode (default: paper)')
+    parser.add_argument('--skip-wait', action='store_true',
+                        help='Testing: skip time-based waiting')
+    parser.add_argument('--skip-ml', action='store_true',
+                        help='Testing: skip ML/ThetaData')
     parser.add_argument('--strikes', type=str, default=None,
                         help='Manual short strikes as "PUT,CALL" (e.g. "6750,6920"). Bypasses delta selection.')
 
     args = parser.parse_args()
-
-    # Parse --credits into list of floats
-    monitor_credits = None
-    if args.credits:
-        try:
-            monitor_credits = [float(x.strip()) for x in args.credits.split(',')]
-        except ValueError:
-            parser.error(f"Invalid --credits format: '{args.credits}'. Use comma-separated numbers, e.g. '2.60,3.00'")
 
     # Parse manual strikes
     manual_strikes = None
@@ -2677,16 +2258,10 @@ def main():
     logger.add(str(log_path), level="DEBUG", rotation="10 MB")
 
     bot = ZeroDTEBot(
-        dry_run=args.dry_run if not args.monitor else False,
+        dry_run=not args.live,
         skip_wait=args.skip_wait,
         skip_ml=args.skip_ml,
-        no_v4=args.no_v4,
-        no_v5=args.no_v5,
         manual_strikes=manual_strikes,
-        monitor_mode=args.monitor,
-        monitor_credit=args.credit,
-        monitor_credits=monitor_credits,
-        manual_approve=args.manual_approve,
     )
 
     asyncio.run(bot.run())
