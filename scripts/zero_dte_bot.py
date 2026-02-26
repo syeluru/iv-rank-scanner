@@ -21,9 +21,9 @@ Exit via: SLTP trailing lock (primary), 5% ceiling TP (Schwab limit),
 Manual-approve is always on: prompts when ML score is below threshold.
 
 Usage:
-  python scripts/zero_dte_bot.py                          # Paper mode (default)
-  python scripts/zero_dte_bot.py --live                    # Real money
-  python scripts/zero_dte_bot.py --skip-wait --skip-ml     # Testing shortcuts
+  python scripts/zero_dte_bot.py                          # Live mode (default, prompts YES)
+  python scripts/zero_dte_bot.py --paper                   # Paper/dry-run mode
+  python scripts/zero_dte_bot.py --paper --skip-wait --skip-ml  # Quick test
   python scripts/zero_dte_bot.py --strikes 6875,6945       # Manual strikes
 """
 
@@ -2215,8 +2215,8 @@ class ZeroDTEBot:
 
 def main():
     parser = argparse.ArgumentParser(description="0DTE Iron Condor Trading Bot")
-    parser.add_argument('--live', action='store_true',
-                        help='Real money mode (default: paper)')
+    parser.add_argument('--paper', action='store_true',
+                        help='Paper/dry-run mode (default: live)')
     parser.add_argument('--skip-wait', action='store_true',
                         help='Testing: skip time-based waiting')
     parser.add_argument('--skip-ml', action='store_true',
@@ -2236,8 +2236,8 @@ def main():
             print(f"Invalid --strikes format: {args.strikes}. Use 'PUT,CALL' e.g. '6750,6920'")
             return
 
-    # Safety check for live mode
-    if args.live:
+    # Safety confirmation for live mode (default)
+    if not args.paper:
         confirm = input(
             "\n*** LIVE TRADING MODE ***\n"
             "This will place REAL orders with REAL money.\n"
@@ -2258,7 +2258,7 @@ def main():
     logger.add(str(log_path), level="DEBUG", rotation="10 MB")
 
     bot = ZeroDTEBot(
-        dry_run=not args.live,
+        dry_run=args.paper,
         skip_wait=args.skip_wait,
         skip_ml=args.skip_ml,
         manual_strikes=manual_strikes,
