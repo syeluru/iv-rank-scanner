@@ -673,13 +673,14 @@ class ZeroDTEBot:
                     logger.info("Position change detected — re-reconstructing ICs")
                     new_positions = await self._get_spx_positions()
                     new_ics = await self._reconstruct_and_assign(new_positions)
+                    # Always update tracked_symbols to prevent infinite retry loop
+                    tracked_symbols = current_symbols
                     if not new_ics:
                         logger.warning("Re-reconstruction failed. Continuing with existing state.")
                     else:
                         # Carry forward SLTP state for unchanged ICs
                         self._merge_sltp_state(tracked_ics, new_ics)
                         tracked_ics = new_ics
-                        tracked_symbols = current_symbols
                         # Place TP for any new IC missing one
                         for ic in tracked_ics:
                             if not ic.tp_order_id:
@@ -827,8 +828,25 @@ class ZeroDTEBot:
             logger.info("  ThetaData Terminal: running - OK")
             return True
 
-        # Not running — try to start it
-        logger.warning("  ThetaData Terminal not responding. Starting...")
+        # Not running — kill any stale instances before launching fresh
+        logger.warning("  ThetaData Terminal not responding. Killing stale processes...")
+        try:
+            result = subprocess.run(
+                ["pkill", "-9", "-f", "ThetaTerminal"],
+                capture_output=True, timeout=5,
+            )
+            subprocess.run(
+                ["pkill", "-9", "-f", "202602131.jar"],
+                capture_output=True, timeout=5,
+            )
+            if result.returncode == 0:
+                logger.info("  Killed stale ThetaData processes")
+                import time as _time_kill
+                _time_kill.sleep(2)  # let port release
+        except Exception:
+            pass
+
+        logger.info("  Starting fresh ThetaData Terminal...")
 
         if not os.path.exists(THETA_JAR):
             logger.error(f"  ThetaData jar not found at {THETA_JAR}")
@@ -1799,6 +1817,48 @@ class ZeroDTEBot:
 
         return all_assigned
 
+    def _extract_fill_price(self, order: dict) -> float:
+        """
+        Extract actual fill price from execution legs (not the order-level limit price).
+
+        For multi-leg orders, computes net credit:
+          net = sum(SELL leg fills) - sum(BUY leg fills)
+
+        Falls back to order-level 'price' if execution legs are unavailable.
+        Uses legId (1-indexed) to map execution legs to order legs.
+        """
+        activities = order.get('orderActivityCollection', [])
+        legs = order.get('orderLegCollection', [])
+
+        if not activities or not legs:
+            return float(order.get('price', 0) or 0)
+
+        # Build instruction map: legId (1-indexed) -> instruction
+        instruction_by_leg_id = {}
+        for i, leg in enumerate(legs):
+            instruction_by_leg_id[i + 1] = leg.get('instruction', '')
+
+        # Sum fill prices by direction (use first activity for multi-fill)
+        sell_total = 0.0
+        buy_total = 0.0
+        for activity in activities:
+            for exec_leg in activity.get('executionLegs', []):
+                leg_id = exec_leg.get('legId', 0)
+                price = float(exec_leg.get('price', 0))
+                instruction = instruction_by_leg_id.get(leg_id, '')
+                if instruction in ('SELL_TO_OPEN', 'SELL_TO_CLOSE'):
+                    sell_total += price
+                elif instruction in ('BUY_TO_OPEN', 'BUY_TO_CLOSE'):
+                    buy_total += price
+            break  # use first activity only
+
+        net = round(sell_total - buy_total, 2)
+        if net != 0:
+            return abs(net)
+
+        # Fallback to order-level price
+        return float(order.get('price', 0) or 0)
+
     def _classify_order(self, order: dict) -> str:
         """
         Classify a filled order as ENTRY, ROLL, or CLOSE.
@@ -1880,21 +1940,22 @@ class ZeroDTEBot:
                 order_symbols = {
                     l.get('instrument', {}).get('symbol', '') for l in legs
                 }
+                fill_price = self._extract_fill_price(order)
                 entries.append({
                     'symbols': order_symbols,
-                    'price': float(order.get('price', 0)),
+                    'price': fill_price,
                     'quantity': order_qty,
                     'order_id': order.get('orderId'),
                     'time': _order_time(order),
                 })
                 logger.info(f"    ENTRY order {order.get('orderId')}: "
-                            f"{order_qty}x ${order.get('price'):.2f} "
+                            f"{order_qty}x ${fill_price:.2f} "
                             f"type={order.get('complexOrderStrategyType')}")
 
             elif kind == 'ROLL':
                 # Separate BUY_TO_CLOSE (old legs) from SELL_TO_OPEN (new legs)
-                btc_symbols = set()
-                sto_symbols = set()
+                btc_symbols = set()   # all legs being closed (BTC + STC)
+                sto_symbols = set()   # all legs being opened (STO + BTO)
                 btc_short_strikes = []  # old short strikes being closed
                 sto_short_strikes = []  # new short strikes being opened
                 for l in legs:
@@ -1910,6 +1971,12 @@ class ZeroDTEBot:
                         parsed = self.builder.parse_option_symbol(sym)
                         if parsed:
                             sto_short_strikes.append(parsed)
+                    elif inst == 'SELL_TO_CLOSE':
+                        # Long leg being closed (e.g., 4-leg spread roll)
+                        btc_symbols.add(sym)
+                    elif inst == 'BUY_TO_OPEN':
+                        # Long leg being opened (e.g., 4-leg spread roll)
+                        sto_symbols.add(sym)
 
                 # Determine if roll is closer-to-ATM (credit) or further (debit)
                 # by comparing old short strike to new short strike
@@ -1928,10 +1995,11 @@ class ZeroDTEBot:
                                 break
                         break  # only need to check one pair
 
+                roll_fill_price = self._extract_fill_price(order)
                 rolls.append({
                     'btc_symbols': btc_symbols,
                     'sto_symbols': sto_symbols,
-                    'price': float(order.get('price', 0)),
+                    'price': roll_fill_price,
                     'is_credit': roll_is_credit,
                     'quantity': order_qty,
                     'order_id': order.get('orderId'),
@@ -1939,7 +2007,7 @@ class ZeroDTEBot:
                 })
                 direction = "credit" if roll_is_credit else "debit"
                 logger.info(f"    ROLL order {order.get('orderId')}: "
-                            f"{order_qty}x ${order.get('price'):.2f} ({direction}) "
+                            f"{order_qty}x ${roll_fill_price:.2f} ({direction}) "
                             f"close={btc_symbols} open={sto_symbols}")
 
             elif kind == 'CLOSE':

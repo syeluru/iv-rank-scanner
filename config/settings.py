@@ -123,14 +123,14 @@ class Settings(BaseSettings):
 
     # v4 Entry Timing
     BOT_V4_ENABLED: bool = True               # Enable v4 dynamic entry (False = fixed-time entry)
-    BOT_V4_ENTRY_START: str = "10:00"         # Start scanning for entry (HH:MM ET)
+    BOT_V4_ENTRY_START: str = "10:30"         # Start scanning for entry (HH:MM ET)
     BOT_V4_ENTRY_END: str = "14:00"           # Stop scanning (HH:MM ET)
     BOT_V4_SCAN_INTERVAL: int = 5             # Minutes between scans
     BOT_V4_MIN_CONFIDENCE: float = 0.55       # v4 P(profitable) threshold for entry
 
     # v5 Take-Profit Models
     BOT_V5_ENABLED: bool = True                # Enable v5 TP-based models (falls back to v4 if False)
-    BOT_V5_TP25_THRESHOLD: float = 0.65        # Min P(hit 25% TP) to enter
+    BOT_V5_TP25_THRESHOLD: float = 0.635       # Min P(hit 25% TP) to enter
     BOT_V5_TP50_THRESHOLD: float = 0.60        # Min P(hit 50% TP) — informational/future
     BOT_FOMC_GATE_ENABLED: bool = True         # Enable FOMC-day awareness
     BOT_FOMC_SKIP_DAY: bool = False            # If True, skip FOMC announcement days entirely
