@@ -1,0 +1,7 @@
+.env
+.env.*
+data/
+__pycache__/
+*.pyc
+models/
+theta_terminal/
