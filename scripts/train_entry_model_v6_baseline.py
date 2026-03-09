@@ -1,60 +1,69 @@
 #!/usr/bin/env python3
 """
-Train v5 take-profit prediction models for 0DTE Iron Condor trades.
+Train v6 baseline take-profit prediction models for 0DTE Iron Condor trades.
 
-The v4 model predicts P(profitable at 3PM close), but the bot actually
-uses dynamic take-profit orders (25% and 50% of credit). A trade that
-hits 25% TP at 11:30 but is underwater at 3PM was a WIN that v4 labels
-as a loss.
-
-v5 fixes this mismatch by training two models:
-  - v5.1: P(hit 25% take-profit before 3PM) — "will I get my quick exit?"
-  - v5.2: P(hit 50% take-profit before 3PM) — "will I get a big win?"
-
-The labels `hit_25pct` and `hit_50pct` already exist in the training
-dataset. No dataset rebuild needed.
-
-Additionally includes economic calendar features (is_fomc_day, is_fomc_week)
-already present in the dataset.
+v6 baseline changes from v5:
+  1. XGBoost instead of Random Forest
+  2. Expanded from 26 to 41 features:
+     - VIX extended: vix_level, vix_change_1d, vix_change_5d, vix_rank_30d, vix_term_slope
+     - Options: iv_skew_10d, short_put_delta, short_call_delta
+     - Calendar: days_since_fomc, dow_sin, dow_cos, is_friday
+     - Intraday: orb_contained, orb_range_pct, momentum_30min
 
 Usage:
-    python scripts/train_entry_model_v5.py --target hit_25pct --cv 5
-    python scripts/train_entry_model_v5.py --target hit_50pct --cv 5
-    python scripts/train_entry_model_v5.py --both --cv 5
-    python scripts/train_entry_model_v5.py --both --threshold 0.80
+    python scripts/train_entry_model_v6_baseline.py --target hit_25pct --cv 5
+    python scripts/train_entry_model_v6_baseline.py --target hit_50pct --cv 5
+    python scripts/train_entry_model_v6_baseline.py --both --cv 5
 """
 
 import argparse
 import sys
 from pathlib import Path
+import time
 
 import joblib
 import numpy as np
 import pandas as pd
-from loguru import logger
-from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import (
     accuracy_score,
     average_precision_score,
     classification_report,
     roc_auc_score,
 )
+from xgboost import XGBClassifier
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
 PROJECT_ROOT = Path(__file__).parent.parent
 TRAINING_DATA_DIR = PROJECT_ROOT / "ml" / "training_data"
 MODEL_DIR = PROJECT_ROOT / "ml" / "artifacts" / "models"
+V6_DIR = MODEL_DIR / "v6"
 
-# ── v5 Features (26) ────────────────────────────────────────────────────────
-# Same 24 as v4, plus 2 economic calendar features
-V5_FEATURES = [
-    # Retained v3 day-level features (5) — important for day-level context
+# ── v6 Features (41) ────────────────────────────────────────────────────────
+# Expanded from v5's 26 features to 41 features
+V6_FEATURES = [
+    # VIX extended (8) - expanded from 2 to 8
+    "vix_level",
+    "vix_change_1d",
+    "vix_change_5d",
+    "vix_rank_30d",
     "vix_sma_10d_dist",
+    "vix_term_slope",
+    # Volatility (6) - retained from v5
+    "rv_close_5d",
+    "rv_close_10d",
+    "rv_close_20d",
     "iv_rv_ratio",
+    "atm_iv",
+    "garman_klass_rv",
+    # Options (3) - new
+    "iv_skew_10d",
+    "short_put_delta",
+    "short_call_delta",
+    # Price action (3) - retained from v5
     "gap_pct",
     "prior_day_range_pct",
-    "atm_iv",
-    # New technical indicators (11) — all time-varying within day
+    "prior_day_return",
+    # Technical indicators (11) - retained from v5
     "adx",
     "efficiency_ratio",
     "choppiness_index",
@@ -64,22 +73,26 @@ V5_FEATURES = [
     "bbw_percentile",
     "ttm_squeeze",
     "bars_in_squeeze",
-    "garman_klass_rv",
     "orb_failure",
-    # Derived cross-features (3) — time-varying
-    "gk_rv_vs_atm_iv",
-    "range_vs_vix_range",
+    "sma_20d_dist",
+    # Intraday (6) - expanded from 2 to 6
+    "intraday_rv",
+    "high_low_range_pct",
+    "orb_contained",
+    "orb_range_pct",
+    "momentum_30min",
     "range_exhaustion_pct",
-    # Time features (3) — time-varying
+    # Time features (3) - retained from v5
     "time_sin",
     "time_cos",
     "minutes_to_close",
-    # Existing intraday (2) — time-varying
-    "intraday_rv",
-    "high_low_range_pct",
-    # Economic calendar (2) — day-level
+    # Calendar (6) - expanded from 2 to 6
     "is_fomc_week",
     "is_fomc_day",
+    "days_since_fomc",
+    "dow_sin",
+    "dow_cos",
+    "is_friday",
 ]
 
 # ── Derived feature definitions ───────────────────────────────────────────────
@@ -92,21 +105,36 @@ VALID_TARGETS = {"hit_25pct", "hit_50pct"}
 
 # Output filename mapping
 TARGET_OUTPUT_NAMES = {
-    "hit_25pct": "entry_timing_v5_tp25.joblib",
-    "hit_50pct": "entry_timing_v5_tp50.joblib",
+    "hit_25pct": "entry_timing_v6_baseline_tp25.joblib",
+    "hit_50pct": "entry_timing_v6_baseline_tp50.joblib",
 }
+
+
+def log_info(msg):
+    """Simple logger replacement."""
+    print(f"[INFO] {msg}")
+
+
+def log_warning(msg):
+    """Simple logger replacement."""
+    print(f"[WARNING] {msg}")
+
+
+def log_error(msg):
+    """Simple logger replacement."""
+    print(f"[ERROR] {msg}")
 
 
 def load_dataset(path: Path) -> pd.DataFrame:
     """Load and validate the multi-entry training dataset."""
     df = pd.read_csv(path)
-    logger.info(f"Loaded {len(df)} rows from {path.name}")
-    logger.info(f"  Date range: {df['trade_date'].min()} to {df['trade_date'].max()}")
+    log_info(f"Loaded {len(df)} rows from {path.name}")
+    log_info(f"  Date range: {df['trade_date'].min()} to {df['trade_date'].max()}")
     if "entry_time" in df.columns:
         n_times = df["entry_time"].nunique()
-        logger.info(f"  Entry times: {n_times} unique slots")
+        log_info(f"  Entry times: {n_times} unique slots")
     else:
-        logger.warning("  No 'entry_time' column — treating as single-entry dataset")
+        log_warning("  No 'entry_time' column — treating as single-entry dataset")
     return df
 
 
@@ -115,7 +143,7 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     rv20 = df["rv_close_20d"].clip(lower=1)
     df["iv_rv_ratio"] = df["atm_iv"] / rv20
-    logger.info(f"  Engineered {len(DERIVED_FEATURES)} derived features")
+    log_info(f"  Engineered {len(DERIVED_FEATURES)} derived features")
     return df
 
 
@@ -131,7 +159,7 @@ def create_labels(df: pd.DataFrame, target: str = "hit_25pct") -> pd.DataFrame:
     n_pos = df["target"].sum()
     n_valid = df["target"].notna().sum()
     rate = n_pos / n_valid if n_valid > 0 else 0
-    logger.info(f"  Target '{target}': {rate:.1%} base rate ({n_pos:.0f}/{n_valid} rows)")
+    log_info(f"  Target '{target}': {rate:.1%} base rate ({n_pos:.0f}/{n_valid} rows)")
     return df
 
 
@@ -184,7 +212,7 @@ def prepare_data(df: pd.DataFrame, target: str, test_months: int = 6) -> tuple:
     valid = valid.reset_index(drop=True)
 
     if len(valid) < 100:
-        logger.error(f"Too few valid samples ({len(valid)}) for training")
+        log_error(f"Too few valid samples ({len(valid)}) for training")
         sys.exit(1)
 
     max_date = valid["trade_date"].max()
@@ -192,20 +220,20 @@ def prepare_data(df: pd.DataFrame, target: str, test_months: int = 6) -> tuple:
     train = valid[valid["trade_date"] < cutoff]
     test = valid[valid["trade_date"] >= cutoff]
 
-    features = [c for c in V5_FEATURES if c in valid.columns]
-    missing = [c for c in V5_FEATURES if c not in valid.columns]
+    features = [c for c in V6_FEATURES if c in valid.columns]
+    missing = [c for c in V6_FEATURES if c not in valid.columns]
     if missing:
-        logger.warning(f"  Missing features: {missing}")
+        log_warning(f"  Missing features: {missing}")
 
     n_train_days = train["trade_date"].dt.date.nunique()
     n_test_days = test["trade_date"].dt.date.nunique()
 
-    logger.info(f"  Features: {len(features)}")
-    logger.info(f"  Train: {len(train)} rows ({n_train_days} days) "
+    log_info(f"  Features: {len(features)}")
+    log_info(f"  Train: {len(train)} rows ({n_train_days} days) "
                 f"({train['trade_date'].min().date()} -> {train['trade_date'].max().date()})")
-    logger.info(f"  Test:  {len(test)} rows ({n_test_days} days) "
+    log_info(f"  Test:  {len(test)} rows ({n_test_days} days) "
                 f"({test['trade_date'].min().date()} -> {test['trade_date'].max().date()})")
-    logger.info(f"  Train hit rate: {train['target'].mean():.1%}, "
+    log_info(f"  Train hit rate: {train['target'].mean():.1%}, "
                 f"Test: {test['target'].mean():.1%}")
 
     X_train = train[features].replace([np.inf, -np.inf], np.nan).fillna(0).values
@@ -216,15 +244,26 @@ def prepare_data(df: pd.DataFrame, target: str, test_months: int = 6) -> tuple:
     return X_train, X_test, y_train, y_test, train, test, features
 
 
-def train_rf(X_train, y_train):
-    """Train Random Forest for TP prediction."""
-    model = RandomForestClassifier(
+def train_xgb(X_train, y_train):
+    """Train XGBoost for TP prediction."""
+    # Calculate scale_pos_weight from class imbalance
+    n_pos = y_train.sum()
+    n_neg = len(y_train) - n_pos
+    scale_pos_weight = n_neg / n_pos if n_pos > 0 else 1.0
+    
+    model = XGBClassifier(
         n_estimators=500,
         max_depth=6,
-        min_samples_leaf=20,
-        class_weight="balanced_subsample",
+        learning_rate=0.05,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        gamma=1,
+        min_child_weight=25,
+        scale_pos_weight=scale_pos_weight,
+        tree_method='hist',
         random_state=42,
         n_jobs=-1,
+        eval_metric='logloss',
     )
     model.fit(X_train, y_train)
     return model
@@ -256,13 +295,13 @@ def run_cv(df: pd.DataFrame, target: str, features: list, n_splits: int = 5) -> 
         dates = valid.iloc[test_idx]["trade_date"]
         n_test_days = len(np.unique(groups[test_idx]))
 
-        rf = train_rf(X_tr, y_tr)
-        y_prob = rf.predict_proba(X_te)[:, 1]
+        xgb = train_xgb(X_tr, y_tr)
+        y_prob = xgb.predict_proba(X_te)[:, 1]
         auc = roc_auc_score(y_te, y_prob) if len(np.unique(y_te)) > 1 else 0.5
 
         # Economic eval: noon hit rate vs model-guided hit rate
         test_df = valid.iloc[test_idx].copy()
-        test_df["v5_score"] = y_prob
+        test_df["v6_score"] = y_prob
 
         noon_hits = 0
         noon_total = 0
@@ -285,15 +324,15 @@ def run_cv(df: pd.DataFrame, target: str, features: list, n_splits: int = 5) -> 
             "noon_total": noon_total,
         })
 
-        logger.info(
+        log_info(
             f"  Fold {fold+1}: {dates.min().date()}->{dates.max().date()}, "
             f"{n_test_days} days, AUC={auc:.3f}, "
             f"noon hit rate={noon_hits}/{noon_total}"
         )
 
-    logger.info("\n  CV Summary:")
+    log_info("\n  CV Summary:")
     avg_auc = np.mean([r["auc"] for r in results])
-    logger.info(f"    Avg AUC: {avg_auc:.3f}")
+    log_info(f"    Avg AUC: {avg_auc:.3f}")
 
     return results
 
@@ -311,31 +350,31 @@ def evaluate_model(model, X_test, y_test, features, test_df, target, threshold):
     auc = roc_auc_score(y_test, y_prob) if len(np.unique(y_test)) > 1 else 0.5
     ap = average_precision_score(y_test, y_prob) if y_test.sum() > 0 else 0
 
-    logger.info("\n" + "=" * 65)
-    logger.info(f"MODEL EVALUATION — v5 {tp_label} (out-of-sample)")
-    logger.info("=" * 65)
-    logger.info(f"\n  AUC-ROC:    {auc:.4f}")
-    logger.info(f"  PR-AUC:     {ap:.4f}")
-    logger.info(f"  Prob range: [{y_prob.min():.4f}, {y_prob.max():.4f}]")
-    logger.info(f"  Accuracy @{threshold}: {accuracy_score(y_test, y_pred):.3f}")
+    log_info("\n" + "=" * 65)
+    log_info(f"MODEL EVALUATION — v6 {tp_label} (out-of-sample)")
+    log_info("=" * 65)
+    log_info(f"\n  AUC-ROC:    {auc:.4f}")
+    log_info(f"  PR-AUC:     {ap:.4f}")
+    log_info(f"  Prob range: [{y_prob.min():.4f}, {y_prob.max():.4f}]")
+    log_info(f"  Accuracy @{threshold}: {accuracy_score(y_test, y_pred):.3f}")
 
     # Feature importance
     importances = model.feature_importances_
     feat_imp = sorted(zip(features, importances), key=lambda x: x[1], reverse=True)
     max_imp = max(importances) if max(importances) > 0 else 1
 
-    logger.info(f"\n  Feature Importances:")
-    for name, imp in feat_imp:
+    log_info(f"\n  Feature Importances (top 20):")
+    for name, imp in feat_imp[:20]:
         bar = "#" * int(imp / max_imp * 30)
-        logger.info(f"    {name:28s} {imp:.4f}  {bar}")
+        log_info(f"    {name:28s} {imp:.4f}  {bar}")
 
     # ── Economic evaluation (TP-focused) ──
-    logger.info("\n" + "=" * 65)
-    logger.info(f"ECONOMIC EVALUATION — {tp_label}")
-    logger.info("=" * 65)
+    log_info("\n" + "=" * 65)
+    log_info(f"ECONOMIC EVALUATION — {tp_label}")
+    log_info("=" * 65)
 
     test_copy = test_df.copy()
-    test_copy["v5_score"] = y_prob
+    test_copy["v6_score"] = y_prob
 
     # Per-day analysis
     day_results = []
@@ -349,8 +388,8 @@ def evaluate_model(model, X_test, y_test, features, test_df, target, threshold):
             noon_hit = 0
             noon_time_to_tp = np.nan
 
-        # v5 threshold: enter at first time above threshold
-        above = group[group["v5_score"] >= threshold]
+        # v6 threshold: enter at first time above threshold
+        above = group[group["v6_score"] >= threshold]
         if len(above) > 0:
             first_above = above.iloc[0]
             thresh_hit = int(first_above["target"])
@@ -387,33 +426,33 @@ def evaluate_model(model, X_test, y_test, features, test_df, target, threshold):
     thresh_hit_rate = thresh_hits / n_entered if n_entered > 0 else 0
     thresh_avg_time = entered_df["thresh_time_to_tp"].dropna().mean()
 
-    logger.info(f"\n  {n_days} test days:")
-    logger.info(f"")
-    logger.info(f"  Strategy          {tp_label} Hit Rate   Avg Time-to-TP   Days Traded   Skip Rate")
-    logger.info(f"  {'─'*15}    {'─'*14}   {'─'*14}   {'─'*11}   {'─'*9}")
-    logger.info(
+    log_info(f"\n  {n_days} test days:")
+    log_info(f"")
+    log_info(f"  Strategy          {tp_label} Hit Rate   Avg Time-to-TP   Days Traded   Skip Rate")
+    log_info(f"  {'─'*15}    {'─'*14}   {'─'*14}   {'─'*11}   {'─'*9}")
+    log_info(
         f"  Noon (baseline)   {noon_hit_rate:>12.1%}   "
         f"{'%6.0f min' % noon_avg_time if not np.isnan(noon_avg_time) else '   N/A':>14s}   "
         f"{n_days:>11d}   {'0%':>9s}"
     )
     if n_entered > 0:
-        logger.info(
-            f"  v5 thresh={threshold:.2f}   {thresh_hit_rate:>12.1%}   "
+        log_info(
+            f"  v6 thresh={threshold:.2f}   {thresh_hit_rate:>12.1%}   "
             f"{'%6.0f min' % thresh_avg_time if not np.isnan(thresh_avg_time) else '   N/A':>14s}   "
             f"{n_entered:>11d}   {skip_rate:>8.0%}"
         )
     else:
-        logger.info(f"  v5 thresh={threshold:.2f}   No entries (threshold too high)")
+        log_info(f"  v6 thresh={threshold:.2f}   No entries (threshold too high)")
 
     # Threshold sweep
-    logger.info(f"\n  Threshold sweep:")
-    logger.info(f"    {'Thresh':>7s}  {'Entered':>8s}  {'Skip%':>6s}  {'Hit Rate':>9s}  {'Avg Time':>9s}  {'Lift':>6s}")
-    logger.info(f"    {'─'*7}  {'─'*8}  {'─'*6}  {'─'*9}  {'─'*9}  {'─'*6}")
+    log_info(f"\n  Threshold sweep:")
+    log_info(f"    {'Thresh':>7s}  {'Entered':>8s}  {'Skip%':>6s}  {'Hit Rate':>9s}  {'Avg Time':>9s}  {'Lift':>6s}")
+    log_info(f"    {'─'*7}  {'─'*8}  {'─'*6}  {'─'*9}  {'─'*9}  {'─'*6}")
     for t in [0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90]:
         entered_days = []
         for _, row in day_df.iterrows():
             group = test_copy[pd.to_datetime(test_copy["trade_date"]).dt.date == row["date"]]
-            above = group[group["v5_score"] >= t]
+            above = group[group["v6_score"] >= t]
             if len(above) > 0:
                 first = above.iloc[0]
                 entered_days.append({
@@ -429,7 +468,7 @@ def evaluate_model(model, X_test, y_test, features, test_df, target, threshold):
         skip = 1 - n_e / n_days
         lift = hit_rate - noon_hit_rate
         time_str = f"{avg_t:7.0f}m" if not np.isnan(avg_t) else "    N/A"
-        logger.info(
+        log_info(
             f"    {t:>6.2f}   {n_e:>6d}    {skip:>5.0%}   {hit_rate:>7.1%}   {time_str}  {lift:>+5.1%}"
         )
 
@@ -437,62 +476,50 @@ def evaluate_model(model, X_test, y_test, features, test_df, target, threshold):
 
 
 def save_model(model, features, metrics, target, output_path):
-    """Save v5 model artifact."""
+    """Save v6 model artifact."""
     artifact = {
         "model": model,
-        "model_version": "v5",
-        "model_type": "RandomForestClassifier",
+        "model_version": "v6_baseline",
+        "model_type": "XGBClassifier",
         "feature_names": features,
         "n_features": len(features),
         "label": target,
         "derived_features": DERIVED_FEATURES,
         "metrics": metrics,
         "description": (
-            f"v5 TP prediction model for 0DTE IC trades. "
+            f"v6 baseline TP prediction model for 0DTE IC trades. "
+            f"Uses XGBoost with 41 features (expanded from v5's 26). "
             f"Predicts P({target}) at each 5-min interval. "
-            f"Higher = more likely to hit take-profit target. "
-            f"Use with v3 risk filter as day-level pre-screen."
+            f"Higher = more likely to hit take-profit target."
         ),
     }
     output_path.parent.mkdir(parents=True, exist_ok=True)
     joblib.dump(artifact, output_path)
-    logger.info(f"\nModel saved to: {output_path}")
-    logger.info(f"  Version: v5")
-    logger.info(f"  Target: {target}")
-    logger.info(f"  Features: {len(features)}")
+    log_info(f"\nModel saved to: {output_path}")
+    log_info(f"  Version: v6_baseline")
+    log_info(f"  Model type: XGBoost")
+    log_info(f"  Target: {target}")
+    log_info(f"  Features: {len(features)}")
 
 
 def train_one_target(args, target: str, output_path: Path = None):
-    """Train a single v5 model for the given target."""
-    output_path = output_path or (MODEL_DIR / TARGET_OUTPUT_NAMES[target])
+    """Train a single v6 model for the given target."""
+    output_path = output_path or (V6_DIR / TARGET_OUTPUT_NAMES[target])
     tp_label = "25% TP" if target == "hit_25pct" else "50% TP"
 
-    logger.info("=" * 65)
-    logger.info(f"0DTE Iron Condor v5 Model — {tp_label}")
-    logger.info("=" * 65)
-    logger.info(f"  Dataset:    {args.dataset}")
-    logger.info(f"  Target:     {target}")
-    logger.info(f"  Threshold:  {args.threshold}")
-    logger.info(f"  Test months: {args.test_months}")
-    logger.info(f"  Output:     {output_path}")
+    log_info("=" * 65)
+    log_info(f"0DTE Iron Condor v6 Baseline Model — {tp_label}")
+    log_info("=" * 65)
+    log_info(f"  Dataset:    {args.dataset}")
+    log_info(f"  Target:     {target}")
+    log_info(f"  Threshold:  {args.threshold}")
+    log_info(f"  Test months: {args.test_months}")
+    log_info(f"  Output:     {output_path}")
 
     # Load & prepare
     df = load_dataset(args.dataset)
     df = engineer_features(df)
     df = create_labels(df, target=target)
-
-    # ── Intraday variance check ──────────────────────────────────────────────
-    day_level = {"vix_sma_10d_dist", "iv_rv_ratio", "gap_pct", "prior_day_range_pct",
-                 "atm_iv", "is_fomc_week", "is_fomc_day"}
-    time_varying = [f for f in V5_FEATURES if f in df.columns and f not in day_level]
-    if "entry_time" in df.columns and len(time_varying) > 0:
-        logger.info("\n  Intraday variance check (should be > 0 for time-varying features):")
-        daily_std = df.groupby("trade_date")[time_varying].std()
-        mean_std = daily_std.mean()
-        for feat in time_varying:
-            std_val = mean_std.get(feat, 0)
-            status = "OK" if std_val > 0 else "ZERO-VARIANCE"
-            logger.info(f"    {feat:28s} avg_within_day_std={std_val:.6f}  [{status}]")
 
     X_train, X_test, y_train, y_test, train_df, test_df, features = prepare_data(
         df, target, args.test_months
@@ -500,16 +527,19 @@ def train_one_target(args, target: str, output_path: Path = None):
 
     # CV
     if args.cv > 0:
-        logger.info("\n" + "=" * 65)
-        logger.info(f"Cross-validation ({args.cv} folds, grouped by date)...")
+        log_info("\n" + "=" * 65)
+        log_info(f"Cross-validation ({args.cv} folds, grouped by date)...")
         run_cv(df, target, features, args.cv)
 
     # Train
-    logger.info("\n" + "=" * 65)
-    logger.info("Training Random Forest...")
-    model = train_rf(X_train, y_train)
-    logger.info(f"  Trees: {model.n_estimators}, Depth: {model.max_depth}, "
-                f"MinLeaf: {model.min_samples_leaf}")
+    log_info("\n" + "=" * 65)
+    log_info("Training XGBoost...")
+    start_time = time.time()
+    model = train_xgb(X_train, y_train)
+    train_time = time.time() - start_time
+    log_info(f"  Trees: {model.n_estimators}, Depth: {model.max_depth}, "
+                f"Learning rate: {model.learning_rate}")
+    log_info(f"  Training time: {train_time:.1f}s")
 
     # Evaluate
     y_prob, metrics = evaluate_model(model, X_test, y_test, features, test_df, target, args.threshold)
@@ -518,15 +548,16 @@ def train_one_target(args, target: str, output_path: Path = None):
     metrics["test_hit_rate"] = float(y_test.mean())
     metrics["threshold"] = args.threshold
     metrics["target"] = target
+    metrics["train_time_seconds"] = train_time
 
     # Save
     save_model(model, features, metrics, target, output_path)
-    logger.info(f"\n{'=' * 65}")
+    log_info(f"\n{'=' * 65}")
     return metrics
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train 0DTE IC v5 take-profit models")
+    parser = argparse.ArgumentParser(description="Train 0DTE IC v6 baseline XGBoost models")
     parser.add_argument(
         "--dataset", type=Path,
         default=TRAINING_DATA_DIR / "training_dataset_multi_w25.csv",
@@ -539,33 +570,23 @@ def main():
                         choices=["hit_25pct", "hit_50pct"],
                         help="Target label to train on")
     parser.add_argument("--both", action="store_true",
-                        help="Train both v5.1 (25%% TP) and v5.2 (50%% TP) sequentially")
+                        help="Train both v6.1 (25%% TP) and v6.2 (50%% TP) sequentially")
     parser.add_argument("--output", type=Path, default=None,
                         help="Custom output path (only for single-target mode)")
-    parser.add_argument("--model-suffix", type=str, default="",
-                        help="Suffix for model filenames (e.g., '_d15', '_d20')")
     args = parser.parse_args()
 
     if args.both:
-        suffix = args.model_suffix
-        tp25_name = f"entry_timing_v5_tp25{suffix}.joblib"
-        tp50_name = f"entry_timing_v5_tp50{suffix}.joblib"
-        logger.info(f"Training both TP25 and TP50{' (suffix=' + suffix + ')' if suffix else ''}...\n")
-        m1 = train_one_target(args, "hit_25pct", MODEL_DIR / tp25_name)
-        logger.info("\n")
-        m2 = train_one_target(args, "hit_50pct", MODEL_DIR / tp50_name)
-        logger.info("\nDone! Both models trained.")
-        logger.info(f"  TP25 AUC: {m1['auc_roc']:.4f}  |  TP50 AUC: {m2['auc_roc']:.4f}")
+        log_info(f"Training both TP25 and TP50...\n")
+        m1 = train_one_target(args, "hit_25pct", V6_DIR / "entry_timing_v6_baseline_tp25.joblib")
+        log_info("\n")
+        m2 = train_one_target(args, "hit_50pct", V6_DIR / "entry_timing_v6_baseline_tp50.joblib")
+        log_info("\nDone! Both models trained.")
+        log_info(f"  TP25 AUC: {m1['auc_roc']:.4f}  |  TP50 AUC: {m2['auc_roc']:.4f}")
+        log_info(f"  TP25 train time: {m1['train_time_seconds']:.1f}s  |  TP50 train time: {m2['train_time_seconds']:.1f}s")
     else:
-        if args.output:
-            out = args.output
-        elif args.model_suffix:
-            base_name = TARGET_OUTPUT_NAMES[args.target]
-            out = MODEL_DIR / base_name.replace(".joblib", f"{args.model_suffix}.joblib")
-        else:
-            out = None
+        out = args.output or (V6_DIR / TARGET_OUTPUT_NAMES[args.target])
         train_one_target(args, args.target, out)
-        logger.info("\nDone!")
+        log_info("\nDone!")
 
 
 if __name__ == "__main__":

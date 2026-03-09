@@ -53,6 +53,10 @@ class RegimeFeaturesExtractor(BaseFeatureExtractor):
         """
         features = {}
 
+        # Strip timezone info — DB stores tz-naive timestamps
+        if hasattr(timestamp, 'tzinfo') and timestamp.tzinfo is not None:
+            timestamp = timestamp.replace(tzinfo=None)
+
         try:
             # Volatility regime
             features['vol_regime'] = await self._classify_vol_regime(timestamp, vix_level)

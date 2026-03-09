@@ -40,6 +40,10 @@ class MarketFeaturesExtractor(BaseFeatureExtractor):
         """
         features = {}
 
+        # Strip timezone info — DB stores tz-naive timestamps
+        if hasattr(timestamp, 'tzinfo') and timestamp.tzinfo is not None:
+            timestamp = timestamp.replace(tzinfo=None)
+
         try:
             # Get VIX data (last 30 days for changes, last 30 min for correlation)
             vix_end = timestamp

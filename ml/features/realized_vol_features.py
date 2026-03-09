@@ -42,6 +42,10 @@ class RealizedVolExtractor(BaseFeatureExtractor):
         """
         features = {}
 
+        # Strip timezone info — DB stores tz-naive timestamps
+        if hasattr(timestamp, 'tzinfo') and timestamp.tzinfo is not None:
+            timestamp = timestamp.replace(tzinfo=None)
+
         try:
             # Get historical candles (25 trading days for 20-day vol)
             end_time = timestamp

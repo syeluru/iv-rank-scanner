@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
 """
-0DTE Iron Condor Automated Trading Bot — Unified Mode.
+0DTE Iron Condor Automated Trading Bot — Persistent 24/7 Mode.
+
+Runs continuously: sleeps overnight/weekends, wakes for each trading day.
+Supports re-entry after a trade closes (if ML still signals and within entry window).
+Daily circuit breakers: 5% portfolio gain OR 10% portfolio loss stops trading for the day.
 
 Single adaptive flow that auto-detects Schwab state:
   - No positions → ML scan entry → monitor
   - Positions exist → reconstruct ICs → monitor
   - Adapts to manual changes (rolls, closes, new ICs) mid-monitoring
+  - After trade closes: re-enters if within scan window and circuit breakers allow
 
 Entry modes (automatic fallback chain):
   v5 dynamic (default): Scans 10:00-14:00 ET every 5 min using ML TP prediction
@@ -21,9 +26,9 @@ Exit via: SLTP trailing lock (primary), 5% ceiling TP (Schwab limit),
 Manual-approve is always on: prompts when ML score is below threshold.
 
 Usage:
-  python scripts/zero_dte_bot.py                          # Live mode (default, prompts YES)
-  python scripts/zero_dte_bot.py --paper                   # Paper/dry-run mode
-  python scripts/zero_dte_bot.py --paper --skip-wait --skip-ml  # Quick test
+  python scripts/zero_dte_bot.py                          # Live persistent mode (prompts YES)
+  python scripts/zero_dte_bot.py --paper                   # Paper persistent mode
+  python scripts/zero_dte_bot.py --paper --skip-wait --skip-ml  # Quick test (single cycle)
   python scripts/zero_dte_bot.py --strikes 6875,6945       # Manual strikes
 """
 
@@ -202,6 +207,9 @@ class ZeroDTEBot:
         self.skip_ml = skip_ml
         self.manual_strikes = manual_strikes  # (short_put, short_call) or None
 
+        # Sync global PAPER_TRADING setting with bot's dry_run flag
+        settings.PAPER_TRADING = dry_run
+
         self.builder = IronCondorOrderBuilder()
 
         # State
@@ -214,9 +222,10 @@ class ZeroDTEBot:
         self.exit_reason = None
         self.portfolio_value = 0.0  # populated from Schwab at startup
 
-        # v4 entry timing state
+        # v4/v5 entry timing state
         self._v3_cached_confidence = None  # cache v3 day-level pre-screen
         self._v4_daily_data_cache = None   # cache daily data for v4 features
+        self._chosen_delta = None          # multi-delta: chosen delta for entry
 
         # Lazy-loaded components
         self._schwab_client = None
@@ -315,7 +324,7 @@ class ZeroDTEBot:
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(None, self._prompt_sync, prompt, timeout)
 
-    async def _compute_entry_preview(self, chain: dict) -> Optional[dict]:
+    async def _compute_entry_preview(self, chain: dict, target_delta: float = None) -> Optional[dict]:
         """Compute order preview (strikes, sizing, TP/SL) without placing any orders."""
         try:
             # Select strikes
@@ -330,7 +339,7 @@ class ZeroDTEBot:
             else:
                 strikes = self.builder.select_strikes(
                     chain,
-                    target_delta=settings.BOT_SHORT_DELTA,
+                    target_delta=target_delta or settings.BOT_SHORT_DELTA,
                     wing_width=settings.BOT_WING_WIDTH,
                 )
             if not strikes:
@@ -382,23 +391,92 @@ class ZeroDTEBot:
             logger.debug(f"  Preview computation failed: {e}")
             return None
 
-    # ===== Unified Bot Lifecycle =====
+    # ===== Persistent Bot Lifecycle =====
 
     async def run(self):
-        """Unified bot lifecycle: detect state -> entry or monitor -> shutdown."""
+        """Persistent bot lifecycle: sleep → wake → trade → repeat forever."""
         logger.info("=" * 60)
-        logger.info("0DTE Iron Condor Bot Starting")
-        logger.info(f"Date: {date.today()}")
+        logger.info("0DTE Iron Condor Bot Starting (PERSISTENT MODE)")
         logger.info(f"Mode: {'PAPER' if self.dry_run else 'LIVE'}")
+        logger.info(f"Daily limits: +{settings.BOT_DAILY_GAIN_LIMIT_PCT:.0%} gain / "
+                     f"-{settings.BOT_DAILY_LOSS_LIMIT_PCT:.0%} loss")
         logger.info("=" * 60)
 
         try:
-            # Step 1: Merged pre-flight
-            if not await self.pre_flight():
-                logger.error("Pre-flight check failed. Aborting.")
-                return
+            while True:
+                try:
+                    # Step 1: Wait for market open (sleeps overnight/weekends)
+                    await self._wait_for_market_open()
 
-            # Step 2: Detect existing positions
+                    # Step 2: Reset all daily state
+                    self._reset_for_new_day()
+
+                    # Step 3: Pre-flight (Schwab, ThetaData, ML)
+                    if not await self.pre_flight():
+                        logger.error("Pre-flight check failed. Sleeping until next day.")
+                        await self._sleep_past_exit()
+                        continue
+
+                    # Step 4: Run the trading day (inner loop allows multiple trades)
+                    await self._run_trading_day()
+
+                    # Step 5: Sleep past exit time to avoid re-triggering same day
+                    await self._sleep_past_exit()
+
+                except KeyboardInterrupt:
+                    raise  # propagate to outer handler
+                except Exception as e:
+                    logger.error(f"Unhandled error in daily cycle: {e}", exc_info=True)
+                    if self.skip_wait:
+                        break
+                    logger.info("Sleeping 60s before retry...")
+                    await asyncio.sleep(60)
+
+                # In skip-wait mode, exit after one cycle (preserves test behavior)
+                if self.skip_wait:
+                    break
+
+        except KeyboardInterrupt:
+            logger.warning("Bot interrupted by user (Ctrl+C)")
+        finally:
+            self.log_trade_result()
+            # Close DuckDB connections to release file locks
+            if self._candle_loader is not None:
+                try:
+                    self._candle_loader.db.close()
+                    logger.info("Closed CandleLoader DuckDB connection.")
+                except Exception:
+                    pass
+            logger.info("Bot shutdown complete.")
+
+    async def _run_trading_day(self):
+        """
+        Inner day loop: allows multiple trades within a single trading day.
+
+        After a trade closes (TP/SL/SLTP), checks circuit breakers and re-enters
+        if ML still signals and within the entry scan window.
+        """
+        exit_time = self._parse_time(settings.BOT_EXIT_TIME)
+        trade_num = 0
+
+        while True:
+            now = self._now_et()
+
+            # Time gate
+            if now.time() >= exit_time and not self.skip_wait:
+                logger.info(f"Past exit time {settings.BOT_EXIT_TIME} ET. Done for the day.")
+                break
+
+            # Circuit breaker check
+            cb_reason = await self._check_daily_circuit_breaker()
+            if cb_reason:
+                logger.warning(f"=== CIRCUIT BREAKER: {cb_reason} ===")
+                logger.info("No more trades today.")
+                play_sound(SL_SOUND)
+                send_notification("0DTE Bot — Circuit Breaker", cb_reason)
+                break
+
+            # Detect existing positions
             positions = await self._get_spx_positions()
 
             if positions:
@@ -406,51 +484,264 @@ class ZeroDTEBot:
                 tracked_ics = await self._reconstruct_and_assign(positions)
                 if not tracked_ics:
                     logger.error("Failed to reconstruct ICs from positions")
-                    return
-                logger.info(f"Detected {len(tracked_ics)} existing IC(s) — entering monitoring")
+                    break
 
-                # Log IC details
-                for ic in tracked_ics:
-                    logger.info(f"  {ic.label}: "
-                                f"{ic.strikes['long_put']['strike']}/{ic.strikes['short_put']['strike']}p - "
-                                f"{ic.strikes['short_call']['strike']}/{ic.strikes['long_call']['strike']}c "
-                                f"x{ic.quantity}  Credit: ${ic.fill_credit:.2f}")
-                    logger.info(f"    SL exit:  debit >= ${ic.sl_exit_debit:.2f} -> MARKET CLOSE "
-                                f"({settings.BOT_STOP_LOSS_PCT:.0%} portfolio)")
-                    if ic.sltp_tiers:
-                        logger.info(f"    SLTP Tiers ({len(ic.sltp_tiers)} tiers):")
-                        for act_pct, flr_pct, act_debit, flr_debit in ic.sltp_tiers:
-                            logger.info(f"      {act_pct:.1%} -> {flr_pct:.1%}: "
-                                        f"activate @ ${act_debit:.2f}, floor @ ${flr_debit:.2f}")
+                trade_num += 1
+                logger.info(f"Trade #{trade_num}: Detected {len(tracked_ics)} existing IC(s) — monitoring")
+                self._log_ic_details(tracked_ics)
             else:
-                # ENTRY PATH: ML scan -> entry -> build IC
+                # ENTRY PATH: double-check positions are truly empty
+                # (guards against API returning stale empty data briefly)
+                await asyncio.sleep(3)
+                positions_recheck = await self._get_spx_positions()
+                if positions_recheck:
+                    logger.warning("Positions appeared on recheck — looping back to monitor path")
+                    continue
+
+                # Also check for any working STO iron condor orders (entry in flight)
+                try:
+                    working = await self.schwab_client.get_orders_for_account(status='WORKING')
+                    has_pending_entry = any(
+                        o.get('complexOrderStrategyType') == 'IRON_CONDOR'
+                        and any(l.get('instruction') == 'SELL_TO_OPEN'
+                                for l in o.get('orderLegCollection', []))
+                        for o in (working or [])
+                    )
+                    if has_pending_entry:
+                        logger.warning("Working STO iron condor order detected — skipping entry")
+                        continue
+                except Exception as e:
+                    logger.debug(f"Working order check failed: {e}")
+
+                # ML scan -> entry -> build IC
                 entry_ic = await self._entry_phase()
                 if not entry_ic:
-                    logger.info("No entry today. Shutting down.")
-                    return
+                    logger.info("No entry signal. Done for the day.")
+                    break
+
+                trade_num += 1
+                logger.info(f"Trade #{trade_num}: New entry — monitoring")
                 tracked_ics = [entry_ic]
 
-            # Step 3: Place 5% ceiling TP for any IC missing a TP order
+            # Sync TP orders: detect existing, cancel+replace if quantity mismatch
             for ic in tracked_ics:
-                existing_tp = await self._detect_tp_order_for_ic(ic)
-                if existing_tp:
-                    ic.tp_order_id = existing_tp
-                    logger.info(f"  {ic.label}: existing TP order: ID={existing_tp}")
-                else:
-                    await self._place_ceiling_tp(ic)
+                await self._sync_tp_for_ic(ic)
 
-            # Step 4: Unified monitoring loop (handles 1 or N ICs)
+            # Monitor until all ICs close or time exit
             await self._monitoring_loop(tracked_ics)
 
-            logger.info("All positions closed. Shutting down.")
+            # Log results for each IC
+            for ic in tracked_ics:
+                self._log_trade_result_for_ic(ic, trade_num)
 
-        except KeyboardInterrupt:
-            logger.warning("Bot interrupted by user (Ctrl+C)")
+            logger.info(f"Trade #{trade_num} monitoring complete.")
+
+            # In skip-wait mode, exit after one trade
+            if self.skip_wait:
+                break
+
+            # Reset for potential re-entry
+            self._reset_for_new_trade()
+            await self._refresh_portfolio_value()
+
+            # Brief pause before re-checking
+            await asyncio.sleep(5)
+
+    def _log_ic_details(self, tracked_ics: list):
+        """Log IC details for monitoring start."""
+        for ic in tracked_ics:
+            logger.info(f"  {ic.label}: "
+                        f"{ic.strikes['long_put']['strike']}/{ic.strikes['short_put']['strike']}p - "
+                        f"{ic.strikes['short_call']['strike']}/{ic.strikes['long_call']['strike']}c "
+                        f"x{ic.quantity}  Credit: ${ic.fill_credit:.2f}")
+            logger.info(f"    SL exit:  debit >= ${ic.sl_exit_debit:.2f} -> MARKET CLOSE "
+                        f"({settings.BOT_STOP_LOSS_PCT:.0%} portfolio)")
+            if ic.sltp_tiers:
+                first = ic.sltp_tiers[0]
+                last = ic.sltp_tiers[-1]
+                step = settings.BOT_SLTP_STEP_PCT
+                gap = settings.BOT_SLTP_GAP_PCT
+                logger.info(f"    SLTP: {len(ic.sltp_tiers)} tiers, {step:.2%} steps, {gap:.1%} trailing gap")
+                logger.info(f"      First: {first[0]:.2%} activate @ ${first[2]:.2f}, floor @ ${first[3]:.2f}")
+                logger.info(f"      Last:  {last[0]:.2%} activate @ ${last[2]:.2f}, floor @ ${last[3]:.2f}")
+
+    # ===== Persistent Mode Helpers =====
+
+    async def _wait_for_market_open(self):
+        """Sleep until the next trading window. Returns immediately if already in window."""
+        now = self._now_et()
+        wake_time = self._parse_time(settings.BOT_WAKE_TIME)
+        exit_time = self._parse_time(settings.BOT_EXIT_TIME)
+
+        # If skip-wait, return immediately
+        if self.skip_wait:
+            return
+
+        # Already within today's trading window?
+        if now.weekday() < 5 and wake_time <= now.time() < exit_time:
+            logger.info(f"Market is open ({now.strftime('%A %H:%M ET')}). Proceeding.")
+            return
+
+        # Compute next wake target
+        target = self._next_wake_datetime(now)
+        delta = target - now
+        hours = delta.total_seconds() / 3600
+
+        logger.info(f"Market closed. Sleeping until {target.strftime('%A %Y-%m-%d %H:%M ET')} "
+                     f"({hours:.1f} hours)")
+        send_notification("0DTE Bot — Sleeping", f"Next wake: {target.strftime('%A %H:%M ET')}")
+
+        await self._sleep_until(target)
+        logger.info(f"Woke up at {self._now_et().strftime('%A %H:%M ET')}")
+
+    def _next_wake_datetime(self, now: datetime) -> datetime:
+        """Compute the next wake datetime (next weekday at BOT_WAKE_TIME)."""
+        wake_time = self._parse_time(settings.BOT_WAKE_TIME)
+        exit_time = self._parse_time(settings.BOT_EXIT_TIME)
+
+        # If before wake time on a weekday, wake today
+        if now.weekday() < 5 and now.time() < wake_time:
+            return now.replace(hour=wake_time.hour, minute=wake_time.minute, second=0, microsecond=0)
+
+        # Otherwise, find next weekday
+        target_date = now.date() + timedelta(days=1)
+        while target_date.weekday() >= 5:  # skip Sat/Sun
+            target_date += timedelta(days=1)
+
+        return ET.localize(datetime.combine(target_date, wake_time))
+
+    async def _sleep_until(self, target_dt: datetime):
+        """Async sleep in 60s chunks until target datetime (Ctrl+C responsive)."""
+        while True:
+            now = self._now_et()
+            if now >= target_dt:
+                break
+            remaining = (target_dt - now).total_seconds()
+            await asyncio.sleep(min(remaining, 60))
+
+    async def _sleep_past_exit(self):
+        """Sleep until after BOT_EXIT_TIME to prevent same-day re-trigger."""
+        if self.skip_wait:
+            return
+
+        now = self._now_et()
+        exit_time = self._parse_time(settings.BOT_EXIT_TIME)
+        exit_dt = now.replace(hour=exit_time.hour, minute=exit_time.minute, second=0, microsecond=0)
+
+        # Add a small buffer (1 minute past exit)
+        exit_dt += timedelta(minutes=1)
+
+        if now < exit_dt:
+            wait_secs = (exit_dt - now).total_seconds()
+            logger.info(f"Sleeping until past exit time ({settings.BOT_EXIT_TIME} ET, {wait_secs:.0f}s)...")
+            await self._sleep_until(exit_dt)
+
+    async def _check_daily_circuit_breaker(self) -> Optional[str]:
+        """
+        Check if daily P&L has hit circuit breaker limits.
+
+        Returns a reason string if breaker tripped, None if OK to continue.
+        Fail-open: returns None if Schwab API fails.
+        """
+        if self.dry_run:
+            return None
+
+        try:
+            daily_pnl = await self._fetch_daily_pnl(open_ics=[])
+            if daily_pnl.sod_balance <= 0:
+                return None  # can't compute percentage
+
+            pnl_pct = daily_pnl.total_daily_pnl / daily_pnl.sod_balance
+
+            if pnl_pct >= settings.BOT_DAILY_GAIN_LIMIT_PCT:
+                return (f"Daily gain +{pnl_pct:.1%} >= {settings.BOT_DAILY_GAIN_LIMIT_PCT:.0%} limit "
+                        f"(+${daily_pnl.total_daily_pnl:,.0f})")
+
+            if pnl_pct <= -settings.BOT_DAILY_LOSS_LIMIT_PCT:
+                return (f"Daily loss {pnl_pct:.1%} >= -{settings.BOT_DAILY_LOSS_LIMIT_PCT:.0%} limit "
+                        f"(-${abs(daily_pnl.total_daily_pnl):,.0f})")
+
+            logger.info(f"  Circuit breaker check: {pnl_pct:+.2%} (limits: "
+                        f"+{settings.BOT_DAILY_GAIN_LIMIT_PCT:.0%}/-{settings.BOT_DAILY_LOSS_LIMIT_PCT:.0%})")
+            return None
+
         except Exception as e:
-            logger.error(f"Unhandled error in bot lifecycle: {e}", exc_info=True)
-        finally:
-            self.log_trade_result()
-            logger.info("Bot shutdown complete.")
+            logger.warning(f"  Circuit breaker check failed (fail-open): {e}")
+            return None
+
+    def _reset_for_new_day(self):
+        """Reset all state between trading days."""
+        logger.info("--- Resetting state for new trading day ---")
+        self.already_traded_today = False
+        self.entry_order_id = None
+        self.tp_order_id = None
+        self.strikes = None
+        self.quantity = 0
+        self.fill_credit = 0.0
+        self.exit_reason = None
+        self.portfolio_value = 0.0
+        self._v3_cached_confidence = None
+        self._v4_daily_data_cache = None
+        self._chosen_delta = None
+
+    def _reset_for_new_trade(self):
+        """Reset entry state between trades within the same day.
+
+        Keeps day-level caches (v3, v4 daily data, portfolio value).
+        """
+        logger.info("--- Resetting state for potential re-entry ---")
+        self.already_traded_today = False
+        self.entry_order_id = None
+        self.tp_order_id = None
+        self.strikes = None
+        self.quantity = 0
+        self.fill_credit = 0.0
+        self.exit_reason = None
+        self._chosen_delta = None
+
+    async def _refresh_portfolio_value(self):
+        """Re-fetch portfolio value from Schwab after a trade closes."""
+        try:
+            account = await self.schwab_client.get_account()
+            old_val = self.portfolio_value
+            self.portfolio_value = self._extract_portfolio_value(account)
+            delta = self.portfolio_value - old_val
+            logger.info(f"  Portfolio refreshed: ${self.portfolio_value:,.2f} "
+                        f"({'+' if delta >= 0 else ''}{delta:,.2f} from last)")
+        except Exception as e:
+            logger.warning(f"  Portfolio refresh failed: {e} (keeping ${self.portfolio_value:,.2f})")
+
+    def _log_trade_result_for_ic(self, ic: TrackedIronCondor, trade_num: int):
+        """Append per-IC trade result to JSONL log file."""
+        log_dir = Path("logs")
+        log_dir.mkdir(exist_ok=True)
+
+        result = {
+            "date": str(date.today()),
+            "timestamp": self._now_et().isoformat(),
+            "trade_num": trade_num,
+            "mode": "dry_run" if self.dry_run else "live",
+            "symbol": settings.BOT_SYMBOL,
+            "label": ic.label,
+            "strikes": {
+                "long_put": ic.strikes['long_put']['strike'],
+                "short_put": ic.strikes['short_put']['strike'],
+                "short_call": ic.strikes['short_call']['strike'],
+                "long_call": ic.strikes['long_call']['strike'],
+            },
+            "quantity": ic.quantity,
+            "credit": ic.fill_credit,
+            "exit_reason": ic.exit_reason,
+            "sltp_tier_reached": ic.sltp_active_tier_idx,
+            "portfolio_value": self.portfolio_value,
+            "chosen_delta": self._chosen_delta or settings.BOT_SHORT_DELTA,
+        }
+
+        log_path = log_dir / f"zero_dte_bot_{date.today()}.jsonl"
+        with open(log_path, 'a') as f:
+            f.write(json.dumps(result, default=str) + '\n')
+
+        logger.info(f"  {ic.label} result logged: {ic.exit_reason or 'unknown'} → {log_path}")
 
     async def pre_flight(self) -> bool:
         """
@@ -460,6 +751,10 @@ class ZeroDTEBot:
         Does NOT gate on existing/missing positions (unified flow handles that).
         """
         logger.info("--- Pre-flight Check ---")
+
+        # Kill stale bot instances and release DuckDB locks before anything else
+        self._kill_stale_processes()
+
         now = self._now_et()
 
         # Check trading day (weekday)
@@ -498,8 +793,33 @@ class ZeroDTEBot:
                 logger.error(f"Insufficient buying power: ${bp:,.2f}")
                 return False
         except Exception as e:
-            logger.error(f"  Schwab connection failed: {e}")
-            return False
+            err_str = str(e)
+            if 'refresh_token' in err_str or 'unsupported_token_type' in err_str:
+                logger.warning(f"  Schwab token expired — launching re-authentication...")
+                play_sound("/System/Library/Sounds/Sosumi.aiff")
+                send_notification("0DTE Bot — Token Expired",
+                                  "Schwab refresh token expired. Browser opening for re-auth.")
+                if self.schwab_client.re_authenticate():
+                    # Retry after re-auth
+                    try:
+                        account = await self.schwab_client.get_account()
+                        bp = (
+                            account.get('securitiesAccount', {})
+                            .get('currentBalances', {})
+                            .get('buyingPower', 0.0)
+                        )
+                        self.portfolio_value = self._extract_portfolio_value(account)
+                        logger.info(f"  Schwab connection: OK after re-auth (buying power: ${bp:,.2f})")
+                        logger.info(f"  Portfolio value: ${self.portfolio_value:,.2f} (live from Schwab)")
+                    except Exception as e2:
+                        logger.error(f"  Schwab connection failed after re-auth: {e2}")
+                        return False
+                else:
+                    logger.error("  Re-authentication failed. Aborting.")
+                    return False
+            else:
+                logger.error(f"  Schwab connection failed: {e}")
+                return False
 
         # Check ML model (graceful — not a hard gate)
         if not self.skip_ml:
@@ -508,12 +828,28 @@ class ZeroDTEBot:
             else:
                 logger.info(f"  ML v3 model: loaded ({self.predictor.num_features} features) - OK")
 
+            # v6 ensemble status
+            if self.predictor.v6_ready and settings.BOT_V6_ENABLED:
+                tp25_models = len(self.predictor.v6_ensemble['tp25'])
+                tp50_models = len(self.predictor.v6_ensemble['tp50'])
+                logger.info(f"  ML v6 ensemble: loaded (TP25={tp25_models}/4, TP50={tp50_models}/4, "
+                           f"{len(self.predictor.v6_feature_names)}f) - "
+                           f"scanning {settings.BOT_V4_ENTRY_START}-{settings.BOT_V4_ENTRY_END} ET")
+                logger.info(f"  v6 consensus filter: enabled (require ≥3/4 models >= 0.5)")
+            elif not settings.BOT_V6_ENABLED:
+                logger.info("  ML v6 ensemble: disabled (BOT_V6_ENABLED=False)")
+            elif not self.predictor.v6_ready:
+                logger.info("  ML v6 ensemble: not loaded — falling back to v5/v4/fixed-time")
+
             # v5 TP model status
             if self.predictor.v5_ready and settings.BOT_V5_ENABLED:
                 tp25_status = f"TP25={len(self.predictor.v5_tp25_feature_names)}f" if self.predictor.v5_tp25_ready else "TP25=N/A"
                 tp50_status = f"TP50={len(self.predictor.v5_tp50_feature_names)}f" if self.predictor.v5_tp50_ready else "TP50=N/A"
+                deltas = self.predictor.available_v5_deltas
+                delta_str = ", ".join(f"d{int(d*100)}" for d in deltas)
+                multi_str = f" | multi-delta: [{delta_str}]" if settings.BOT_V5_MULTI_DELTA and len(deltas) > 1 else ""
                 logger.info(f"  ML v5 model: loaded ({tp25_status}, {tp50_status}) - "
-                           f"scanning {settings.BOT_V4_ENTRY_START}-{settings.BOT_V4_ENTRY_END} ET")
+                           f"scanning {settings.BOT_V4_ENTRY_START}-{settings.BOT_V4_ENTRY_END} ET{multi_str}")
                 # FOMC gate status
                 from ml.models.predictor import get_economic_calendar_features
                 cal = get_economic_calendar_features()
@@ -536,19 +872,30 @@ class ZeroDTEBot:
         else:
             logger.info("  ML model: skipped (--skip-ml)")
 
+        # Backfill candle database for ML features (requires ThetaData)
+        if not self.skip_ml:
+            self._backfill_candle_db()
+
         logger.info("--- Pre-flight Check PASSED ---")
         return True
 
     async def _entry_phase(self) -> Optional[TrackedIronCondor]:
         """Run ML scan entry, wait for fill, return TrackedIronCondor or None."""
-        # Determine entry method (v5 -> v4 -> fixed-time, automatic)
+        # Determine entry method (v6 -> v5 -> v4 -> fixed-time, automatic)
+        use_v6 = (
+            settings.BOT_V6_ENABLED
+            and not self.skip_ml
+            and self.predictor.v6_ready
+        )
         use_v5 = (
-            settings.BOT_V5_ENABLED
+            not use_v6
+            and settings.BOT_V5_ENABLED
             and not self.skip_ml
             and self.predictor.v5_ready
         )
         use_v4 = (
-            not use_v5
+            not use_v6
+            and not use_v5
             and settings.BOT_V4_ENABLED
             and not self.skip_ml
             and self.predictor.v4_ready
@@ -557,12 +904,12 @@ class ZeroDTEBot:
         entered = False
         entry_filled = False
 
-        if use_v5 or use_v4:
-            version = "v5" if use_v5 else "v4"
+        if use_v6 or use_v5 or use_v4:
+            version = "v6" if use_v6 else ("v5" if use_v5 else "v4")
             logger.info(f"{version} entry timing enabled — scanning for optimal entry")
             if not self.skip_wait:
                 await self._wait_until(settings.BOT_V4_ENTRY_START)
-            entered = await self._entry_scan(use_v5=use_v5)
+            entered = await self._entry_scan(use_v6=use_v6, use_v5=use_v5)
             # _entry_scan handles attempt_entry + wait_for_fill internally
             entry_filled = entered
         else:
@@ -599,13 +946,56 @@ class ZeroDTEBot:
         ic.target_tp_debit = tp_debit
 
         logger.info(
-            f"  {ic.label}: 5% ceiling TP ${tp_debit:.2f} "
+            f"  {ic.label}: 5% ceiling TP ${tp_debit:.2f} x{ic.quantity} "
             f"(SLTP tiers are primary exit)"
         )
         await self._place_tp_limit_order(ic, tp_debit)
 
+    async def _sync_tp_for_ic(self, ic: TrackedIronCondor):
+        """
+        Ensure IC has a TP order with correct quantity.
+
+        Detects existing TP, compares quantity, cancels+replaces if mismatched.
+        """
+        tp_id, tp_qty = await self._detect_tp_order_for_ic(ic)
+
+        if tp_id and tp_qty == ic.quantity:
+            # TP exists with correct quantity
+            ic.tp_order_id = tp_id
+            logger.info(f"  {ic.label}: existing TP order: ID={tp_id} x{tp_qty}")
+        elif tp_id and tp_qty != ic.quantity:
+            # TP exists but wrong quantity — cancel and replace
+            logger.warning(
+                f"  {ic.label}: TP quantity mismatch (TP={tp_qty} vs position={ic.quantity}) "
+                f"— cancelling TP {tp_id} and placing new"
+            )
+            await self._cancel_order_safe(tp_id)
+            ic.tp_order_id = None
+            await self._place_ceiling_tp(ic)
+        else:
+            # No TP found — place new
+            await self._place_ceiling_tp(ic)
+
     async def _reconstruct_and_assign(self, positions=None) -> Optional[List[TrackedIronCondor]]:
-        """Reconstruct ICs from Schwab positions and assign credits."""
+        """
+        Reconstruct ICs and assign credits.
+
+        Primary: order-based reconstruction (handles netted positions correctly).
+        Fallback: position-based reconstruction + credit detection.
+        """
+        # Primary: reconstruct from order history (avoids netting ambiguity)
+        logger.info("  Attempting order-based IC reconstruction...")
+        try:
+            order_ics = await self.reconstruct_ics_from_orders()
+            if order_ics:
+                logger.info(f"  Order-based reconstruction: {len(order_ics)} IC(s)")
+                return order_ics
+            logger.info("  Order-based reconstruction returned None")
+        except Exception as e:
+            logger.warning(f"  Order-based reconstruction error: {e}", exc_info=True)
+
+        # Fallback: position-based reconstruction
+        logger.info("  Falling back to position-based reconstruction...")
         if positions is None:
             positions = await self._get_spx_positions()
         if not positions:
@@ -627,6 +1017,20 @@ class ZeroDTEBot:
             for leg in ['long_put', 'short_put', 'short_call', 'long_call']:
                 symbols.add(ic.strikes[leg]['symbol'])
         return frozenset(symbols)
+
+    def _get_ic_identity_keys(self, ics: List[TrackedIronCondor]) -> frozenset:
+        """Get a stable identity key per IC (strikes + quantity) for change detection."""
+        keys = set()
+        for ic in ics:
+            key = (
+                ic.strikes['long_put']['symbol'],
+                ic.strikes['short_put']['symbol'],
+                ic.strikes['short_call']['symbol'],
+                ic.strikes['long_call']['symbol'],
+                ic.quantity,
+            )
+            keys.add(key)
+        return frozenset(keys)
 
     async def _get_current_position_symbols(self) -> frozenset:
         """Get set of current SPX option symbols from Schwab positions."""
@@ -653,8 +1057,10 @@ class ZeroDTEBot:
         """Unified monitoring loop for 1 or N ICs with position change detection."""
         exit_time = self._parse_time(settings.BOT_EXIT_TIME)
 
-        # Snapshot tracked symbols for change detection
-        tracked_symbols = self._get_tracked_symbols(tracked_ics)
+        # Track IC identity keys for change detection (avoids symbol netting issues)
+        last_ic_keys = self._get_ic_identity_keys(tracked_ics)
+        # Snapshot position symbols for lightweight change detection trigger
+        last_pos_symbols = await self._get_current_position_symbols()
 
         logger.info("--- Monitoring Loop Started ---")
         logger.info(f"  Monitoring {len(tracked_ics)} IC(s)")
@@ -663,33 +1069,38 @@ class ZeroDTEBot:
 
         while True:
             try:
-                # Check for position changes (rolls, manual closes, new ICs)
-                current_symbols = await self._get_current_position_symbols()
-                if current_symbols != tracked_symbols:
-                    if not current_symbols:
-                        logger.info("No positions remaining. Exiting monitoring.")
+                # Lightweight check: did position symbols change?
+                current_pos_symbols = await self._get_current_position_symbols()
+                if not current_pos_symbols:
+                    # Double-check: API may briefly return empty during settlement
+                    await asyncio.sleep(3)
+                    recheck = await self._get_current_position_symbols()
+                    if not recheck:
+                        logger.info("No positions remaining (confirmed). Exiting monitoring.")
                         return
-
-                    logger.info("Position change detected — re-reconstructing ICs")
-                    new_positions = await self._get_spx_positions()
-                    new_ics = await self._reconstruct_and_assign(new_positions)
-                    # Always update tracked_symbols to prevent infinite retry loop
-                    tracked_symbols = current_symbols
-                    if not new_ics:
-                        logger.warning("Re-reconstruction failed. Continuing with existing state.")
                     else:
-                        # Carry forward SLTP state for unchanged ICs
-                        self._merge_sltp_state(tracked_ics, new_ics)
-                        tracked_ics = new_ics
-                        # Place TP for any new IC missing one
-                        for ic in tracked_ics:
-                            if not ic.tp_order_id:
-                                existing_tp = await self._detect_tp_order_for_ic(ic)
-                                if existing_tp:
-                                    ic.tp_order_id = existing_tp
-                                else:
-                                    await self._place_ceiling_tp(ic)
+                        logger.warning("Positions reappeared on recheck — continuing monitoring")
+                        last_pos_symbols = recheck
                         continue
+
+                if current_pos_symbols != last_pos_symbols:
+                    # Position symbols changed — re-reconstruct from orders
+                    # (handles netted positions correctly)
+                    logger.info("Position change detected — re-reconstructing ICs from orders")
+                    last_pos_symbols = current_pos_symbols
+                    new_ics = await self._reconstruct_and_assign()
+                    if new_ics:
+                        new_keys = self._get_ic_identity_keys(new_ics)
+                        if new_keys != last_ic_keys:
+                            logger.info(f"IC structure changed — {len(tracked_ics)} -> {len(new_ics)} IC(s)")
+                            self._merge_sltp_state(tracked_ics, new_ics)
+                            tracked_ics = new_ics
+                            last_ic_keys = new_keys
+                            for ic in tracked_ics:
+                                await self._sync_tp_for_ic(ic)
+                            continue
+                    else:
+                        logger.warning("Re-reconstruction failed. Continuing with existing state.")
 
                 # Filter to open ICs
                 open_ics = [ic for ic in tracked_ics if not ic.is_closed]
@@ -713,6 +1124,9 @@ class ZeroDTEBot:
                     await asyncio.sleep(settings.BOT_MONITOR_INTERVAL)
                     continue
 
+                # Track per-IC unrealized P&L for cumulative summary
+                ic_unrealized = {}  # ic.ic_id -> unrealized $ amount
+
                 for ic in open_ics:
                     # Check if TP limit order filled
                     if ic.tp_order_id:
@@ -728,6 +1142,12 @@ class ZeroDTEBot:
                         logger.debug(f"  {ic.label}: could not get position value")
                         continue
 
+                    # Compute per-IC unrealized P&L in dollars
+                    # Positive = profit (debit < credit), negative = loss (debit > credit)
+                    fee_per_contract = settings.BOT_COST_PER_LEG * 8  # 4 legs × 2 (open+close)
+                    unrealized_dollars = (ic.fill_credit - debit) * ic.quantity * 100 - fee_per_contract * ic.quantity
+                    ic_unrealized[ic.ic_id] = unrealized_dollars
+
                     pnl_pct = round((1 - debit / ic.fill_credit) * 100) if ic.fill_credit > 0 else 0
                     if ic.sltp_active_tier_idx >= 0:
                         act_pct = ic.sltp_tiers[ic.sltp_active_tier_idx][0]
@@ -735,31 +1155,44 @@ class ZeroDTEBot:
                         sltp_tag = f" [SLTP {act_pct:.1%}->{flr_pct:.1%} floor@${ic.sltp_floor_debit:.2f}]"
                     else:
                         sltp_tag = ""
+                    sign = "+" if unrealized_dollars >= 0 else ""
                     logger.info(
                         f"  [{now.strftime('%H:%M:%S')}] {ic.label}: "
-                        f"debit ${debit:.2f}  P/L {pnl_pct:+d}%{sltp_tag}"
+                        f"debit ${debit:.2f}  P/L {pnl_pct:+d}%  |  "
+                        f"unrealized {sign}${unrealized_dollars:,.0f} "
+                        f"({ic.quantity}x ${debit:.2f} vs ${ic.fill_credit:.2f} credit)"
+                        f"{sltp_tag}"
                     )
 
                     # --- Tiered SLTP: ratcheting profit lock ---
                     if ic.sltp_tiers:
                         # Check if we've reached a higher tier (scan from highest to current+1)
+                        prev_tier_idx = ic.sltp_active_tier_idx
                         for idx in range(len(ic.sltp_tiers) - 1, ic.sltp_active_tier_idx, -1):
                             act_pct, flr_pct, act_debit, flr_debit = ic.sltp_tiers[idx]
                             if debit <= act_debit:
                                 ic.sltp_active_tier_idx = idx
                                 ic.sltp_floor_debit = flr_debit
-                                logger.info(
-                                    f"  >>> {ic.label}: SLTP TIER {act_pct:.1%} ACTIVATED "
+                                # Log every tier change at DEBUG, but INFO + sound only at 0.5% milestones
+                                logger.debug(
+                                    f"  SLTP ratchet: {ic.label} floor -> {flr_pct:.2%} "
                                     f"(debit ${debit:.2f} <= ${act_debit:.2f})"
                                 )
-                                logger.info(
-                                    f"      Floor raised to ${flr_debit:.2f} (locks in {flr_pct:.1%} gain)"
+                                # Milestone check: notify at ~0.5% increments (every 10th tier with 0.05% steps)
+                                prev_act_pct = ic.sltp_tiers[prev_tier_idx][0] if prev_tier_idx >= 0 else 0
+                                crossed_milestone = (
+                                    int(act_pct * 200) > int(prev_act_pct * 200)  # 0.5% boundary
                                 )
-                                play_sound(TP_SOUND)
-                                send_notification(
-                                    f"Profit Lock {act_pct:.1%} - {ic.label}",
-                                    f"Floor ${flr_debit:.2f} ({flr_pct:.1%})"
-                                )
+                                if crossed_milestone or prev_tier_idx < 0:
+                                    logger.info(
+                                        f"  >>> {ic.label}: SLTP {act_pct:.1%} ACTIVATED "
+                                        f"(floor ${flr_debit:.2f} = {flr_pct:.1%})"
+                                    )
+                                    play_sound(TP_SOUND)
+                                    send_notification(
+                                        f"Profit Lock {act_pct:.1%} - {ic.label}",
+                                        f"Floor ${flr_debit:.2f} ({flr_pct:.1%})"
+                                    )
                                 break  # Only need highest matching tier
 
                         # Check if floor breached (debit reversed up past lock-in)
@@ -794,6 +1227,37 @@ class ZeroDTEBot:
                         ic.alerts_fired.add(AlertLevel.SL_WARNING)
                         alert_sl(ic, AlertLevel.SL_WARNING, debit)
 
+                # --- Cumulative multi-IC summary and combined SL check ---
+                still_open = [ic for ic in open_ics if not ic.is_closed]
+                if len(still_open) >= 2 and ic_unrealized:
+                    total_unrealized = sum(
+                        ic_unrealized[ic.ic_id] for ic in still_open
+                        if ic.ic_id in ic_unrealized
+                    )
+                    combined_sl_limit = self.portfolio_value * settings.BOT_STOP_LOSS_PCT
+                    sign = "+" if total_unrealized >= 0 else ""
+                    logger.info(
+                        f"  [{now.strftime('%H:%M:%S')}] TOTAL: {len(still_open)} ICs  |  "
+                        f"net unrealized {sign}${total_unrealized:,.0f}  |  "
+                        f"combined SL at -${combined_sl_limit:,.0f}"
+                    )
+
+                    # Combined SL: close ALL open ICs if total unrealized loss exceeds portfolio SL
+                    if total_unrealized <= -combined_sl_limit:
+                        logger.warning(
+                            f"  === COMBINED SL TRIGGERED: "
+                            f"${total_unrealized:,.0f} <= -${combined_sl_limit:,.0f} "
+                            f"({settings.BOT_STOP_LOSS_PCT:.0%} of ${self.portfolio_value:,.0f}) ==="
+                        )
+                        play_sound(SL_SOUND)
+                        send_notification(
+                            "COMBINED STOP LOSS",
+                            f"Total loss ${total_unrealized:,.0f} — closing all {len(still_open)} ICs"
+                        )
+                        for ic in still_open:
+                            if not ic.is_closed:
+                                await self._close_ic(ic, "combined_stop_loss")
+
             except Exception as e:
                 logger.error(f"Error in monitoring loop: {e}", exc_info=True)
 
@@ -802,6 +1266,77 @@ class ZeroDTEBot:
                 break
 
             await asyncio.sleep(settings.BOT_MONITOR_INTERVAL)
+
+    # ===== Process Cleanup =====
+
+    def _kill_stale_processes(self):
+        """
+        Kill stale processes that could block this bot instance.
+
+        1. Other zero_dte_bot.py Python processes (not self)
+        2. Processes holding DuckDB file locks in data_store/
+        3. Stale ThetaData Terminal processes (will be restarted by _ensure_thetadata_running)
+        """
+        my_pid = os.getpid()
+
+        # --- 1. Kill other bot instances ---
+        try:
+            result = subprocess.run(
+                ["pgrep", "-f", "zero_dte_bot.py"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if result.stdout.strip():
+                pids = [int(p) for p in result.stdout.strip().split('\n') if p.strip()]
+                stale_pids = [p for p in pids if p != my_pid]
+                for pid in stale_pids:
+                    logger.warning(f"  Killing stale bot instance PID {pid}")
+                    try:
+                        os.kill(pid, 9)
+                    except ProcessLookupError:
+                        pass
+                if stale_pids:
+                    import time as _t
+                    _t.sleep(1)
+                    logger.info(f"  Killed {len(stale_pids)} stale bot instance(s)")
+        except Exception as e:
+            logger.debug(f"  Bot process cleanup skipped: {e}")
+
+        # --- 2. Kill processes holding DuckDB locks ---
+        db_dir = Path("data_store")
+        if db_dir.exists():
+            duckdb_files = list(db_dir.glob("*.duckdb"))
+            for db_file in duckdb_files:
+                try:
+                    result = subprocess.run(
+                        ["lsof", str(db_file)],
+                        capture_output=True, text=True, timeout=5,
+                    )
+                    if result.stdout.strip():
+                        lines = result.stdout.strip().split('\n')[1:]  # skip header
+                        for line in lines:
+                            parts = line.split()
+                            if len(parts) >= 2:
+                                pid = int(parts[1])
+                                if pid != my_pid:
+                                    logger.warning(f"  Killing PID {pid} holding lock on {db_file.name}")
+                                    try:
+                                        os.kill(pid, 9)
+                                    except ProcessLookupError:
+                                        pass
+                except Exception as e:
+                    logger.debug(f"  DuckDB lock cleanup for {db_file.name} skipped: {e}")
+
+            # Also remove .wal files that can hold stale locks
+            for wal_file in db_dir.glob("*.duckdb.wal"):
+                try:
+                    wal_file.unlink()
+                    logger.info(f"  Removed stale WAL file: {wal_file.name}")
+                except Exception:
+                    pass
+
+        # Brief pause to let OS release resources
+        import time as _t
+        _t.sleep(1)
 
     # ===== ThetaData =====
 
@@ -888,12 +1423,13 @@ class ZeroDTEBot:
 
     # ===== Entry Methods =====
 
-    async def attempt_entry(self, chain: dict = None) -> bool:
+    async def attempt_entry(self, chain: dict = None, target_delta: float = None) -> bool:
         """
         Full entry flow: fetch chain -> ML prediction -> select strikes -> size -> place order.
 
         Args:
             chain: Optional pre-fetched option chain (from v4 scan). If None, fetches fresh.
+            target_delta: Override delta for strike selection (from multi-delta scoring).
 
         Returns True if entry order was placed, False otherwise.
         """
@@ -907,10 +1443,23 @@ class ZeroDTEBot:
         if not self.dry_run:
             daily_pnl = await self._fetch_daily_pnl(open_ics=[])
             if daily_pnl.remaining_to_target <= 0:
-                logger.info(f"Daily target already met: +${daily_pnl.realized_today:.2f}. No new entry.")
-                return False
-            logger.info(f"  Daily P&L: +${daily_pnl.realized_today:.2f}, "
-                        f"need ${daily_pnl.remaining_to_target:.2f} more")
+                logger.info(f"  *** DAILY GOAL MET: +${daily_pnl.realized_today:.2f} "
+                            f"(target: ${daily_pnl.daily_target:.2f}) ***")
+                play_sound("/System/Library/Sounds/Glass.aiff")
+                send_notification(
+                    "0DTE Bot — Daily Goal Met",
+                    f"+${daily_pnl.realized_today:.2f} realized. Override to enter another trade?"
+                )
+                answer = await self._async_prompt(
+                    "  Daily goal already met. Enter another trade anyway? [y/N] (60s): ", timeout=60
+                )
+                if answer.lower() not in ('y', 'yes'):
+                    logger.info("  Skipping entry — daily goal met, no override.")
+                    return False
+                logger.info("  Manual override APPROVED — entering despite daily goal met.")
+            else:
+                logger.info(f"  Daily P&L: +${daily_pnl.realized_today:.2f}, "
+                            f"need ${daily_pnl.remaining_to_target:.2f} more")
 
         # Fetch 0DTE chain (skip if pre-fetched by v4 scan)
         if chain is None:
@@ -937,6 +1486,7 @@ class ZeroDTEBot:
             logger.info("  ML check: skipped (--skip-ml)")
 
         # Select strikes
+        effective_delta = target_delta or settings.BOT_SHORT_DELTA
         if self.manual_strikes:
             sp_strike, sc_strike = self.manual_strikes
             logger.info(f"  Using manual strikes: {sp_strike}p / {sc_strike}c")
@@ -949,7 +1499,7 @@ class ZeroDTEBot:
         else:
             self.strikes = self.builder.select_strikes(
                 chain,
-                target_delta=settings.BOT_SHORT_DELTA,
+                target_delta=effective_delta,
                 wing_width=settings.BOT_WING_WIDTH,
             )
         if not self.strikes:
@@ -1124,7 +1674,226 @@ class ZeroDTEBot:
             logger.error(f"ML prediction error: {e}", exc_info=True)
             return None
 
+    # ===== Candle DB Backfill =====
+
+    def _backfill_candle_db(self):
+        """
+        Populate intraday_candles table from ThetaData if empty/stale.
+
+        Fetches ~45 days of 5-min SPX and VIX candles so that the v3 feature
+        extractors (RealizedVol, MarketFeatures, Intraday, Regime) have data.
+        Runs once at startup in pre_flight(); skips if data is already fresh.
+        """
+        import pandas as pd
+
+        loader = self.candle_loader  # triggers table creation via _ensure_table_exists
+
+        for symbol in ("SPX", "VIX"):
+            try:
+                existing = loader.get_available_date_range(symbol)
+                today = date.today()
+
+                if existing:
+                    last_date = existing[1].date() if hasattr(existing[1], 'date') else existing[1]
+                    # If last data is from today or yesterday (non-weekend), skip
+                    gap = (today - last_date).days
+                    if gap <= 1 or (gap <= 3 and today.weekday() == 0):
+                        logger.info(f"  Candle DB: {symbol} data is fresh (last: {last_date}) — skip backfill")
+                        continue
+                    # Partial backfill: only fetch missing days
+                    start = last_date + timedelta(days=1)
+                    logger.info(f"  Candle DB: {symbol} stale (last: {last_date}) — backfilling {start}..{today}")
+                else:
+                    start = today - timedelta(days=60)  # ~45 trading days
+                    logger.info(f"  Candle DB: {symbol} empty — backfilling {start}..{today}")
+
+                df = self._fetch_thetadata_candles(symbol, start, today)
+                if df is not None and not df.empty:
+                    inserted = loader.insert_candles(symbol, df)
+                    logger.info(f"  Candle DB: {symbol} backfilled {inserted} rows")
+                else:
+                    logger.warning(f"  Candle DB: {symbol} — no data returned from ThetaData")
+
+            except Exception as e:
+                logger.warning(f"  Candle DB backfill failed for {symbol}: {e}")
+
+    def _fetch_thetadata_candles(self, symbol: str, start: date, end: date) -> 'pd.DataFrame | None':
+        """
+        Fetch OHLC candles from ThetaData v3 for a date range.
+
+        Uses /v3/index/history/ohlc with 5-min interval (good balance of
+        resolution vs data size). Returns DataFrame with timestamp/open/high/low/close/volume.
+        """
+        import pandas as pd
+
+        try:
+            url = "http://127.0.0.1:25503/v3/index/history/ohlc"
+            params = {
+                "symbol": symbol,
+                "start_date": start.strftime("%Y%m%d"),
+                "end_date": end.strftime("%Y%m%d"),
+                "interval": "5m",
+                "start_time": "09:30:00",
+                "end_time": "16:00:00",
+                "format": "json",
+            }
+
+            query = "&".join(f"{k}={v}" for k, v in params.items())
+            full_url = f"{url}?{query}"
+
+            req = urllib.request.Request(full_url)
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                data = json.loads(resp.read().decode())
+
+            response = data.get("response", data if isinstance(data, list) else [])
+
+            # Handle nested format
+            if response and isinstance(response[0], dict) and "data" in response[0]:
+                bars = []
+                for entry in response:
+                    for dp in entry.get("data", []):
+                        bars.append(dp)
+                response = bars
+
+            if not response:
+                return None
+
+            df = pd.DataFrame(response)
+
+            # Normalize column names
+            col_map = {}
+            for col in df.columns:
+                lower = col.lower()
+                if lower in ('open', 'high', 'low', 'close', 'volume', 'timestamp', 'datetime', 'date', 'time'):
+                    col_map[col] = lower
+            if col_map:
+                df = df.rename(columns=col_map)
+
+            # Build timestamp from date + time columns if no timestamp column
+            if 'timestamp' not in df.columns and 'datetime' not in df.columns:
+                if 'date' in df.columns and 'time' in df.columns:
+                    df['timestamp'] = pd.to_datetime(
+                        df['date'].astype(str) + ' ' + df['time'].astype(str),
+                        errors='coerce'
+                    )
+                elif 'date' in df.columns:
+                    df['timestamp'] = pd.to_datetime(df['date'], errors='coerce')
+                else:
+                    # Use ms_of_day if available (ThetaData format)
+                    if 'ms_of_day' in df.columns and 'date' not in df.columns:
+                        # Try to find a date-like column
+                        for c in df.columns:
+                            if 'date' in c.lower():
+                                df['timestamp'] = pd.to_datetime(df[c].astype(str), format='%Y%m%d', errors='coerce')
+                                break
+                    if 'timestamp' not in df.columns:
+                        df['timestamp'] = pd.Timestamp.now()  # fallback
+            elif 'datetime' in df.columns and 'timestamp' not in df.columns:
+                df['timestamp'] = pd.to_datetime(df['datetime'], errors='coerce')
+
+            # Ensure OHLC columns
+            required = ['open', 'high', 'low', 'close']
+            if not all(c in df.columns for c in required):
+                logger.warning(f"  ThetaData {symbol} missing OHLC columns. Have: {list(df.columns)}")
+                return None
+
+            for col in required:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+
+            if 'volume' not in df.columns:
+                df['volume'] = 0
+
+            # Filter weekends (ThetaData forward-fills Sat/Sun)
+            df['timestamp'] = pd.to_datetime(df['timestamp'])
+            df = df[df['timestamp'].dt.weekday < 5]
+
+            # Drop rows with NaN OHLC
+            df = df.dropna(subset=required)
+
+            result_cols = ['timestamp', 'open', 'high', 'low', 'close', 'volume']
+            return df[result_cols].reset_index(drop=True)
+
+        except Exception as e:
+            logger.warning(f"  ThetaData fetch failed for {symbol}: {e}")
+            return None
+
     # ===== v4/v5 Entry Timing Methods =====
+
+    async def _show_all_model_scores(self, chain: dict):
+        """Show v4/v5 scores for informational purposes even when v3 blocks."""
+        try:
+            candles = self._fetch_spx_5min_candles()
+            if candles is None or len(candles) < 6:
+                logger.info("  [INFO] Insufficient candles for v4/v5 scores")
+                return
+
+            atm_iv = self._extract_atm_iv(chain)
+            underlying = chain.get('underlyingPrice', 0)
+            bar_len = 20
+
+            # Multi-delta v5 scores
+            multi_delta = (
+                settings.BOT_V5_MULTI_DELTA
+                and len(self.predictor.available_v5_deltas) > 1
+            )
+            if multi_delta:
+                all_delta_scores = self._score_all_deltas(candles, atm_iv, chain)
+                if all_delta_scores:
+                    logger.info(f"  [INFO] Multi-delta v5 scores (SPX=${underlying:,.0f}):")
+                    for ds in all_delta_scores:
+                        d_int = int(ds["delta"] * 100)
+                        tp25_v = ds["tp25"]
+                        tp50_v = ds.get("tp50")
+                        cr = ds.get("credit", 0)
+                        tp25_filled = int(tp25_v * bar_len)
+                        tp25_bar = "\u2588" * tp25_filled + "\u2591" * (bar_len - tp25_filled)
+                        tp50_str = f" TP50={tp50_v:.3f}" if tp50_v is not None else ""
+                        logger.info(f"    d{d_int}: TP25={tp25_v:.3f} |{tp25_bar}|{tp50_str}  cr=${cr:.2f}")
+            else:
+                # Single-delta v5 scores
+                tp25_score = tp50_score = None
+                if hasattr(self.predictor, 'v5_tp25_ready') and self.predictor.v5_tp25_ready:
+                    tp25_score = self.predictor.predict_v5(
+                        candles_5min=candles,
+                        daily_data=self._v4_daily_data_cache,
+                        option_atm_iv=atm_iv,
+                        target="tp25",
+                    )
+                if hasattr(self.predictor, 'v5_tp50_ready') and self.predictor.v5_tp50_ready:
+                    tp50_score = self.predictor.predict_v5(
+                        candles_5min=candles,
+                        daily_data=self._v4_daily_data_cache,
+                        option_atm_iv=atm_iv,
+                        target="tp50",
+                    )
+
+                if tp25_score is not None:
+                    tp25_filled = int(tp25_score * bar_len)
+                    tp25_bar = "\u2588" * tp25_filled + "\u2591" * (bar_len - tp25_filled)
+                    tp50_str = ""
+                    if tp50_score is not None:
+                        tp50_filled = int(tp50_score * bar_len)
+                        tp50_bar = "\u2588" * tp50_filled + "\u2591" * (bar_len - tp50_filled)
+                        tp50_str = f" TP50={tp50_score:.3f} |{tp50_bar}|"
+                    logger.info(f"  [INFO] v5: TP25={tp25_score:.3f} |{tp25_bar}|{tp50_str}  SPX=${underlying:,.0f}")
+
+            # v4 score
+            v4_score = self.predictor.predict_v4(
+                candles_5min=candles,
+                daily_data=self._v4_daily_data_cache,
+                option_atm_iv=atm_iv,
+            )
+            if v4_score is not None:
+                v4_filled = int(v4_score * bar_len)
+                v4_bar = "\u2588" * v4_filled + "\u2591" * (bar_len - v4_filled)
+                logger.info(f"  [INFO] v4: score={v4_score:.3f} |{v4_bar}|  ATM-IV={atm_iv:.1f}")
+
+            # Cache daily data
+            if self._v4_daily_data_cache is None and self.predictor._daily_cache:
+                self._v4_daily_data_cache = self.predictor._daily_cache
+
+        except Exception as e:
+            logger.warning(f"  [INFO] Could not compute v4/v5 scores: {e}")
 
     def _fetch_spx_5min_candles(self) -> 'pd.DataFrame | None':
         """
@@ -1259,16 +2028,59 @@ class ZeroDTEBot:
             return sum(ivs) / len(ivs)
         return 15.0
 
-    async def _entry_scan(self, use_v5: bool = False) -> bool:
+    def _score_all_deltas(self, candles, atm_iv, chain) -> list:
         """
-        Dynamic entry scanning loop (supports v5 and v4).
+        Score all loaded delta models and estimate credit per delta.
+
+        Returns list of dicts sorted by TP25 descending:
+          [{"delta": 0.15, "tp25": 0.756, "tp50": 0.612, "credit": 3.80}, ...]
+        """
+        all_scores = self.predictor.predict_v5_all_deltas(
+            candles_5min=candles,
+            daily_data=self._v4_daily_data_cache,
+            option_atm_iv=atm_iv,
+        )
+
+        results = []
+        for delta, scores in all_scores.items():
+            tp25 = scores.get("tp25")
+            if tp25 is None:
+                continue
+
+            # Estimate credit for this delta
+            credit = 0.0
+            try:
+                strikes = self.builder.select_strikes(
+                    chain,
+                    target_delta=delta,
+                    wing_width=settings.BOT_WING_WIDTH,
+                )
+                if strikes:
+                    credit = strikes.get('net_credit', 0.0)
+            except Exception:
+                pass
+
+            results.append({
+                "delta": delta,
+                "tp25": tp25,
+                "tp50": scores.get("tp50"),
+                "credit": credit,
+            })
+
+        # Sort by TP25 descending, TP50 as tiebreaker
+        results.sort(key=lambda r: (r["tp25"], r.get("tp50") or 0), reverse=True)
+        return results
+
+    async def _entry_scan(self, use_v6: bool = False, use_v5: bool = False) -> bool:
+        """
+        Dynamic entry scanning loop (supports v6, v5, and v4).
 
         Scans every V4_SCAN_INTERVAL minutes from ENTRY_START to ENTRY_END:
         1. v3 pre-screen (run once, cache result)
-        2. FOMC gate check (v5 only, if BOT_FOMC_SKIP_DAY enabled)
+        2. FOMC gate check (v6/v5 only, if BOT_FOMC_SKIP_DAY enabled)
         3. Fetch 5-min SPX candles
-        4. Compute v5/v4 features + predict
-        5. If score >= threshold -> attempt_entry()
+        4. Compute v6/v5/v4 features + predict
+        5. If score >= threshold (+ consensus for v6) -> attempt_entry()
         6. If no entry by ENTRY_END -> skip day
 
         Manual-approve is always on: prompts when score < threshold.
@@ -1281,9 +2093,11 @@ class ZeroDTEBot:
         scan_start = self._parse_time(settings.BOT_V4_ENTRY_START)
         scan_end = self._parse_time(settings.BOT_V4_ENTRY_END)
         interval = settings.BOT_V4_SCAN_INTERVAL
-        version = "v5" if use_v5 else "v4"
+        version = "v6" if use_v6 else ("v5" if use_v5 else "v4")
 
-        if use_v5:
+        if use_v6:
+            threshold = settings.BOT_V6_TP25_THRESHOLD
+        elif use_v5:
             threshold = settings.BOT_V5_TP25_THRESHOLD
         else:
             threshold = settings.BOT_V4_MIN_CONFIDENCE
@@ -1292,8 +2106,8 @@ class ZeroDTEBot:
         logger.info(f"  Window: {settings.BOT_V4_ENTRY_START} - {settings.BOT_V4_ENTRY_END} ET")
         logger.info(f"  Interval: {interval} min | Threshold: {threshold:.0%}")
 
-        # FOMC gate check (v5 only)
-        if use_v5 and settings.BOT_FOMC_GATE_ENABLED:
+        # FOMC gate check (v6/v5 only)
+        if (use_v6 or use_v5) and settings.BOT_FOMC_GATE_ENABLED:
             cal = get_economic_calendar_features()
             if cal["is_fomc_day"] and settings.BOT_FOMC_SKIP_DAY:
                 logger.info("  FOMC day detected — skipping per BOT_FOMC_SKIP_DAY=True")
@@ -1342,9 +2156,27 @@ class ZeroDTEBot:
                 if v3_conf < settings.BOT_MIN_CONFIDENCE:
                     logger.warning(
                         f"  v3 pre-screen FAILED: {v3_conf:.3f} < {settings.BOT_MIN_CONFIDENCE} "
-                        f"— skipping entire day"
+                        f"— would skip entire day"
                     )
-                    return False
+                    # Still show v4/v5 scores for informational purposes
+                    await self._show_all_model_scores(chain)
+
+                    # Offer manual override (skip in skip-wait mode)
+                    if not self.skip_wait:
+                        play_sound("/System/Library/Sounds/Glass.aiff")
+                        send_notification("0DTE Bot — v3 Pre-Screen Failed",
+                                          f"Score {v3_conf:.3f} < {settings.BOT_MIN_CONFIDENCE}")
+                        answer = await self._async_prompt(
+                            f"  v3 override? Enter despite failed risk screen [y/N] (60s timeout): ",
+                            timeout=60)
+                        if answer.lower() in ('y', 'yes'):
+                            logger.info(f"  v3 override APPROVED — proceeding despite {v3_conf:.3f}")
+                        else:
+                            reason = "timeout" if answer == '' else "declined"
+                            logger.info(f"  v3 override {reason}. Skipping day.")
+                            return False
+                    else:
+                        return False
                 logger.info(f"  v3 pre-screen PASSED: {v3_conf:.3f}")
 
             # Step 3: Fetch 5-min SPX candles
@@ -1362,9 +2194,136 @@ class ZeroDTEBot:
             atm_iv = self._extract_atm_iv(chain)
             underlying = chain.get('underlyingPrice', 0)
 
+            # Multi-delta scoring (v5 with multiple delta models)
+            multi_delta = (
+                use_v5
+                and settings.BOT_V5_MULTI_DELTA
+                and len(self.predictor.available_v5_deltas) > 1
+            )
+
+            best = None  # set by v5/v4 branches; v6 handles entry inline
+
             try:
-                if use_v5:
-                    # v5: predict both TP25 and TP50
+                if use_v6:
+                    # v6 ensemble prediction
+                    result_tp25 = self.predictor.predict_v6_ensemble(
+                        candles_5min=candles,
+                        daily_data=self._v4_daily_data_cache,
+                        option_atm_iv=atm_iv,
+                        target="tp25"
+                    )
+                    result_tp50 = self.predictor.predict_v6_ensemble(
+                        candles_5min=candles,
+                        daily_data=self._v4_daily_data_cache,
+                        option_atm_iv=atm_iv,
+                        target="tp50"
+                    )
+
+                    # Cache daily data after first call
+                    if self._v4_daily_data_cache is None and self.predictor._daily_cache:
+                        self._v4_daily_data_cache = self.predictor._daily_cache
+
+                    tp25_score = result_tp25['ensemble_prob']
+                    tp50_score = result_tp50['ensemble_prob']
+                    
+                    # Check consensus filter
+                    consensus_pass = result_tp25['consensus_count'] >= settings.BOT_V6_MIN_CONSENSUS
+                    
+                    # Display v6 ensemble results
+                    bar_len = 20
+                    tp25_filled = int(tp25_score * bar_len)
+                    tp25_bar = "\u2588" * tp25_filled + "\u2591" * (bar_len - tp25_filled)
+                    logger.info(f"  {progress} {slot_time}  v6 ensemble (SPX=${underlying:,.0f}):")
+                    logger.info(f"    TP25 Ensemble: {tp25_score:.3f} |{tp25_bar}|  (threshold={threshold:.3f})")
+                    logger.info(f"    TP50 Ensemble: {tp50_score:.3f}")
+                    logger.info(f"    Individual TP25: 1y={result_tp25['individual_probs']['1y']:.3f} "
+                               f"6m={result_tp25['individual_probs']['6m']:.3f} "
+                               f"3m={result_tp25['individual_probs']['3m']:.3f} "
+                               f"1m={result_tp25['individual_probs']['1m']:.3f}")
+                    logger.info(f"    Consensus: {result_tp25['consensus_count']}/4 models >= 0.5 "
+                               f"({'PASS' if consensus_pass else 'FAIL'})")
+                    
+                    if result_tp25['disagreement']:
+                        logger.warning(f"    ⚠️  High disagreement (std={result_tp25['std']:.3f}) — models diverge!")
+                        play_sound("/System/Library/Sounds/Glass.aiff")
+                    
+                    # Entry decision: ensemble >= threshold AND consensus >= 3/4
+                    if tp25_score >= threshold and consensus_pass:
+                        logger.info(f"    >>> ENTRY (ensemble={tp25_score:.3f}, consensus={result_tp25['consensus_count']}/4)")
+                        entered = await self.attempt_entry(chain=chain)
+                        if entered:
+                            filled = await self.wait_for_entry_fill()
+                            if filled:
+                                return True
+                    elif tp25_score >= threshold and not consensus_pass:
+                        logger.warning(f"    Ensemble score meets threshold but consensus FAILED "
+                                     f"({result_tp25['consensus_count']}/{settings.BOT_V6_MIN_CONSENSUS}) — SKIP")
+                    else:
+                        logger.info(f"    Score below threshold — waiting for next slot")
+
+                    # v6 handles entry inline — skip to next scan slot
+                    if self.skip_wait:
+                        return False
+                    await asyncio.sleep(interval * 60)
+                    continue
+
+                elif use_v5 and multi_delta:
+                    # Multi-delta: score all deltas at once
+                    all_delta_scores = self._score_all_deltas(candles, atm_iv, chain)
+
+                    # Cache daily data from predictor after first call
+                    if self._v4_daily_data_cache is None and self.predictor._daily_cache:
+                        self._v4_daily_data_cache = self.predictor._daily_cache
+
+                    if not all_delta_scores:
+                        logger.warning(f"  {progress} {slot_time} — no delta scores available")
+                        if self.skip_wait:
+                            return False
+                        await asyncio.sleep(interval * 60)
+                        continue
+
+                    # Find best delta: highest TP25 among qualifying
+                    best = None
+                    for ds in all_delta_scores:
+                        if ds["tp25"] >= threshold:
+                            best = ds
+                            break  # already sorted by TP25 desc
+
+                    primary_score = all_delta_scores[0]["tp25"]
+                    tp25_score = primary_score
+                    tp50_score = all_delta_scores[0].get("tp50")
+
+                    # Display all deltas
+                    bar_len = 20
+                    logger.info(f"  {progress} {slot_time}  Multi-delta v5 scores (SPX=${underlying:,.0f}):")
+                    for ds in all_delta_scores:
+                        d_int = int(ds["delta"] * 100)
+                        tp25_v = ds["tp25"]
+                        tp50_v = ds.get("tp50")
+                        cr = ds.get("credit", 0)
+                        qualifies = tp25_v >= threshold
+                        is_best = best is not None and ds["delta"] == best["delta"]
+                        prefix = "*" if qualifies else " "
+                        tp25_filled = int(tp25_v * bar_len)
+                        tp25_bar = "\u2588" * tp25_filled + "\u2591" * (bar_len - tp25_filled)
+                        tp50_str = ""
+                        if tp50_v is not None:
+                            tp50_str = f" TP50={tp50_v:.3f}"
+                        chosen_mark = "  <<<" if is_best else ""
+                        logger.info(
+                            f"    {prefix}d{d_int}: TP25={tp25_v:.3f} |{tp25_bar}|{tp50_str}"
+                            f"  cr=${cr:.2f}{chosen_mark}"
+                        )
+
+                    if best:
+                        self._chosen_delta = best["delta"]
+                        d_int = int(best["delta"] * 100)
+                        logger.info(f"    Best: d{d_int} (TP25={best['tp25']:.3f})  >>> ENTRY")
+                    else:
+                        self._chosen_delta = None
+
+                elif use_v5:
+                    # Single-delta v5 (original path)
                     tp25_score = self.predictor.predict_v5(
                         candles_5min=candles,
                         daily_data=self._v4_daily_data_cache,
@@ -1380,6 +2339,28 @@ class ZeroDTEBot:
                     ) if self.predictor.v5_tp50_ready else None
 
                     primary_score = tp25_score if tp25_score is not None else (tp50_score or 0.0)
+                    best = {"delta": settings.BOT_SHORT_DELTA, "tp25": primary_score} if primary_score >= threshold else None
+
+                    # Cache daily data from predictor after first call
+                    if self._v4_daily_data_cache is None and self.predictor._daily_cache:
+                        self._v4_daily_data_cache = self.predictor._daily_cache
+
+                    # Display (original single-delta format)
+                    bar_len = 20
+                    pass_mark = " >>> ENTRY" if primary_score >= threshold else ""
+                    tp25_filled = int((tp25_score or 0) * bar_len)
+                    tp25_bar = "\u2588" * tp25_filled + "\u2591" * (bar_len - tp25_filled)
+                    tp50_str = ""
+                    if tp50_score is not None:
+                        tp50_filled = int(tp50_score * bar_len)
+                        tp50_bar = "\u2588" * tp50_filled + "\u2591" * (bar_len - tp50_filled)
+                        tp50_str = f" TP50={tp50_score:.3f} |{tp50_bar}|"
+                    logger.info(
+                        f"  {progress} {slot_time}  "
+                        f"v5: TP25={tp25_score:.3f} |{tp25_bar}|{tp50_str}  "
+                        f"SPX=${underlying:,.0f}"
+                        f"{pass_mark}"
+                    )
                 else:
                     # v4: predict P(profitable)
                     primary_score = self.predictor.predict_v4(
@@ -1389,10 +2370,24 @@ class ZeroDTEBot:
                     )
                     tp25_score = None
                     tp50_score = None
+                    best = {"delta": settings.BOT_SHORT_DELTA, "tp25": primary_score} if primary_score >= threshold else None
 
-                # Cache daily data from predictor after first call
-                if self._v4_daily_data_cache is None and self.predictor._daily_cache:
-                    self._v4_daily_data_cache = self.predictor._daily_cache
+                    # Cache daily data from predictor after first call
+                    if self._v4_daily_data_cache is None and self.predictor._daily_cache:
+                        self._v4_daily_data_cache = self.predictor._daily_cache
+
+                    # Display (original v4 format)
+                    bar_len = 20
+                    pass_mark = " >>> ENTRY" if primary_score >= threshold else ""
+                    filled = int(primary_score * bar_len)
+                    bar = "\u2588" * filled + "\u2591" * (bar_len - filled)
+                    logger.info(
+                        f"  {progress} {slot_time}  "
+                        f"v4={primary_score:.3f} |{bar}| "
+                        f"ATM-IV={atm_iv:.1f}  SPX=${underlying:,.0f}"
+                        f"{pass_mark}"
+                    )
+
             except Exception as e:
                 logger.warning(f"  {progress} {slot_time} — {version} prediction error: {e}")
                 if self.skip_wait:
@@ -1400,43 +2395,14 @@ class ZeroDTEBot:
                 await asyncio.sleep(interval * 60)
                 continue
 
-            # Step 5: Display score(s) and check threshold
-            bar_len = 20
-            pass_mark = " >>> ENTRY" if primary_score >= threshold else ""
+            # Step 5: Entry or manual approval
+            entry_delta = self._chosen_delta  # set by multi-delta, or None for single
 
-            if use_v5 and tp25_score is not None:
-                # Dual-score display for v5
-                tp25_filled = int(tp25_score * bar_len)
-                tp25_bar = "\u2588" * tp25_filled + "\u2591" * (bar_len - tp25_filled)
-                tp50_str = ""
-                if tp50_score is not None:
-                    tp50_filled = int(tp50_score * bar_len)
-                    tp50_bar = "\u2588" * tp50_filled + "\u2591" * (bar_len - tp50_filled)
-                    tp50_str = f" TP50={tp50_score:.3f} |{tp50_bar}|"
-
-                logger.info(
-                    f"  {progress} {slot_time}  "
-                    f"v5: TP25={tp25_score:.3f} |{tp25_bar}|{tp50_str}  "
-                    f"SPX=${underlying:,.0f}"
-                    f"{pass_mark}"
-                )
-            else:
-                # Single-score display for v4
-                filled = int(primary_score * bar_len)
-                bar = "\u2588" * filled + "\u2591" * (bar_len - filled)
-                logger.info(
-                    f"  {progress} {slot_time}  "
-                    f"v4={primary_score:.3f} |{bar}| "
-                    f"ATM-IV={atm_iv:.1f}  SPX=${underlying:,.0f}"
-                    f"{pass_mark}"
-                )
-
-            if primary_score >= threshold:
-                logger.info(f"  {version} TRIGGERED at {slot_time} (score {primary_score:.3f} >= {threshold})")
-                # Pass the already-fetched chain to attempt_entry
-                result = await self.attempt_entry(chain=chain)
+            if best is not None:
+                d_str = f" (d{int(entry_delta*100)})" if entry_delta else ""
+                logger.info(f"  {version} TRIGGERED at {slot_time} (score {primary_score:.3f} >= {threshold}){d_str}")
+                result = await self.attempt_entry(chain=chain, target_delta=entry_delta)
                 if not result:
-                    # Hard failure (bad strikes, sizing, etc.) — skip this slot
                     logger.warning(f"  Entry attempt failed. Will retry at next scan slot.")
                     self._reset_entry_state()
                     await asyncio.sleep(interval * 60)
@@ -1445,18 +2411,17 @@ class ZeroDTEBot:
                 # Order placed — wait for fill
                 filled = await self.wait_for_entry_fill()
                 if filled:
-                    return True  # Order placed AND filled
+                    return True
 
                 # Fill timeout — cancel order, reset state, and keep scanning
                 logger.warning("  Entry did not fill within timeout. Cancelling and re-scanning.")
                 await self._cancel_order_safe(self.entry_order_id)
                 self._reset_entry_state()
-                # wait_for_entry_fill already consumed ~5 min, so we're at the next slot
                 continue
 
             # Manual approval: always-on when below threshold (skip in skip-wait mode)
             if not self.skip_wait:
-                preview = await self._compute_entry_preview(chain)
+                preview = await self._compute_entry_preview(chain, target_delta=entry_delta)
                 if preview:
                     s = preview['strikes']
                     gap = threshold - primary_score
@@ -1475,10 +2440,12 @@ class ZeroDTEBot:
                     logger.info(f"  SL: close at ${preview['sl_debit']:.2f}  "
                                 f"({settings.BOT_STOP_LOSS_PCT:.0%} portfolio -> -${preview['sl_loss']:,.0f})")
 
+                    play_sound("/System/Library/Sounds/Glass.aiff")
+                    send_notification("0DTE Bot — Approval Needed", f"Score {primary_score:.3f} | ${preview['credit']:.2f} x{preview['quantity']}")
                     answer = await self._async_prompt("  Override entry? [y/N] (60s timeout): ", timeout=60)
                     if answer.lower() in ('y', 'yes'):
                         logger.info(f"  Manual override APPROVED at {slot_time}")
-                        result = await self.attempt_entry(chain=chain)
+                        result = await self.attempt_entry(chain=chain, target_delta=entry_delta)
                         if not result:
                             logger.warning(f"  Entry attempt failed after manual approval.")
                             self._reset_entry_state()
@@ -1501,7 +2468,7 @@ class ZeroDTEBot:
             if self.skip_wait:
                 logger.info(f"  [SKIP-WAIT] {version} score {primary_score:.3f} < {threshold}. "
                            f"Falling back to direct entry attempt.")
-                return await self.attempt_entry(chain=chain)
+                return await self.attempt_entry(chain=chain, target_delta=entry_delta)
 
             # Wait for next scan interval
             await asyncio.sleep(interval * 60)
@@ -2100,16 +3067,371 @@ class ZeroDTEBot:
 
         return True
 
-    async def _detect_tp_order_for_ic(self, ic: TrackedIronCondor) -> Optional[str]:
-        """Find a working BUY_TO_CLOSE IRON_CONDOR order matching this IC's symbols."""
+    async def reconstruct_ics_from_orders(self) -> Optional[List[TrackedIronCondor]]:
+        """
+        Build TrackedIronCondor objects directly from FILLED ENTRY orders
+        (not positions). This avoids netting ambiguity when two ICs share a strike.
+
+        Algorithm:
+        1. Fetch filled orders (last 3 days), classify as ENTRY/ROLL/CLOSE
+        2. Build IC states from ENTRY orders (symbols + credit)
+        3. Apply ROLLs chronologically
+        4. Filter out closed ICs (explicit CLOSE orders + expiration check)
+        5. Validate remaining ICs against current positions
+        6. Return TrackedIronCondor list with credits already assigned
+        """
+        try:
+            now_utc = datetime.now(pytz.utc)
+            lookback_utc = now_utc - timedelta(days=3)
+            all_orders = await self.schwab_client.get_orders_for_account(
+                from_entered_datetime=lookback_utc,
+                to_entered_datetime=now_utc,
+            )
+        except Exception as e:
+            logger.warning(f"Order-based recon: failed to fetch orders: {e}")
+            return None
+
+        if not all_orders:
+            logger.info("Order-based recon: no orders in last 3 days")
+            return None
+
+        filled_orders = [o for o in all_orders if o.get('status', '').upper() == 'FILLED']
+        if not filled_orders:
+            logger.info(f"Order-based recon: {len(all_orders)} orders but none FILLED")
+            return None
+
+        logger.info(f"    {len(filled_orders)} filled orders (of {len(all_orders)} total)")
+
+        def _order_time(o):
+            t = o.get('enteredTime', '')
+            try:
+                return datetime.fromisoformat(t.replace('Z', '+00:00'))
+            except (ValueError, AttributeError):
+                return datetime.min.replace(tzinfo=pytz.utc)
+
+        filled_orders.sort(key=_order_time)
+
+        # --- Classify all filled orders ---
+        entries = []
+        rolls = []
+        closes = []
+        for order in filled_orders:
+            kind = self._classify_order(order)
+            legs = order.get('orderLegCollection', [])
+            if not legs:
+                continue
+            order_qty = max((l.get('quantity', 0) for l in legs), default=0)
+
+            if kind == 'ENTRY':
+                leg_details = []
+                order_symbols = set()
+                for l in legs:
+                    sym = l.get('instrument', {}).get('symbol', '')
+                    inst = l.get('instruction', '')
+                    parsed = self.builder.parse_option_symbol(sym)
+                    if parsed:
+                        parsed['symbol'] = sym
+                        parsed['instruction'] = inst
+                        leg_details.append(parsed)
+                    order_symbols.add(sym)
+
+                fill_price = self._extract_fill_price(order)
+                entries.append({
+                    'symbols': order_symbols,
+                    'leg_details': leg_details,
+                    'price': fill_price,
+                    'quantity': order_qty,
+                    'order_id': order.get('orderId'),
+                    'time': _order_time(order),
+                })
+
+            elif kind == 'ROLL':
+                btc_symbols = set()
+                sto_symbols = set()
+                sto_leg_details = []
+                btc_short_strikes = []
+                sto_short_strikes = []
+                for l in legs:
+                    sym = l.get('instrument', {}).get('symbol', '')
+                    inst = l.get('instruction', '')
+                    parsed = self.builder.parse_option_symbol(sym)
+                    if inst == 'BUY_TO_CLOSE':
+                        btc_symbols.add(sym)
+                        if parsed:
+                            btc_short_strikes.append(parsed)
+                    elif inst == 'SELL_TO_OPEN':
+                        sto_symbols.add(sym)
+                        if parsed:
+                            parsed['symbol'] = sym
+                            parsed['instruction'] = inst
+                            sto_short_strikes.append(parsed)
+                            sto_leg_details.append(parsed)
+                    elif inst == 'SELL_TO_CLOSE':
+                        btc_symbols.add(sym)
+                    elif inst == 'BUY_TO_OPEN':
+                        sto_symbols.add(sym)
+                        if parsed:
+                            parsed['symbol'] = sym
+                            parsed['instruction'] = inst
+                            sto_leg_details.append(parsed)
+
+                roll_is_credit = True
+                if btc_short_strikes and sto_short_strikes:
+                    for new_leg in sto_short_strikes:
+                        for old_leg in btc_short_strikes:
+                            if new_leg['option_type'] == old_leg['option_type']:
+                                if new_leg['option_type'] == 'C':
+                                    roll_is_credit = new_leg['strike'] < old_leg['strike']
+                                else:
+                                    roll_is_credit = new_leg['strike'] > old_leg['strike']
+                                break
+                        break
+
+                roll_fill_price = self._extract_fill_price(order)
+                rolls.append({
+                    'btc_symbols': btc_symbols,
+                    'sto_symbols': sto_symbols,
+                    'sto_leg_details': sto_leg_details,
+                    'price': roll_fill_price,
+                    'is_credit': roll_is_credit,
+                    'quantity': order_qty,
+                    'order_id': order.get('orderId'),
+                    'time': _order_time(order),
+                })
+
+            elif kind == 'CLOSE':
+                close_symbols = set()
+                for l in legs:
+                    close_symbols.add(l.get('instrument', {}).get('symbol', ''))
+                closes.append({
+                    'symbols': close_symbols,
+                    'quantity': order_qty,
+                    'order_id': order.get('orderId'),
+                    'time': _order_time(order),
+                })
+
+        if not entries:
+            logger.info("Order-based recon: no ENTRY orders found")
+            return None
+
+        logger.info(f"    Classified: {len(entries)} entries, {len(rolls)} rolls, {len(closes)} closes")
+        for e in entries:
+            logger.info(f"      ENTRY {e['order_id']}: {e['quantity']}x ${e['price']:.2f} "
+                        f"legs={len(e['leg_details'])} syms={e['symbols']}")
+
+        # --- Build IC states from entries ---
+        ic_states = []
+        for entry in entries:
+            ic_states.append({
+                'current_symbols': set(entry['symbols']),
+                'leg_details': list(entry['leg_details']),  # copy to avoid mutation
+                'cumulative_credit': entry['price'],
+                'quantity': entry['quantity'],
+                'order_id': entry['order_id'],
+                'rolls_applied': 0,
+            })
+
+        # --- Apply rolls chronologically ---
+        for roll in rolls:
+            matched_state = None
+            for state in ic_states:
+                if (roll['btc_symbols'].issubset(state['current_symbols'])
+                        and roll['quantity'] == state['quantity']):
+                    matched_state = state
+                    break
+
+            if matched_state is None:
+                logger.debug(f"    Roll {roll['order_id']} didn't match any IC state")
+                continue
+
+            matched_state['current_symbols'] -= roll['btc_symbols']
+            matched_state['current_symbols'] |= roll['sto_symbols']
+
+            # Update leg_details: remove closed legs, add new ones
+            matched_state['leg_details'] = [
+                ld for ld in matched_state['leg_details']
+                if ld['symbol'] not in roll['btc_symbols']
+            ]
+            matched_state['leg_details'].extend(roll['sto_leg_details'])
+
+            if roll['is_credit']:
+                matched_state['cumulative_credit'] += roll['price']
+            else:
+                matched_state['cumulative_credit'] -= roll['price']
+            matched_state['rolls_applied'] += 1
+            logger.info(f"      Applied roll {roll['order_id']} to entry {matched_state['order_id']}")
+
+        # --- Filter out closed ICs ---
+        # Method 1: explicit CLOSE orders
+        for close in closes:
+            for state in ic_states:
+                if state.get('closed'):
+                    continue
+                if (close['symbols'].issubset(state['current_symbols'])
+                        and close['quantity'] == state['quantity']):
+                    state['closed'] = True
+                    logger.info(f"      Entry {state['order_id']}: closed by order {close['order_id']}")
+                    break
+
+        # Method 2: expiration check — 0DTE entries from previous days are expired
+        today_str = self._now_et().strftime('%Y-%m-%d')
+        for state in ic_states:
+            if state.get('closed'):
+                continue
+            # Check expiration from any parsed leg
+            for ld in state['leg_details']:
+                exp = ld.get('expiration', '')
+                if exp and exp < today_str:
+                    state['closed'] = True
+                    logger.info(f"      Entry {state['order_id']}: expired ({exp} < {today_str})")
+                    break
+
+        open_states = [s for s in ic_states if not s.get('closed')]
+        logger.info(f"    After close/expiry filter: {len(open_states)} of {len(ic_states)} IC states remain")
+
+        if not open_states:
+            logger.info("Order-based recon: all entry orders are closed/expired")
+            return None
+
+        # --- Validate against current positions ---
+        positions = await self._get_spx_positions()
+        if not positions:
+            logger.info("Order-based recon: no SPX positions found")
+            return None
+
+        # Build position map: symbol -> net quantity
+        pos_map = {}
+        for p in positions:
+            sym = p.get('instrument', {}).get('symbol', '')
+            long_qty = p.get('longQuantity', 0)
+            short_qty = p.get('shortQuantity', 0)
+            pos_map[sym] = pos_map.get(sym, 0) + (long_qty - short_qty)
+
+        logger.info(f"    Positions ({len(pos_map)} symbols): "
+                    + ", ".join(f"{s.split()[-1] if ' ' in s else s}={q}"
+                               for s, q in sorted(pos_map.items())))
+
+        # Keep IC states where ALL symbols appear in positions
+        active_states = []
+        for state in open_states:
+            missing = state['current_symbols'] - set(pos_map.keys())
+            if not missing:
+                active_states.append(state)
+            else:
+                logger.info(f"      Entry {state['order_id']}: filtered (missing {missing})")
+
+        if not active_states:
+            logger.info("Order-based recon: no ICs match current positions")
+            return None
+
+        logger.info(f"    {len(active_states)} IC(s) pass position filter")
+
+        # Cross-check: expected vs actual net quantities per symbol
+        expected_net = {}
+        for state in active_states:
+            for ld in state['leg_details']:
+                sym = ld['symbol']
+                inst = ld.get('instruction', '')
+                if inst == 'SELL_TO_OPEN':
+                    expected_net[sym] = expected_net.get(sym, 0) - state['quantity']
+                elif inst == 'BUY_TO_OPEN':
+                    expected_net[sym] = expected_net.get(sym, 0) + state['quantity']
+
+        for sym, exp_qty in expected_net.items():
+            actual_qty = pos_map.get(sym, 0)
+            if actual_qty != exp_qty:
+                logger.warning(f"    Qty mismatch {sym}: expected={exp_qty} actual={actual_qty}")
+
+        # --- Build TrackedIronCondor objects ---
+        def _make_leg(parsed_leg):
+            return {
+                'symbol': parsed_leg['symbol'],
+                'strike': parsed_leg['strike'],
+                'avg_price': parsed_leg.get('avg_price', 0.0),
+                'delta': 0,
+                'bid': 0, 'ask': 0, 'mid': 0,
+                'open_interest': 0, 'volume': 0,
+            }
+
+        tracked_ics = []
+        for idx, state in enumerate(active_states):
+            # Classify legs by instruction + option_type
+            long_put = short_put = short_call = long_call = None
+            for ld in state['leg_details']:
+                inst = ld.get('instruction', '')
+                otype = ld.get('option_type', '')
+                if inst == 'SELL_TO_OPEN' and otype == 'P':
+                    short_put = ld
+                elif inst == 'BUY_TO_OPEN' and otype == 'P':
+                    long_put = ld
+                elif inst == 'SELL_TO_OPEN' and otype == 'C':
+                    short_call = ld
+                elif inst == 'BUY_TO_OPEN' and otype == 'C':
+                    long_call = ld
+
+            if not all([long_put, short_put, short_call, long_call]):
+                logger.warning(f"    Entry {state['order_id']}: incomplete IC — "
+                               f"LP={'Y' if long_put else 'N'} SP={'Y' if short_put else 'N'} "
+                               f"SC={'Y' if short_call else 'N'} LC={'Y' if long_call else 'N'} "
+                               f"(legs: {[(ld.get('instruction'), ld.get('option_type'), ld.get('strike')) for ld in state['leg_details']]})")
+                continue
+
+            if not (long_put['strike'] < short_put['strike'] < short_call['strike'] < long_call['strike']):
+                logger.warning(f"    Entry {state['order_id']}: bad strike order "
+                               f"{long_put['strike']}/{short_put['strike']}/"
+                               f"{short_call['strike']}/{long_call['strike']}")
+                continue
+
+            ic_num = idx + 1
+            exp_date = short_put.get('expiration', '')
+            strikes = {
+                'long_put': _make_leg(long_put),
+                'short_put': _make_leg(short_put),
+                'short_call': _make_leg(short_call),
+                'long_call': _make_leg(long_call),
+                'net_credit': round(state['cumulative_credit'], 2),
+                'expiration': exp_date,
+                'exp_key': f"{exp_date}:0",
+            }
+
+            label = (f"IC#{ic_num} ({int(long_put['strike'])}/{int(short_put['strike'])}p - "
+                     f"{int(short_call['strike'])}/{int(long_call['strike'])}c)")
+
+            tracked_ics.append(TrackedIronCondor(
+                ic_id=ic_num,
+                label=label,
+                strikes=strikes,
+                quantity=int(state['quantity']),
+                fill_credit=round(state['cumulative_credit'], 2),
+                portfolio_value=self.portfolio_value,
+            ))
+
+            rolls_note = f" (+{state['rolls_applied']} rolls)" if state['rolls_applied'] else ""
+            logger.info(f"    {label}: {state['quantity']}x ${state['cumulative_credit']:.2f}"
+                        f"{rolls_note} (order {state['order_id']})")
+
+        if not tracked_ics:
+            logger.warning("Order-based recon: no valid ICs built")
+            return None
+
+        logger.info(f"  Order-based recon: {len(tracked_ics)} IC(s) reconstructed")
+        return tracked_ics
+
+    async def _detect_tp_order_for_ic(self, ic: TrackedIronCondor) -> Tuple[Optional[str], int]:
+        """
+        Find a working BUY_TO_CLOSE IRON_CONDOR order matching this IC's symbols.
+
+        Returns:
+            (order_id, order_quantity) if found, (None, 0) otherwise.
+        """
         try:
             orders = await self.schwab_client.get_orders_for_account(status='WORKING')
         except Exception as e:
             logger.warning(f"Failed to fetch working orders: {e}")
-            return None
+            return None, 0
 
         if not orders:
-            return None
+            return None, 0
 
         ic_symbols = {
             ic.strikes['long_put']['symbol'],
@@ -2129,9 +3451,13 @@ class ZeroDTEBot:
                 l.get('instrument', {}).get('symbol', '') for l in legs
             }
             if order_symbols == ic_symbols:
-                return str(order.get('orderId', ''))
+                order_id = str(order.get('orderId', ''))
+                order_qty = max(
+                    (l.get('quantity', 0) for l in legs), default=0
+                )
+                return order_id, int(order_qty)
 
-        return None
+        return None, 0
 
     async def _place_tp_limit_order(self, ic: TrackedIronCondor, debit: float):
         """Place a BUY_TO_CLOSE limit order for a specific IC."""
@@ -2307,10 +3633,13 @@ def main():
     # Safety confirmation for live mode (default)
     if not args.paper:
         confirm = input(
-            "\n*** LIVE TRADING MODE ***\n"
-            "This will place REAL orders with REAL money.\n"
+            "\n*** PERSISTENT LIVE TRADING MODE ***\n"
+            "This bot will run 24/7: trade, sleep overnight, wake for next day.\n"
+            "It will place REAL orders with REAL money.\n"
             f"Symbol: {settings.BOT_SYMBOL}\n"
             f"Max contracts: {settings.BOT_MAX_CONTRACTS}\n"
+            f"Daily limits: +{settings.BOT_DAILY_GAIN_LIMIT_PCT:.0%} gain / "
+            f"-{settings.BOT_DAILY_LOSS_LIMIT_PCT:.0%} loss\n"
             f"Portfolio value: live from Schwab (fallback: ${settings.BOT_PORTFOLIO_VALUE:,.0f})\n"
             "\nType 'YES' to confirm: "
         )
@@ -2318,12 +3647,12 @@ def main():
             print("Aborted.")
             return
 
-    # Configure logging
+    # Configure logging (rotation handles multi-day persistence)
     logger.remove()
     logger.add(sys.stderr, level="INFO", format="{time:HH:mm:ss} | {level:<7} | {message}")
-    log_path = Path("logs") / f"zero_dte_bot_{date.today()}.log"
+    log_path = Path("logs") / "zero_dte_bot.log"
     log_path.parent.mkdir(exist_ok=True)
-    logger.add(str(log_path), level="DEBUG", rotation="10 MB")
+    logger.add(str(log_path), level="DEBUG", rotation="10 MB", retention="30 days")
 
     bot = ZeroDTEBot(
         dry_run=args.paper,

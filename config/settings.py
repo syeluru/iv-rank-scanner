@@ -42,7 +42,7 @@ class Settings(BaseSettings):
     MARKET_DATA_PROVIDER: str = "alpaca"
 
     # ===== Trading Mode =====
-    PAPER_TRADING: bool = True
+    PAPER_TRADING: bool = False  # Overridden by bot's --paper flag
 
     # ===== Manual Approval System =====
     ENABLE_MANUAL_APPROVAL: bool = True  # Toggle approval system on/off
@@ -105,9 +105,11 @@ class Settings(BaseSettings):
     BOT_DAILY_TARGET_PCT: float = 0.02  # 2% daily profit target
     BOT_TAKE_PROFIT_PCT: float = 0.25  # Close at 25% of credit received
     BOT_STOP_LOSS_PCT: float = 0.10  # Max loss per trade as % of portfolio (10% = $8,700 on $87K)
+    BOT_DAILY_GAIN_LIMIT_PCT: float = 0.05  # 5% daily gain → stop trading for day
+    BOT_DAILY_LOSS_LIMIT_PCT: float = 0.10  # 10% daily loss → stop trading for day
     BOT_ENTRY_TIME: str = "12:00"  # HH:MM ET entry time
     BOT_EXIT_TIME: str = "15:00"  # HH:MM ET forced close time
-    BOT_WAKE_TIME: str = "11:55"  # HH:MM ET pre-flight check time
+    BOT_WAKE_TIME: str = "10:20"  # HH:MM ET pre-flight check time (before V4_ENTRY_START)
     BOT_SHORT_DELTA: float = 0.10  # Target delta for short strikes
     BOT_WING_WIDTH: float = 25.0  # Wing width in dollars
     BOT_SYMBOL: str = "$SPX"  # Underlying symbol
@@ -134,10 +136,17 @@ class Settings(BaseSettings):
     BOT_V5_TP50_THRESHOLD: float = 0.60        # Min P(hit 50% TP) — informational/future
     BOT_FOMC_GATE_ENABLED: bool = True         # Enable FOMC-day awareness
     BOT_FOMC_SKIP_DAY: bool = False            # If True, skip FOMC announcement days entirely
+    BOT_V5_MULTI_DELTA: bool = True            # Score all loaded delta models, pick best for entry
+
+    # v6 Ensemble Models
+    BOT_V6_ENABLED: bool = True                # Enable v6 ensemble (falls back to v5/v4 if False)
+    BOT_V6_TP25_THRESHOLD: float = 0.58        # Min ensemble P(hit 25% TP) to enter
+    BOT_V6_TP50_THRESHOLD: float = 0.62        # Min ensemble P(hit 50% TP) to enter
+    BOT_V6_MIN_CONSENSUS: int = 3              # Require ≥3/4 models >= 0.5
 
     # Tiered SLTP (trailing profit lock)
     BOT_SLTP_START_PCT: float = 0.01    # First tier activates at 1.0% portfolio gain
-    BOT_SLTP_STEP_PCT: float = 0.005   # 0.5% steps between tiers
+    BOT_SLTP_STEP_PCT: float = 0.0005  # 0.05% steps between tiers
     BOT_SLTP_GAP_PCT: float = 0.005    # Lock-in is 0.5% below activation
     BOT_SLTP_MAX_PCT: float = 0.05     # Highest tier: 5.0% activation
 

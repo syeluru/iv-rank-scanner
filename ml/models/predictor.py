@@ -154,10 +154,20 @@ class MLPredictor:
         self.v4_derived_features = {}
 
         # v5 take-profit models (separate artifacts)
+        # Default (10-delta) models
         self.v5_tp25_model = None
         self.v5_tp25_feature_names = None
         self.v5_tp50_model = None
         self.v5_tp50_feature_names = None
+        # Delta-specific models: {delta_float: (model, feature_names)}
+        self._v5_delta_models = {}  # keyed by (target, delta), e.g. ("tp25", 0.15)
+
+        # v6 ensemble models (4 windows per target = 8 models total)
+        self.v6_ensemble = {
+            'tp25': {},  # {'1y': model, '6m': model, '3m': model, '1m': model}
+            'tp50': {}
+        }
+        self.v6_feature_names = None  # Same features across all v6 models
 
         if self.model_path.exists():
             self._load_model()
@@ -169,13 +179,23 @@ class MLPredictor:
         if v4_path.exists():
             self._load_v4_model(v4_path)
 
-        # Try loading v5 TP models
+        # Try loading v5 TP models (10-delta defaults)
         v5_tp25_path = self.model_path.parent / "entry_timing_v5_tp25.joblib"
         v5_tp50_path = self.model_path.parent / "entry_timing_v5_tp50.joblib"
         if v5_tp25_path.exists():
             self._load_v5_model(v5_tp25_path, "tp25")
         if v5_tp50_path.exists():
             self._load_v5_model(v5_tp50_path, "tp50")
+
+        # Try loading delta-specific v5 models (15-delta, 20-delta)
+        for delta, suffix in [(0.15, "_d15"), (0.20, "_d20")]:
+            for target_name in ["tp25", "tp50"]:
+                path = self.model_path.parent / f"entry_timing_v5_{target_name}{suffix}.joblib"
+                if path.exists():
+                    self._load_v5_delta_model(path, target_name, delta)
+
+        # Try loading v6 ensemble models (1y, 6m, 3m, 1m windows)
+        self._load_v6_ensemble()
 
     def _load_model(self):
         """Load model artifact and detect version."""
@@ -684,6 +704,37 @@ class MLPredictor:
     def v5_ready(self) -> bool:
         return self.v5_tp25_ready or self.v5_tp50_ready
 
+    @property
+    def available_v5_deltas(self) -> list:
+        """Return sorted list of deltas with loaded v5 models (at least tp25)."""
+        deltas = set()
+        # Default 10-delta models
+        if self.v5_tp25_model is not None:
+            deltas.add(0.10)
+        # Delta-specific models
+        for (target, delta) in self._v5_delta_models:
+            if target == "tp25":
+                deltas.add(delta)
+        return sorted(deltas)
+
+    @property
+    def v6_ready(self) -> bool:
+        """Check if v6 ensemble is loaded (need all 4 windows for both targets)."""
+        return (
+            len(self.v6_ensemble['tp25']) == 4 and
+            len(self.v6_ensemble['tp50']) == 4
+        )
+
+    @property
+    def v6_tp25_ready(self) -> bool:
+        """Check if v6 tp25 models are loaded (all 4 windows)."""
+        return len(self.v6_ensemble['tp25']) == 4
+
+    @property
+    def v6_tp50_ready(self) -> bool:
+        """Check if v6 tp50 models are loaded (all 4 windows)."""
+        return len(self.v6_ensemble['tp50']) == 4
+
     def _load_v5_model(self, path: Path, target: str):
         """Load a v5 TP model artifact (tp25 or tp50)."""
         try:
@@ -705,6 +756,73 @@ class MLPredictor:
             )
         except Exception as e:
             logger.warning(f"Failed to load v5 {target} model: {e}")
+
+    def _load_v5_delta_model(self, path: Path, target: str, delta: float):
+        """Load a delta-specific v5 model (e.g. 15-delta, 20-delta)."""
+        try:
+            artifact = joblib.load(path)
+            model = artifact["model"]
+            feature_names = artifact.get("feature_names", [])
+            self._v5_delta_models[(target, delta)] = (model, feature_names)
+            logger.info(
+                f"v5 {target} d{int(delta*100)} model loaded: {path.name} "
+                f"({len(feature_names)} features)"
+            )
+        except Exception as e:
+            logger.warning(f"Failed to load v5 {target} d{int(delta*100)} model: {e}")
+
+    def _load_v6_ensemble(self):
+        """Load v6 ensemble models (4 windows per target = 8 models total)."""
+        base_path = self.model_path.parent / "v6" / "ensemble"
+        if not base_path.exists():
+            logger.debug("v6 ensemble directory not found, skipping")
+            return
+
+        windows = ['1y', '6m', '3m', '1m']
+        loaded_count = 0
+
+        for target in ['tp25', 'tp50']:
+            for window in windows:
+                # Try with month tag first (e.g., entry_timing_v6_tp25_202603_1y.joblib)
+                # Fall back to no month tag
+                patterns = [
+                    f"entry_timing_v6_{target}_*_{window}.joblib",
+                    f"entry_timing_v6_{target}_{window}.joblib"
+                ]
+                
+                path = None
+                for pattern in patterns:
+                    import glob
+                    matches = list(base_path.glob(pattern))
+                    if matches:
+                        # Use most recent if multiple matches
+                        path = Path(sorted(matches, reverse=True)[0])
+                        break
+
+                if path and path.exists():
+                    try:
+                        artifact = joblib.load(path)
+                        model = artifact["model"]
+
+                        self.v6_ensemble[target][window] = model
+                        # Use XGBoost's internal feature names (authoritative)
+                        # over artifact metadata (may be stale/wrong)
+                        if self.v6_feature_names is None:
+                            if hasattr(model, 'feature_names_in_'):
+                                self.v6_feature_names = list(model.feature_names_in_)
+                            else:
+                                self.v6_feature_names = artifact.get("feature_names", [])
+                        
+                        loaded_count += 1
+                        logger.debug(f"v6 {target} {window} loaded: {path.name}")
+                    except Exception as e:
+                        logger.warning(f"Failed to load v6 {target} {window}: {e}")
+
+        if loaded_count > 0:
+            logger.info(
+                f"v6 ensemble loaded: {loaded_count}/8 models "
+                f"({len(self.v6_feature_names)} features)"
+            )
 
     def compute_v5_features(
         self,
@@ -733,12 +851,180 @@ class MLPredictor:
 
         return features
 
+    def compute_v6_features(
+        self,
+        candles_5min: pd.DataFrame,
+        daily_data: Optional[dict] = None,
+        option_atm_iv: float = 15.0,
+    ) -> Dict[str, float]:
+        """
+        Compute full v6 feature vector (41 features).
+
+        Extends v5 features with additional daily, VIX, intraday, and calendar
+        features that the v6 XGBoost ensemble was trained on.
+        """
+        # Start with v5 features (v4 + economic calendar)
+        features = self.compute_v5_features(candles_5min, daily_data, option_atm_iv)
+
+        # Fetch daily data for additional features
+        daily = self._get_daily_data()
+        spx = daily.get("spx")
+        vix_df = daily.get("vix")
+        vix3m_df = daily.get("vix3m")
+
+        # --- Daily realized volatility windows ---
+        if spx is not None and len(spx) >= 21:
+            closes_d = spx["Close"].values.flatten()
+            highs_d = spx["High"].values.flatten()
+            lows_d = spx["Low"].values.flatten()
+            opens_d = spx["Open"].values.flatten()
+
+            for window, key in [(5, "rv_close_5d"), (10, "rv_close_10d"), (20, "rv_close_20d")]:
+                if len(closes_d) >= window + 1:
+                    log_rets = np.diff(np.log(closes_d[-(window+1):]))
+                    features[key] = float(np.std(log_rets) * np.sqrt(252) * 100)
+                else:
+                    features.setdefault(key, 15.0)
+
+            # atr_14d_pct (may already be in daily_data from v4)
+            if "atr_14d_pct" not in features:
+                if len(closes_d) >= 15:
+                    trs = []
+                    for i in range(-14, 0):
+                        tr = max(highs_d[i] - lows_d[i],
+                                 abs(highs_d[i] - closes_d[i-1]),
+                                 abs(lows_d[i] - closes_d[i-1]))
+                        trs.append(tr)
+                    features["atr_14d_pct"] = float(np.mean(trs) / closes_d[-1] * 100)
+                else:
+                    features.setdefault("atr_14d_pct", 0.5)
+
+            # prior_day_return
+            if len(closes_d) >= 2:
+                features.setdefault("prior_day_return",
+                                    float((closes_d[-2] / closes_d[-3] - 1) * 100) if len(closes_d) >= 3 else 0.0)
+
+            # sma_20d_dist
+            if len(closes_d) >= 20:
+                sma20 = float(np.mean(closes_d[-20:]))
+                features.setdefault("sma_20d_dist", float((closes_d[-1] / sma20 - 1) * 100))
+            else:
+                features.setdefault("sma_20d_dist", 0.0)
+        else:
+            for key in ["rv_close_5d", "rv_close_10d", "rv_close_20d"]:
+                features.setdefault(key, 15.0)
+            features.setdefault("atr_14d_pct", 0.5)
+            features.setdefault("prior_day_return", 0.0)
+            features.setdefault("sma_20d_dist", 0.0)
+
+        # --- VIX features ---
+        if vix_df is not None and len(vix_df) >= 10:
+            vix_closes = vix_df["Close"].values.flatten()
+            features.setdefault("vix_level", float(vix_closes[-1]))
+            features.setdefault("vix_change_1d",
+                                float(vix_closes[-1] - vix_closes[-2]) if len(vix_closes) >= 2 else 0.0)
+            features.setdefault("vix_change_5d",
+                                float(vix_closes[-1] - vix_closes[-6]) if len(vix_closes) >= 6 else 0.0)
+            if len(vix_closes) >= 30:
+                rank = float(np.sum(vix_closes[-30:] <= vix_closes[-1]) / 30.0 * 100)
+                features.setdefault("vix_rank_30d", rank)
+            else:
+                features.setdefault("vix_rank_30d", 50.0)
+        else:
+            features.setdefault("vix_level", 18.5)
+            features.setdefault("vix_change_1d", 0.0)
+            features.setdefault("vix_change_5d", 0.0)
+            features.setdefault("vix_rank_30d", 50.0)
+
+        # vix_term_slope (VIX3M vs VIX)
+        vix_now = features.get("vix_level", 18.5)
+        if vix3m_df is not None and len(vix3m_df) >= 1:
+            vix3m_now = float(vix3m_df["Close"].values.flatten()[-1])
+            features.setdefault("vix_term_slope",
+                                float((vix3m_now / vix_now - 1)) if vix_now > 0 else 0.0)
+        else:
+            features.setdefault("vix_term_slope", 0.0)
+
+        # --- Intraday features ---
+        if candles_5min is not None and len(candles_5min) >= 2:
+            opens = candles_5min["open"].values.astype(float)
+            closes = candles_5min["close"].values.astype(float)
+            highs = candles_5min["high"].values.astype(float)
+            lows = candles_5min["low"].values.astype(float)
+            open_price = float(opens[0])
+
+            if open_price > 0:
+                features.setdefault("move_from_open_pct",
+                                    float((closes[-1] / open_price - 1) * 100))
+            else:
+                features.setdefault("move_from_open_pct", 0.0)
+
+            # ORB features (first 30 min = 6 bars)
+            orb_bars = min(6, len(candles_5min))
+            orb_high = float(np.max(highs[:orb_bars]))
+            orb_low = float(np.min(lows[:orb_bars]))
+            if open_price > 0:
+                features.setdefault("orb_range_pct", float((orb_high - orb_low) / open_price * 100))
+            else:
+                features.setdefault("orb_range_pct", 0.0)
+
+            features.setdefault("orb_contained",
+                                1.0 if closes[-1] <= orb_high and closes[-1] >= orb_low else 0.0)
+
+            # range_exhaustion (session range / ATR)
+            session_range = float(np.max(highs) - np.min(lows))
+            atr_pct = features.get("atr_14d_pct", 0.5)
+            if atr_pct > 0 and open_price > 0:
+                session_range_pct = session_range / open_price * 100
+                features.setdefault("range_exhaustion", float(session_range_pct / atr_pct))
+            else:
+                features.setdefault("range_exhaustion", 0.0)
+
+            # momentum_30min (last 6 bars return)
+            lookback = min(6, len(closes))
+            if closes[-lookback] > 0:
+                features.setdefault("momentum_30min",
+                                    float((closes[-1] / closes[-lookback] - 1) * 100))
+            else:
+                features.setdefault("momentum_30min", 0.0)
+
+            # trend_slope_norm (linear regression slope of closes, normalized)
+            if len(closes) >= 3:
+                x = np.arange(len(closes))
+                slope = float(np.polyfit(x, closes, 1)[0])
+                features.setdefault("trend_slope_norm",
+                                    float(slope / np.std(closes)) if np.std(closes) > 0 else 0.0)
+            else:
+                features.setdefault("trend_slope_norm", 0.0)
+        else:
+            for key in ["move_from_open_pct", "orb_range_pct", "orb_contained",
+                        "range_exhaustion", "momentum_30min", "trend_slope_norm"]:
+                features.setdefault(key, 0.0)
+
+        # --- Day-of-week features ---
+        now = datetime.now()
+        dow = now.weekday()  # 0=Mon, 4=Fri
+        features.setdefault("dow_sin", float(np.sin(2 * np.pi * dow / 5)))
+        features.setdefault("dow_cos", float(np.cos(2 * np.pi * dow / 5)))
+
+        # --- days_since_fomc ---
+        today_date = now.date()
+        days_since = 14  # default
+        for fomc_date in sorted(_FOMC_DATE_SET, reverse=True):
+            if fomc_date <= today_date:
+                days_since = (today_date - fomc_date).days
+                break
+        features.setdefault("days_since_fomc", float(days_since))
+
+        return features
+
     def predict_v5(
         self,
         candles_5min: pd.DataFrame,
         daily_data: Optional[dict] = None,
         option_atm_iv: float = 15.0,
         target: str = "tp25",
+        delta: float = 0.10,
     ) -> float:
         """
         Predict P(hit TP) for entry timing.
@@ -748,11 +1034,16 @@ class MLPredictor:
             daily_data: Optional pre-computed day-level features.
             option_atm_iv: ATM implied volatility.
             target: "tp25" for P(hit 25% TP) or "tp50" for P(hit 50% TP).
+            delta: Short delta level (0.10, 0.15, or 0.20). Uses delta-specific
+                   model if available, falls back to 10-delta model.
 
         Returns:
             P(hit TP) score (0-1). Higher = more likely to hit take-profit.
         """
-        if target == "tp25":
+        # Try delta-specific model first (for non-default deltas)
+        if delta != 0.10 and (target, delta) in self._v5_delta_models:
+            model, feature_names = self._v5_delta_models[(target, delta)]
+        elif target == "tp25":
             model = self.v5_tp25_model
             feature_names = self.v5_tp25_feature_names
         elif target == "tp50":
@@ -762,7 +1053,7 @@ class MLPredictor:
             raise ValueError(f"Invalid v5 target: {target}. Use 'tp25' or 'tp50'.")
 
         if model is None:
-            raise ValueError(f"v5 {target} model not loaded")
+            raise ValueError(f"v5 {target} model not loaded (delta={delta})")
 
         features = self.compute_v5_features(candles_5min, daily_data, option_atm_iv)
 
@@ -774,3 +1065,126 @@ class MLPredictor:
         ]).reshape(1, -1)
 
         return float(model.predict_proba(feature_array)[0][1])
+
+    def predict_v5_all_deltas(
+        self,
+        candles_5min: pd.DataFrame,
+        daily_data: Optional[dict] = None,
+        option_atm_iv: float = 15.0,
+    ) -> Dict[float, Dict[str, float]]:
+        """
+        Score all loaded delta models. Computes features ONCE.
+
+        Returns:
+            {delta: {"tp25": score, "tp50": score}} for each loaded delta.
+            Missing models get None values.
+        """
+        deltas = self.available_v5_deltas
+        if not deltas:
+            return {}
+
+        # Compute features once (shared across all deltas)
+        features = self.compute_v5_features(candles_5min, daily_data, option_atm_iv)
+
+        results = {}
+        for delta in deltas:
+            scores = {}
+            for target in ["tp25", "tp50"]:
+                # Select model for this (target, delta)
+                if delta != 0.10 and (target, delta) in self._v5_delta_models:
+                    model, feature_names = self._v5_delta_models[(target, delta)]
+                elif delta == 0.10 and target == "tp25":
+                    model = self.v5_tp25_model
+                    feature_names = self.v5_tp25_feature_names
+                elif delta == 0.10 and target == "tp50":
+                    model = self.v5_tp50_model
+                    feature_names = self.v5_tp50_feature_names
+                else:
+                    model = None
+                    feature_names = None
+
+                if model is not None and feature_names is not None:
+                    try:
+                        feature_array = np.array([
+                            features.get(name, 0.0) if not np.isnan(features.get(name, 0.0))
+                            else 0.0
+                            for name in feature_names
+                        ]).reshape(1, -1)
+                        scores[target] = float(model.predict_proba(feature_array)[0][1])
+                    except Exception:
+                        scores[target] = None
+                else:
+                    scores[target] = None
+
+            results[delta] = scores
+
+        return results
+
+    def predict_v6_ensemble(
+        self,
+        candles_5min: pd.DataFrame,
+        daily_data: Optional[dict] = None,
+        option_atm_iv: float = 15.0,
+        target: str = "tp25",
+        weights: Optional[Dict[str, float]] = None,
+    ) -> Dict[str, any]:
+        """
+        Predict using v6 ensemble (4-window weighted average).
+
+        Args:
+            candles_5min: 5-min OHLC candles from 9:30 to now.
+            daily_data: Optional pre-computed day-level features.
+            option_atm_iv: ATM implied volatility.
+            target: "tp25" or "tp50".
+            weights: Optional custom weights. Default: {'1y': 0.4, '6m': 0.3, '3m': 0.2, '1m': 0.1}
+
+        Returns:
+            Dict with:
+                - ensemble_prob: Weighted ensemble prediction (0-1)
+                - individual_probs: Dict of {window: prob} for each window
+                - consensus_count: Number of models predicting >= 0.5
+                - disagreement: True if std(probs) > 0.15
+                - std: Standard deviation of individual predictions
+        """
+        if weights is None:
+            weights = {'1y': 0.4, '6m': 0.3, '3m': 0.2, '1m': 0.1}
+
+        # Check if target models are loaded
+        if target not in ['tp25', 'tp50']:
+            raise ValueError(f"Invalid target: {target}. Use 'tp25' or 'tp50'.")
+
+        models = self.v6_ensemble.get(target, {})
+        if len(models) != 4:
+            raise ValueError(
+                f"v6 {target} ensemble incomplete: {len(models)}/4 models loaded"
+            )
+
+        # Compute full v6 feature set (41 features)
+        features = self.compute_v6_features(candles_5min, daily_data, option_atm_iv)
+
+        # Build feature vector
+        feature_array = np.array([
+            features.get(name, 0.0) if not np.isnan(features.get(name, 0.0))
+            else 0.0
+            for name in self.v6_feature_names
+        ]).reshape(1, -1)
+
+        # Get predictions from all 4 windows
+        probs = {}
+        for window in ['1y', '6m', '3m', '1m']:
+            model = models[window]
+            probs[window] = float(model.predict_proba(feature_array)[0][1])
+
+        # Compute ensemble
+        ensemble_prob = sum(probs[w] * weights[w] for w in weights)
+        consensus_count = sum(1 for p in probs.values() if p >= 0.5)
+        std = np.std(list(probs.values()))
+        disagreement = std > 0.15
+
+        return {
+            'ensemble_prob': ensemble_prob,
+            'individual_probs': probs,
+            'consensus_count': consensus_count,
+            'disagreement': disagreement,
+            'std': std
+        }

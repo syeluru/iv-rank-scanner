@@ -31,6 +31,22 @@ class CandleLoader:
             db_path = Path(db_path)
 
         self.db = DatabaseManager(db_path)
+        self._ensure_table_exists()
+
+    def _ensure_table_exists(self):
+        """Create intraday_candles table if it doesn't exist."""
+        self.db.execute("""
+            CREATE TABLE IF NOT EXISTS intraday_candles (
+                symbol VARCHAR NOT NULL,
+                timestamp TIMESTAMP NOT NULL,
+                open DOUBLE,
+                high DOUBLE,
+                low DOUBLE,
+                close DOUBLE,
+                volume BIGINT DEFAULT 0,
+                PRIMARY KEY (symbol, timestamp)
+            )
+        """)
 
     async def get_candles(
         self,
@@ -165,7 +181,7 @@ class CandleLoader:
             records = candles_df.to_records(index=False).tolist()
 
             # Batch insert
-            self.db.executemany(insert_query, records)
+            self.db.execute_many(insert_query, records)
 
             logger.info(f"✓ Inserted {len(records)} candles for {symbol}")
 

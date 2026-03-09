@@ -44,6 +44,10 @@ class IntradayFeaturesExtractor(BaseFeatureExtractor):
         """
         features = {}
 
+        # Strip timezone info — DB stores tz-naive timestamps
+        if hasattr(timestamp, 'tzinfo') and timestamp.tzinfo is not None:
+            timestamp = timestamp.replace(tzinfo=None)
+
         try:
             # Get today's candles up to current time
             today_start = timestamp.replace(hour=9, minute=30, second=0, microsecond=0)
