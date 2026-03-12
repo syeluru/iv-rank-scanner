@@ -101,7 +101,7 @@ class Settings(BaseSettings):
     LIVE_AUTO_APPROVE: bool = False  # Auto-approve signals (use with caution!)
 
     # ===== 0DTE Bot Configuration =====
-    BOT_PORTFOLIO_VALUE: float = 87000.0  # Portfolio value for sizing
+    BOT_PORTFOLIO_VALUE: float = 28000.0  # Portfolio value for sizing
     BOT_DAILY_TARGET_PCT: float = 0.02  # 2% daily profit target
     BOT_TAKE_PROFIT_PCT: float = 0.25  # Close at 25% of credit received
     BOT_STOP_LOSS_PCT: float = 0.10  # Max loss per trade as % of portfolio (10% = $8,700 on $87K)
@@ -142,13 +142,29 @@ class Settings(BaseSettings):
     BOT_V6_ENABLED: bool = True                # Enable v6 ensemble (falls back to v5/v4 if False)
     BOT_V6_TP25_THRESHOLD: float = 0.58        # Min ensemble P(hit 25% TP) to enter
     BOT_V6_TP50_THRESHOLD: float = 0.62        # Min ensemble P(hit 50% TP) to enter
-    BOT_V6_MIN_CONSENSUS: int = 3              # Require ≥3/4 models >= 0.5
+    BOT_V6_MIN_CONSENSUS: int = 4              # Require ≥4/6 models >= 0.5
 
-    # Tiered SLTP (trailing profit lock)
-    BOT_SLTP_START_PCT: float = 0.01    # First tier activates at 1.0% portfolio gain
-    BOT_SLTP_STEP_PCT: float = 0.0005  # 0.05% steps between tiers
-    BOT_SLTP_GAP_PCT: float = 0.005    # Lock-in is 0.5% below activation
-    BOT_SLTP_MAX_PCT: float = 0.05     # Highest tier: 5.0% activation
+    # Unified Strategy Selection
+    BOT_UNIFIED_STRATEGY: bool = True          # Enable EV-based multi-delta strategy selection
+    BOT_MIN_EV_THRESHOLD: float = 0.10         # Min EV per contract ($) to enter a strategy
+
+    # v8 XGBoost Models (200+ features, replaces v5/v7 when available)
+    BOT_V8_ENABLED: bool = True                # Enable v8 models (falls back to v5/v7 if unavailable)
+
+    # v7 Long IC Models
+    BOT_V7_ENABLED: bool = True                # Enable v7 long IC decision system
+    BOT_V7_THRESHOLD: float = 0.50             # Min P(long IC profitable) to enter long IC
+    BOT_V7_PREFERRED_DELTA: float = 0.20       # Preferred delta for long ICs (highest gamma)
+    BOT_LONG_IC_MAX_RISK_PCT: float = 0.02     # Max portfolio risk per long IC trade (2%)
+    BOT_LONG_IC_TP_PCT: float = 0.50           # Take profit at 50% of debit as profit
+    BOT_LONG_IC_SL_PCT: float = 0.40           # Stop loss at 40% loss of debit
+    BOT_LONG_IC_ENTRY_START: str = "11:00"     # Long IC entry window start
+    BOT_LONG_IC_ENTRY_END: str = "12:30"       # Long IC entry window end
+
+    # Credit-based SLTP (trailing profit lock on debit)
+    BOT_SLTP_ACTIVATE_PCT: float = 0.30   # SLTP activates at 30% profit (debit = credit * 0.70)
+    BOT_SLTP_LOCK_OFFSET_PCT: float = 0.05  # Lock-in is 5% below activation (30% → lock 25%)
+    BOT_SLTP_STEP_PCT: float = 0.05       # Trail up every 5% profit increment
 
     # ===== API Rate Limiting =====
     SCHWAB_RATE_LIMIT_CALLS: int = 120  # Schwab allows 120 calls per minute

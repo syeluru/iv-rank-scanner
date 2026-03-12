@@ -59,6 +59,25 @@ class SchwabClient:
             logger.info("Schwab client connection established")
         return self._client
 
+    def re_authenticate(self) -> bool:
+        """
+        Run interactive OAuth flow to get fresh tokens when refresh token expires.
+
+        Returns:
+            True if re-authentication succeeded
+        """
+        logger.warning("Running interactive re-authentication (browser will open)...")
+        try:
+            client = auth_manager.authenticate_interactive()
+            if client:
+                self._client = client
+                self._account_hash_cache = None
+                logger.info("Re-authentication successful — client refreshed")
+                return True
+        except Exception as e:
+            logger.error(f"Re-authentication failed: {e}")
+        return False
+
     async def _rate_limited_call(self, func: callable, *args, **kwargs) -> Any:
         """
         Execute function with rate limiting.
@@ -575,6 +594,55 @@ class SchwabClient:
 
         data = response.json()
         logger.debug(f"Got {len(data)} orders")
+        return data
+
+    async def get_transactions(
+        self,
+        start_date: Optional[date] = None,
+        end_date: Optional[date] = None,
+        transaction_types: Optional[str] = None,
+        account_id: Optional[str] = None
+    ) -> list[dict]:
+        """
+        Get transactions for account.
+
+        Args:
+            start_date: Only transactions after this date (defaults to 60 days prior)
+            end_date: Only transactions before this date (defaults to now)
+            transaction_types: Filter by type (e.g. 'TRADE', 'DIVIDEND_OR_INTEREST')
+            account_id: Account hash (defaults to configured account)
+
+        Returns:
+            List of transaction dictionaries
+        """
+        client = self._get_client()
+
+        if account_id:
+            acc_hash = account_id
+        else:
+            acc_hash = await self._get_account_hash()
+
+        kwargs = {}
+        if start_date:
+            kwargs['start_date'] = start_date
+        if end_date:
+            kwargs['end_date'] = end_date
+        if transaction_types:
+            kwargs['transaction_types'] = transaction_types
+
+        response = await self._rate_limited_call(
+            client.get_transactions,
+            acc_hash,
+            **kwargs
+        )
+
+        if response.status_code != 200:
+            logger.error(f"Failed to get transactions: {response.status_code}")
+            logger.error(f"Response: {response.text if response.text else 'No response body'}")
+            return []
+
+        data = response.json()
+        logger.info(f"Got {len(data)} transactions")
         return data
 
     async def cancel_order(

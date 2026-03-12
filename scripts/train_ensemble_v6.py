@@ -25,6 +25,8 @@ REPORT_PATH = BASE_DIR / 'ML_V6_ENSEMBLE_REPORT.md'
 
 # Ensemble configuration
 WINDOWS = {
+    '3y': 756,  # 3 years trading days
+    '2y': 504,  # 2 years trading days
     '1y': 252,  # 1 year trading days
     '6m': 126,  # 6 months trading days
     '3m': 63,   # 3 months trading days
@@ -32,9 +34,11 @@ WINDOWS = {
 }
 
 WEIGHTS = {
-    '1y': 0.40,
-    '6m': 0.30,
-    '3m': 0.20,
+    '3y': 0.20,
+    '2y': 0.20,
+    '1y': 0.20,
+    '6m': 0.15,
+    '3m': 0.15,
     '1m': 0.10
 }
 
@@ -157,7 +161,7 @@ def evaluate_ensemble(X_test, y_test, models, weights, target_name):
     consensus_dist = pd.Series(consensus_counts).value_counts().sort_index()
     
     # Filtered predictions (3+ models agree)
-    strong_consensus_mask = np.array(consensus_counts) >= 3
+    strong_consensus_mask = np.array(consensus_counts) >= (len(weights) // 2 + 1)
     if strong_consensus_mask.sum() > 0:
         strong_consensus_auc = roc_auc_score(
             y_test[strong_consensus_mask],
@@ -305,7 +309,7 @@ def main():
         print(f"  Consensus distribution:")
         for count, freq in ensemble_metrics['consensus_dist'].items():
             pct = freq / len(X_test) * 100
-            print(f"    {count}/4 models agree: {freq:,} ({pct:.1f}%)")
+            print(f"    {count}/{len(WINDOWS)} models agree: {freq:,} ({pct:.1f}%)")
         
         if ensemble_metrics['strong_consensus_auc']:
             print(f"  Strong consensus (3+): AUC={ensemble_metrics['strong_consensus_auc']:.4f}, "
@@ -335,7 +339,7 @@ def generate_report(all_results, all_models, total_time):
     report.append("# ML Model v6 - Ensemble Training Report")
     report.append(f"\n**Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     report.append(f"\n**Total Training Time:** {total_time:.1f}s ({total_time/60:.1f} minutes)")
-    report.append(f"\n**Models Trained:** 8 (4 windows × 2 targets)")
+    report.append(f"\n**Models Trained:** {len(WINDOWS) * len(TARGETS)} ({len(WINDOWS)} windows × {len(TARGETS)} targets)")
     
     # Summary table
     report.append("\n## Performance Summary")
@@ -347,16 +351,16 @@ def generate_report(all_results, all_models, total_time):
         metrics = all_results['tp25'][window]
         report.append(f"| {window.upper()} ({WINDOWS[window]}d) | {metrics['n_train']:,} | "
                      f"{metrics['test_auc']:.4f} | {metrics['train_time']:.1f}s |")
-    
+
     ens_auc_tp25 = all_results['tp25']['ensemble']['ensemble_auc']
     report.append(f"| **Ensemble (Weighted)** | - | **{ens_auc_tp25:.4f}** | - |")
-    
+
     report.append(f"\n**Ensemble AUC:** {ens_auc_tp25:.4f}")
-    
+
     report.append("\n### TP50 Target")
     report.append("\n| Model | Train Samples | Test AUC | Train Time |")
     report.append("|-------|--------------|----------|------------|")
-    
+
     for window in WINDOWS.keys():
         metrics = all_results['tp50'][window]
         report.append(f"| {window.upper()} ({WINDOWS[window]}d) | {metrics['n_train']:,} | "
@@ -381,7 +385,7 @@ def generate_report(all_results, all_models, total_time):
         for count in sorted(consensus_dist.index):
             freq = consensus_dist[count]
             pct = freq / total * 100
-            report.append(f"| {count}/4 models | {freq:,} | {pct:.1f}% |")
+            report.append(f"| {count}/{len(WINDOWS)} models | {freq:,} | {pct:.1f}% |")
         
         strong_auc = all_results[target]['ensemble']['strong_consensus_auc']
         strong_pct = all_results[target]['ensemble']['strong_consensus_pct']
@@ -397,13 +401,13 @@ def generate_report(all_results, all_models, total_time):
         
         importance_df = get_feature_importance(all_models[target], FEATURE_COLS)
         
-        report.append("\n| Rank | Feature | Avg Importance | 1Y | 6M | 3M | 1M |")
-        report.append("|------|---------|----------------|----|----|----|----|")
-        
+        window_headers = " | ".join(w.upper() for w in WINDOWS.keys())
+        report.append(f"\n| Rank | Feature | Avg Importance | {window_headers} |")
+        report.append("|------|---------|----------------|" + "|".join(["----"] * len(WINDOWS)) + "|")
+
         for idx, row in importance_df.head(10).iterrows():
-            report.append(f"| {idx+1} | {row['feature']} | {row['avg_importance']:.4f} | "
-                         f"{row['importance_1y']:.4f} | {row['importance_6m']:.4f} | "
-                         f"{row['importance_3m']:.4f} | {row['importance_1m']:.4f} |")
+            window_vals = " | ".join(f"{row[f'importance_{w}']:.4f}" for w in WINDOWS.keys())
+            report.append(f"| {idx+1} | {row['feature']} | {row['avg_importance']:.4f} | {window_vals} |")
     
     # Ensemble configuration
     report.append("\n## Ensemble Configuration")
@@ -415,9 +419,10 @@ def generate_report(all_results, all_models, total_time):
     
     report.append("\n### Prediction Formula")
     report.append("\n```")
-    report.append("ensemble_prob = (1Y × 0.40) + (6M × 0.30) + (3M × 0.20) + (1M × 0.10)")
+    formula_parts = " + ".join(f"({w.upper()} × {WEIGHTS[w]:.2f})" for w in WINDOWS.keys())
+    report.append(f"ensemble_prob = {formula_parts}")
     report.append("consensus_count = number of models predicting prob ≥ 0.5")
-    report.append("strong_consensus = consensus_count ≥ 3")
+    report.append(f"strong_consensus = consensus_count ≥ {len(WINDOWS) // 2 + 1}")
     report.append("```")
     
     # Model files

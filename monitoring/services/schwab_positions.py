@@ -312,16 +312,16 @@ class SchwabPositionsService:
                 logger.debug(f"Order {order_id}: All legs are closing - skipping")
                 continue
 
-            # Skip roll orders (mix of opening and closing legs)
-            # Rolls are already incorporated into the original trade via the database
+            # Detect roll orders (mix of opening and closing legs)
+            # These are processed normally and merged with the original trade via trade_id
             has_closing_leg = any('CLOSE' in leg.get('instruction', '') for leg in order_legs)
-            if has_opening_leg and has_closing_leg:
-                logger.info(f"Order {order_id}: ROLL order (mix of opening/closing) - skipping to avoid duplicate display")
-                continue
+            is_roll_order = has_opening_leg and has_closing_leg
 
-            # ALSO skip if this order is a roll order in the database
+            # If DB has this as a roll order AND the original trade already has the rolled legs,
+            # skip to avoid duplicates. Otherwise, process it for merge via trade_id.
             if order_id in db_roll_order_ids:
-                logger.info(f"Order {order_id}: Found in trade_rolls table - skipping to avoid duplicate display")
+                # Check if the original trade already incorporated these legs via DB lookup
+                logger.info(f"Order {order_id}: Found in trade_rolls table - skipping (already incorporated)")
                 continue
 
             # Create positions for all legs

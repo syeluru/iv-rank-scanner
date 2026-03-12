@@ -1582,6 +1582,108 @@ register_order_callbacks(app)
 # Callbacks are automatically registered by importing history_callbacks module
 
 
+# ============================================================================
+# REST API FOR CHROME EXTENSION
+# ============================================================================
+
+from flask import jsonify, request as flask_request
+from dataclasses import asdict
+
+server = app.server
+
+
+@server.after_request
+def add_cors_headers(response):
+    """Allow Chrome extension to access API endpoints."""
+    origin = flask_request.headers.get('Origin', '')
+    if flask_request.path.startswith('/api/'):
+        response.headers['Access-Control-Allow-Origin'] = '*'
+        response.headers['Access-Control-Allow-Methods'] = 'GET, OPTIONS'
+        response.headers['Access-Control-Allow-Headers'] = 'Content-Type'
+    return response
+
+
+@server.route('/api/trades', methods=['GET', 'OPTIONS'])
+def api_trades():
+    """JSON API endpoint for Chrome extension overlay.
+
+    Returns KPI metrics and all open trade groups with payoff chart data.
+    """
+    if flask_request.method == 'OPTIONS':
+        return '', 204
+
+    try:
+        # Fetch live positions (same path as dashboard callbacks)
+        options_trades, stock_positions = run_async(schwab_positions.get_aggregated_trades())
+
+        # Build KPI
+        kpi = run_async(schwab_positions.get_global_metrics())
+
+        # Serialize trades
+        trades_json = []
+        for t in options_trades + stock_positions:
+            trade_dict = {
+                'trade_group_id': t.trade_group_id,
+                'underlying': t.underlying,
+                'strategy_type': t.strategy_type,
+                'expiration': t.expiration.isoformat() if t.expiration else None,
+                'days_to_expiration': t.days_to_expiration,
+                'entry_credit': t.entry_credit,
+                'max_profit': t.max_profit,
+                'max_loss': t.max_loss,
+                'current_mark': t.current_mark,
+                'unrealized_pnl': t.unrealized_pnl,
+                'realized_pnl': t.realized_pnl,
+                'day_pnl': t.day_pnl,
+                'profit_capture_pct': t.profit_capture_pct,
+                'total_delta': t.total_delta,
+                'total_theta': t.total_theta,
+                'theta_per_hour': t.theta_per_hour,
+                'alert_color': t.alert_color.value if hasattr(t.alert_color, 'value') else str(t.alert_color),
+                'short_strike_breached': t.short_strike_breached,
+                'entry_per_contract': t.entry_per_contract,
+                'mark_per_contract': t.mark_per_contract,
+                'num_contracts': t.num_contracts,
+                'status': t.status,
+                'legs': [
+                    {
+                        'symbol': leg.get('symbol', ''),
+                        'option_type': leg.get('option_type', ''),
+                        'strike': leg.get('strike', 0),
+                        'quantity': leg.get('quantity', 0),
+                        'entry_price': leg.get('entry_price', 0),
+                        'current_mark': leg.get('current_mark', 0),
+                        'delta': leg.get('delta'),
+                    }
+                    for leg in (t.legs or [])
+                    if not leg.get('_is_closed', False)
+                ],
+            }
+
+            # Generate payoff chart JSON (Plotly figure serialized)
+            try:
+                fig = payoff_generator.generate_payoff_diagram(
+                    legs=t.legs,
+                    current_underlying_price=t.underlying_price,
+                    strategy_type=t.strategy_type,
+                    underlying_symbol=t.underlying,
+                    expiration_date=t.expiration,
+                )
+                trade_dict['payoff_chart'] = fig.to_dict()
+            except Exception:
+                trade_dict['payoff_chart'] = None
+
+            trades_json.append(trade_dict)
+
+        return jsonify({'kpi': kpi, 'trades': trades_json})
+
+    except Exception as e:
+        logger.error(f"API /api/trades error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+
 if __name__ == '__main__':
     logger.info("=" * 60)
     logger.info("Starting Trade-Nexus Dashboard...")

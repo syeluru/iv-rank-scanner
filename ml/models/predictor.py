@@ -169,6 +169,22 @@ class MLPredictor:
         }
         self.v6_feature_names = None  # Same features across all v6 models
 
+        # v7 long IC models: {delta_float: (model, feature_names)}
+        self._v7_models = {}  # keyed by delta, e.g. {0.10: (model, features), ...}
+
+        # v8 XGBoost models (200+ features from v8 feature store)
+        # Short IC: {(target, delta): model} where target in (tp25, tp50, big_loss)
+        # Long IC: {(target, delta): model} where target in (profitable, big_move)
+        self._v8_short_models = {}
+        self._v8_long_models = {}
+        self._v8_feature_names = None  # Ordered list of feature names (shared)
+
+        # v8 ensemble: {(strategy, target, window, delta): model}
+        # e.g. ("short_ic", "tp25", "3yr", 0.10): XGBClassifier
+        self._v8_ens_models = {}
+        self._v8_ens_weights = {}       # window_name -> weight
+        self._v8_ens_feature_names = None
+
         if self.model_path.exists():
             self._load_model()
         else:
@@ -196,6 +212,15 @@ class MLPredictor:
 
         # Try loading v6 ensemble models (1y, 6m, 3m, 1m windows)
         self._load_v6_ensemble()
+
+        # Try loading v7 long IC models (per delta)
+        self._load_v7_models()
+
+        # Try loading v8 XGBoost models
+        self._load_v8_models()
+
+        # Try loading v8 ensemble models (6-timeframe weighted)
+        self._load_v8_ensemble()
 
     def _load_model(self):
         """Load model artifact and detect version."""
@@ -719,21 +744,21 @@ class MLPredictor:
 
     @property
     def v6_ready(self) -> bool:
-        """Check if v6 ensemble is loaded (need all 4 windows for both targets)."""
+        """Check if v6 ensemble is loaded (need all 6 windows for both targets)."""
         return (
-            len(self.v6_ensemble['tp25']) == 4 and
-            len(self.v6_ensemble['tp50']) == 4
+            len(self.v6_ensemble['tp25']) == self.V6_EXPECTED_MODELS and
+            len(self.v6_ensemble['tp50']) == self.V6_EXPECTED_MODELS
         )
 
     @property
     def v6_tp25_ready(self) -> bool:
-        """Check if v6 tp25 models are loaded (all 4 windows)."""
-        return len(self.v6_ensemble['tp25']) == 4
+        """Check if v6 tp25 models are loaded (all 6 windows)."""
+        return len(self.v6_ensemble['tp25']) == self.V6_EXPECTED_MODELS
 
     @property
     def v6_tp50_ready(self) -> bool:
-        """Check if v6 tp50 models are loaded (all 4 windows)."""
-        return len(self.v6_ensemble['tp50']) == 4
+        """Check if v6 tp50 models are loaded (all 6 windows)."""
+        return len(self.v6_ensemble['tp50']) == self.V6_EXPECTED_MODELS
 
     def _load_v5_model(self, path: Path, target: str):
         """Load a v5 TP model artifact (tp25 or tp50)."""
@@ -771,25 +796,29 @@ class MLPredictor:
         except Exception as e:
             logger.warning(f"Failed to load v5 {target} d{int(delta*100)} model: {e}")
 
+    # v6 ensemble windows — order matters for weighted prediction
+    V6_WINDOWS = ['3y', '2y', '1y', '6m', '3m', '1m']
+    V6_EXPECTED_MODELS = len(V6_WINDOWS)  # per target
+
     def _load_v6_ensemble(self):
-        """Load v6 ensemble models (4 windows per target = 8 models total)."""
+        """Load v6 ensemble models (6 windows per target = 12 models total)."""
         base_path = self.model_path.parent / "v6" / "ensemble"
         if not base_path.exists():
             logger.debug("v6 ensemble directory not found, skipping")
             return
 
-        windows = ['1y', '6m', '3m', '1m']
         loaded_count = 0
+        total_expected = self.V6_EXPECTED_MODELS * 2
 
         for target in ['tp25', 'tp50']:
-            for window in windows:
+            for window in self.V6_WINDOWS:
                 # Try with month tag first (e.g., entry_timing_v6_tp25_202603_1y.joblib)
                 # Fall back to no month tag
                 patterns = [
                     f"entry_timing_v6_{target}_*_{window}.joblib",
                     f"entry_timing_v6_{target}_{window}.joblib"
                 ]
-                
+
                 path = None
                 for pattern in patterns:
                     import glob
@@ -812,7 +841,7 @@ class MLPredictor:
                                 self.v6_feature_names = list(model.feature_names_in_)
                             else:
                                 self.v6_feature_names = artifact.get("feature_names", [])
-                        
+
                         loaded_count += 1
                         logger.debug(f"v6 {target} {window} loaded: {path.name}")
                     except Exception as e:
@@ -820,7 +849,7 @@ class MLPredictor:
 
         if loaded_count > 0:
             logger.info(
-                f"v6 ensemble loaded: {loaded_count}/8 models "
+                f"v6 ensemble loaded: {loaded_count}/{total_expected} models "
                 f"({len(self.v6_feature_names)} features)"
             )
 
@@ -1147,16 +1176,16 @@ class MLPredictor:
                 - std: Standard deviation of individual predictions
         """
         if weights is None:
-            weights = {'1y': 0.4, '6m': 0.3, '3m': 0.2, '1m': 0.1}
+            weights = {'3y': 0.20, '2y': 0.20, '1y': 0.20, '6m': 0.15, '3m': 0.15, '1m': 0.10}
 
         # Check if target models are loaded
         if target not in ['tp25', 'tp50']:
             raise ValueError(f"Invalid target: {target}. Use 'tp25' or 'tp50'.")
 
         models = self.v6_ensemble.get(target, {})
-        if len(models) != 4:
+        if len(models) != self.V6_EXPECTED_MODELS:
             raise ValueError(
-                f"v6 {target} ensemble incomplete: {len(models)}/4 models loaded"
+                f"v6 {target} ensemble incomplete: {len(models)}/{self.V6_EXPECTED_MODELS} models loaded"
             )
 
         # Compute full v6 feature set (41 features)
@@ -1169,9 +1198,9 @@ class MLPredictor:
             for name in self.v6_feature_names
         ]).reshape(1, -1)
 
-        # Get predictions from all 4 windows
+        # Get predictions from all windows
         probs = {}
-        for window in ['1y', '6m', '3m', '1m']:
+        for window in self.V6_WINDOWS:
             model = models[window]
             probs[window] = float(model.predict_proba(feature_array)[0][1])
 
@@ -1188,3 +1217,607 @@ class MLPredictor:
             'disagreement': disagreement,
             'std': std
         }
+
+    # ── v7 Long IC Models ────────────────────────────────────────────────────
+
+    def _load_v7_models(self):
+        """Load v7 long IC models from ml/artifacts/models/v7/ directory."""
+        v7_dir = self.model_path.parent / "v7"
+        if not v7_dir.exists():
+            logger.debug("v7 long IC model directory not found, skipping")
+            return
+
+        for delta, suffix in [(0.10, "d10"), (0.15, "d15"), (0.20, "d20")]:
+            path = v7_dir / f"long_ic_{suffix}.joblib"
+            if path.exists():
+                try:
+                    artifact = joblib.load(path)
+                    model = artifact["model"]
+                    feature_names = artifact.get("feature_names", [])
+                    self._v7_models[delta] = (model, feature_names)
+                    logger.info(
+                        f"v7 long IC {suffix} model loaded: {path.name} "
+                        f"({len(feature_names)} features)"
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to load v7 {suffix} model: {e}")
+
+    @property
+    def v7_ready(self) -> bool:
+        """Check if any v7 long IC model is loaded."""
+        return len(self._v7_models) > 0
+
+    @property
+    def available_v7_deltas(self) -> list:
+        """Return sorted list of deltas with loaded v7 models."""
+        return sorted(self._v7_models.keys())
+
+    def predict_v7(
+        self,
+        candles_5min: pd.DataFrame,
+        daily_data: Optional[dict] = None,
+        option_atm_iv: float = 15.0,
+        delta: float = 0.20,
+        v3_confidence: Optional[float] = None,
+    ) -> float:
+        """
+        Predict P(long IC profitable) for a given delta.
+
+        Uses the same v4/v6 feature pipeline plus v3_confidence as meta-feature.
+
+        Args:
+            candles_5min: 5-min OHLC candles from 9:30 to now.
+            daily_data: Optional pre-computed day-level features.
+            option_atm_iv: ATM implied volatility.
+            delta: Target delta (0.10, 0.15, or 0.20).
+            v3_confidence: Pre-computed v3 confidence score (meta-feature).
+
+        Returns:
+            P(long IC profitable) score (0-1). Higher = better for long IC.
+        """
+        if delta not in self._v7_models:
+            raise ValueError(
+                f"v7 model not loaded for delta={delta}. "
+                f"Available: {self.available_v7_deltas}"
+            )
+
+        model, feature_names = self._v7_models[delta]
+
+        # Compute features using existing v4 pipeline (same features)
+        features = self.compute_v4_features(candles_5min, daily_data, option_atm_iv)
+
+        # Add v3_confidence as meta-feature
+        if v3_confidence is not None:
+            features["v3_confidence"] = v3_confidence
+        else:
+            features["v3_confidence"] = 0.5  # Neutral default
+
+        # Add any additional features that might be in the v7 model but not in v4
+        # These come from the training data columns
+        if daily_data:
+            for key in ["rv_close_5d", "rv_close_10d", "rv_close_20d",
+                        "vix_change_1d", "vix_change_5d", "vix_rank_30d",
+                        "vix_level", "sma_20d_dist", "prior_day_return",
+                        "iv_skew_10d", "move_from_open_pct",
+                        "orb_contained", "range_exhaustion",
+                        "is_friday", "days_since_fomc"]:
+                if key in daily_data and key not in features:
+                    features[key] = daily_data[key]
+
+        # Economic calendar features
+        from ml.models.predictor import get_economic_calendar_features
+        econ = get_economic_calendar_features()
+        features.update(econ)
+
+        # Day-of-week features
+        from datetime import datetime as dt_cls
+        now = dt_cls.now()
+        dow = now.weekday()
+        features.setdefault("dow_sin", float(np.sin(2 * np.pi * dow / 5)))
+        features.setdefault("dow_cos", float(np.cos(2 * np.pi * dow / 5)))
+        features.setdefault("is_friday", 1.0 if dow == 4 else 0.0)
+
+        # Build feature vector in model order
+        feature_array = np.array([
+            features.get(name, 0.0)
+            if not (isinstance(features.get(name, 0.0), float) and np.isnan(features.get(name, 0.0)))
+            else 0.0
+            for name in feature_names
+        ]).reshape(1, -1)
+
+        return float(model.predict_proba(feature_array)[0][1])
+
+    def predict_v7_all_deltas(
+        self,
+        candles_5min: pd.DataFrame,
+        daily_data: Optional[dict] = None,
+        option_atm_iv: float = 15.0,
+        v3_confidence: Optional[float] = None,
+    ) -> Dict[float, float]:
+        """
+        Score all loaded v7 deltas and return {delta: P(long_IC_profit)}.
+
+        Returns:
+            Dict mapping delta to v7 score, e.g. {0.10: 0.45, 0.15: 0.52, 0.20: 0.61}
+        """
+        scores = {}
+        for delta in self.available_v7_deltas:
+            try:
+                scores[delta] = self.predict_v7(
+                    candles_5min, daily_data, option_atm_iv, delta, v3_confidence
+                )
+            except Exception as e:
+                logger.warning(f"v7 prediction failed for delta={delta}: {e}")
+        return scores
+
+    # ── Unified scoring for TradeDecisionEngine ─────────────────────────
+
+    def predict_all_strategies(
+        self,
+        candles_5min: pd.DataFrame,
+        daily_data: Optional[dict] = None,
+        option_atm_iv: float = 15.0,
+        v3_confidence: Optional[float] = None,
+    ) -> dict:
+        """
+        Gather all model scores needed by the unified TradeDecisionEngine.
+
+        Returns dict with:
+            "v3_confidence": float,
+            "v5_scores": {delta: {"tp25": float, "tp50": float}, ...} or None,
+            "v7_scores": {delta: float, ...} or None,
+        """
+        # Get v3 confidence if not provided
+        if v3_confidence is None:
+            if self.model_ready:
+                v3_confidence = self.predict(daily_data or {})
+            else:
+                v3_confidence = 0.5  # neutral default
+
+        result = {"v3_confidence": v3_confidence, "v5_scores": None, "v7_scores": None}
+
+        # Score v5 per-delta (short IC TP probabilities)
+        if self.v5_ready:
+            try:
+                v5_all = self.predict_v5_all_deltas(candles_5min, daily_data, option_atm_iv)
+                if v5_all:
+                    result["v5_scores"] = v5_all
+            except Exception as e:
+                logger.warning(f"v5 scoring failed: {e}")
+
+        # Score v7 per-delta (long IC profitability)
+        if self.v7_ready:
+            try:
+                v7_all = self.predict_v7_all_deltas(candles_5min, daily_data, option_atm_iv, v3_confidence)
+                if v7_all:
+                    result["v7_scores"] = v7_all
+            except Exception as e:
+                logger.warning(f"v7 scoring failed: {e}")
+
+        return result
+
+    # ── v8 XGBoost models (200+ features) ─────────────────────────────────
+
+    def _load_v8_models(self):
+        """Load v8 XGBoost models and feature names from ml/artifacts/models/v8/."""
+        v8_dir = self.model_path.parent / "v8"
+        if not v8_dir.exists():
+            logger.debug("v8 model directory not found, skipping")
+            return
+
+        # Load feature names (shared across all v8 models)
+        feature_names_path = v8_dir / "short_ic" / "feature_names.json"
+        if not feature_names_path.exists():
+            feature_names_path = v8_dir / "long_ic" / "feature_names.json"
+        if feature_names_path.exists():
+            import json as _json
+            with open(feature_names_path) as f:
+                self._v8_feature_names = _json.load(f)
+            logger.info(f"v8 feature names loaded: {len(self._v8_feature_names)} features")
+        else:
+            logger.warning("v8 feature_names.json not found — cannot load v8 models")
+            return
+
+        # Load short IC models
+        short_dir = v8_dir / "short_ic"
+        if short_dir.exists():
+            for target in ["tp25", "tp50", "big_loss"]:
+                for delta_str, delta_val in [("d10", 0.10), ("d15", 0.15), ("d20", 0.20)]:
+                    path = short_dir / f"v8_short_ic_{delta_str}_{target}_full.joblib"
+                    if path.exists():
+                        try:
+                            model = joblib.load(path)
+                            self._v8_short_models[(target, delta_val)] = model
+                            logger.info(f"v8 short IC {delta_str}/{target} loaded: {path.name}")
+                        except Exception as e:
+                            logger.warning(f"Failed to load v8 short {delta_str}/{target}: {e}")
+
+        # Load long IC models
+        long_dir = v8_dir / "long_ic"
+        if long_dir.exists():
+            for target in ["profitable", "big_move"]:
+                for delta_str, delta_val in [("d10", 0.10), ("d15", 0.15), ("d20", 0.20)]:
+                    path = long_dir / f"v8_long_ic_{delta_str}_{target}_full.joblib"
+                    if path.exists():
+                        try:
+                            model = joblib.load(path)
+                            self._v8_long_models[(target, delta_val)] = model
+                            logger.info(f"v8 long IC {delta_str}/{target} loaded: {path.name}")
+                        except Exception as e:
+                            logger.warning(f"Failed to load v8 long {delta_str}/{target}: {e}")
+
+        if self._v8_short_models or self._v8_long_models:
+            logger.info(
+                f"v8 models ready: {len(self._v8_short_models)} short, "
+                f"{len(self._v8_long_models)} long"
+            )
+
+    @property
+    def v8_ready(self) -> bool:
+        """Check if any v8 model is loaded with feature names."""
+        return self._v8_feature_names is not None and (
+            len(self._v8_short_models) > 0 or len(self._v8_long_models) > 0
+        )
+
+    @property
+    def v8_short_ready(self) -> bool:
+        return self._v8_feature_names is not None and len(self._v8_short_models) > 0
+
+    @property
+    def v8_long_ready(self) -> bool:
+        return self._v8_feature_names is not None and len(self._v8_long_models) > 0
+
+    @property
+    def available_v8_short_deltas(self) -> list:
+        """Return sorted list of deltas with loaded v8 short IC tp25 models."""
+        return sorted(set(d for (t, d) in self._v8_short_models if t == "tp25"))
+
+    @property
+    def available_v8_long_deltas(self) -> list:
+        """Return sorted list of deltas with loaded v8 long IC profitable models."""
+        return sorted(set(d for (t, d) in self._v8_long_models if t == "profitable"))
+
+    def _v8_features_to_array(self, features_dict: dict) -> np.ndarray:
+        """Convert v8 feature dict to ordered numpy array matching training order."""
+        arr = np.array([
+            features_dict.get(name, -999.0)
+            for name in self._v8_feature_names
+        ], dtype=np.float64)
+        # Replace NaN with -999 (same as training preprocessing)
+        arr = np.where(np.isnan(arr), -999.0, arr)
+        arr = np.where(np.isinf(arr), -999.0, arr)
+        return arr.reshape(1, -1)
+
+    def predict_v8_short(
+        self,
+        v8_features: dict,
+        delta: float = 0.10,
+        target: str = "tp25",
+    ) -> float:
+        """
+        Predict using v8 short IC model.
+
+        Args:
+            v8_features: dict from compute_all_features() in v8 feature store.
+            delta: Target delta (0.10, 0.15, 0.20).
+            target: "tp25", "tp50", or "big_loss".
+
+        Returns:
+            P(target) score (0-1).
+        """
+        key = (target, delta)
+        if key not in self._v8_short_models:
+            raise ValueError(f"v8 short model not loaded for {target}@{delta}δ")
+
+        model = self._v8_short_models[key]
+        X = self._v8_features_to_array(v8_features)
+        return float(model.predict_proba(X)[0][1])
+
+    def predict_v8_long(
+        self,
+        v8_features: dict,
+        delta: float = 0.10,
+        target: str = "profitable",
+    ) -> float:
+        """
+        Predict using v8 long IC model.
+
+        Args:
+            v8_features: dict from compute_all_features() in v8 feature store.
+            delta: Target delta (0.10, 0.15, 0.20).
+            target: "profitable" or "big_move".
+
+        Returns:
+            P(target) score (0-1).
+        """
+        key = (target, delta)
+        if key not in self._v8_long_models:
+            raise ValueError(f"v8 long model not loaded for {target}@{delta}δ")
+
+        model = self._v8_long_models[key]
+        X = self._v8_features_to_array(v8_features)
+        return float(model.predict_proba(X)[0][1])
+
+    def predict_v8_all_strategies(
+        self,
+        v8_features: dict,
+        v3_confidence: Optional[float] = None,
+    ) -> dict:
+        """
+        Score all v8 strategies and return scores for the decision engine.
+
+        Returns dict with:
+            "v3_confidence": float (from v8 big_loss model or fallback to v3),
+            "v5_scores": {delta: {"tp25": float, "tp50": float}, ...},
+            "v7_scores": {delta: float, ...},
+        """
+        # v3 confidence: use v8 big_loss model if available, else fallback
+        if v3_confidence is None:
+            v3_confidence = 0.5
+
+        # Try to get better v3 from v8 big_loss model
+        for delta in self.available_v8_short_deltas:
+            if ("big_loss", delta) in self._v8_short_models:
+                try:
+                    p_big_loss = self.predict_v8_short(v8_features, delta, "big_loss")
+                    v3_confidence = 1.0 - p_big_loss  # v3 = 1 - P(big_loss)
+                    logger.debug(f"v8 big_loss → v3_confidence={v3_confidence:.3f}")
+                except Exception as e:
+                    logger.warning(f"v8 big_loss prediction failed: {e}")
+                break  # Only need one delta for the risk score
+
+        result = {
+            "v3_confidence": v3_confidence,
+            "v5_scores": None,
+            "v7_scores": None,
+        }
+
+        # Short IC scores (replacing v5)
+        v5_scores = {}
+        for delta in self.available_v8_short_deltas:
+            entry = {}
+            try:
+                entry["tp25"] = self.predict_v8_short(v8_features, delta, "tp25")
+            except Exception:
+                continue
+            try:
+                entry["tp50"] = self.predict_v8_short(v8_features, delta, "tp50")
+            except Exception:
+                entry["tp50"] = 0.0
+            v5_scores[delta] = entry
+        if v5_scores:
+            result["v5_scores"] = v5_scores
+
+        # Long IC scores (replacing v7)
+        v7_scores = {}
+        for delta in self.available_v8_long_deltas:
+            try:
+                v7_scores[delta] = self.predict_v8_long(v8_features, delta, "profitable")
+            except Exception:
+                pass
+        if v7_scores:
+            result["v7_scores"] = v7_scores
+
+        return result
+
+    # ── v8 Ensemble (6-timeframe weighted) ────────────────────────────────
+
+    def _load_v8_ensemble(self):
+        """Load v8 ensemble models from ml/artifacts/models/v8_ensemble/."""
+        ens_dir = self.model_path.parent / "v8_ensemble"
+        if not ens_dir.exists():
+            logger.debug("v8_ensemble directory not found, skipping")
+            return
+
+        # Load config
+        config_path = ens_dir / "ensemble_config.json"
+        if config_path.exists():
+            import json as _json
+            with open(config_path) as f:
+                config = _json.load(f)
+            self._v8_ens_weights = config.get("weights", {})
+            logger.info(f"v8 ensemble config loaded: {len(self._v8_ens_weights)} windows")
+        else:
+            logger.warning("v8 ensemble config not found")
+            return
+
+        # Load feature names
+        fn_path = ens_dir / "feature_names.json"
+        if fn_path.exists():
+            import json as _json
+            with open(fn_path) as f:
+                self._v8_ens_feature_names = _json.load(f)
+            logger.info(f"v8 ensemble feature names: {len(self._v8_ens_feature_names)}")
+        else:
+            # Fall back to v8 single model feature names
+            if self._v8_feature_names:
+                self._v8_ens_feature_names = self._v8_feature_names
+            else:
+                logger.warning("v8 ensemble feature names not found")
+                return
+
+        # Load per-window models
+        window_names = list(self._v8_ens_weights.keys())
+
+        # Short IC targets
+        for target in ["tp10", "tp25", "tp50", "big_loss"]:
+            for window in window_names:
+                for delta_str, delta_val in [("d10", 0.10), ("d15", 0.15), ("d20", 0.20)]:
+                    path = ens_dir / window / f"v8_short_ic_{delta_str}_{target}.joblib"
+                    if path.exists():
+                        try:
+                            model = joblib.load(path)
+                            self._v8_ens_models[("short_ic", target, window, delta_val)] = model
+                        except Exception as e:
+                            logger.warning(f"Failed to load v8 ens short {window}/{target}: {e}")
+
+        # Long IC targets
+        for target in ["tp10", "tp25", "tp50"]:
+            for window in window_names:
+                for delta_str, delta_val in [("d10", 0.10), ("d15", 0.15), ("d20", 0.20)]:
+                    path = ens_dir / window / f"v8_long_ic_{delta_str}_{target}.joblib"
+                    if path.exists():
+                        try:
+                            model = joblib.load(path)
+                            self._v8_ens_models[("long_ic", target, window, delta_val)] = model
+                        except Exception as e:
+                            logger.warning(f"Failed to load v8 ens long {window}/{target}: {e}")
+
+        if self._v8_ens_models:
+            n_short = sum(1 for k in self._v8_ens_models if k[0] == "short_ic")
+            n_long = sum(1 for k in self._v8_ens_models if k[0] == "long_ic")
+            windows_loaded = set(k[2] for k in self._v8_ens_models)
+            logger.info(
+                f"v8 ensemble ready: {n_short} short + {n_long} long models "
+                f"across {len(windows_loaded)} windows ({sorted(windows_loaded)})"
+            )
+
+    @property
+    def v8_ensemble_ready(self) -> bool:
+        """Check if v8 ensemble is loaded."""
+        return (
+            self._v8_ens_feature_names is not None
+            and len(self._v8_ens_models) > 0
+            and len(self._v8_ens_weights) > 0
+        )
+
+    def _v8_ens_features_to_array(self, features_dict: dict) -> np.ndarray:
+        """Convert feature dict to array using ensemble feature names."""
+        arr = np.array([
+            features_dict.get(name, -999.0)
+            for name in self._v8_ens_feature_names
+        ], dtype=np.float64)
+        arr = np.where(np.isnan(arr), -999.0, arr)
+        arr = np.where(np.isinf(arr), -999.0, arr)
+        return arr.reshape(1, -1)
+
+    def _predict_v8_ensemble_single(
+        self,
+        X: np.ndarray,
+        strategy: str,
+        target: str,
+        delta: float,
+    ) -> float:
+        """
+        Weighted average prediction across all loaded timeframe models.
+
+        Automatically re-normalizes weights when some windows are missing.
+        Returns P(target) as float.
+        """
+        predictions = {}
+        for (s, t, window, d), model in self._v8_ens_models.items():
+            if s == strategy and t == target and d == delta:
+                try:
+                    prob = float(model.predict_proba(X)[0][1])
+                    predictions[window] = prob
+                except Exception:
+                    pass
+
+        if not predictions:
+            raise ValueError(
+                f"No v8 ensemble models for {strategy}/{target}@{delta}δ"
+            )
+
+        # Weighted average with re-normalization
+        active_weights = {w: self._v8_ens_weights[w]
+                          for w in predictions if w in self._v8_ens_weights}
+        total_w = sum(active_weights.values())
+        if total_w <= 0:
+            # Equal weight fallback
+            return sum(predictions.values()) / len(predictions)
+
+        weighted_sum = sum(
+            predictions[w] * (active_weights[w] / total_w)
+            for w in predictions if w in active_weights
+        )
+
+        logger.debug(
+            f"v8 ens {strategy}/{target}@{delta}δ: "
+            f"{len(predictions)} windows, "
+            f"probs={[f'{w}={p:.3f}' for w, p in sorted(predictions.items())]}, "
+            f"weighted={weighted_sum:.4f}"
+        )
+
+        return weighted_sum
+
+    def predict_v8_ensemble_all_strategies(
+        self,
+        v8_features: dict,
+        v3_confidence: Optional[float] = None,
+    ) -> dict:
+        """
+        Score all v8 ensemble strategies. Returns dict compatible with
+        TradeDecisionEngine.decide().
+
+        Ensemble predictions are weighted averages across timeframe models.
+        Falls back to single v8 models for any missing strategy/delta.
+        """
+        X = self._v8_ens_features_to_array(v8_features)
+
+        if v3_confidence is None:
+            v3_confidence = 0.5
+
+        # Risk score from ensemble big_loss model
+        short_deltas = sorted(set(
+            d for (s, t, w, d) in self._v8_ens_models
+            if s == "short_ic" and t == "big_loss"
+        ))
+        for delta in short_deltas:
+            try:
+                p_big_loss = self._predict_v8_ensemble_single(X, "short_ic", "big_loss", delta)
+                v3_confidence = 1.0 - p_big_loss
+                logger.debug(f"v8 ens big_loss → v3_confidence={v3_confidence:.3f}")
+            except Exception:
+                pass
+            break
+
+        result = {"v3_confidence": v3_confidence, "v5_scores": None, "v7_scores": None}
+
+        # Short IC scores (ensemble replaces v5)
+        # Find all deltas that have at least tp25 models
+        short_deltas = sorted(set(
+            d for (s, t, w, d) in self._v8_ens_models
+            if s == "short_ic" and t == "tp25"
+        ))
+        v5_scores = {}
+        for delta in short_deltas:
+            entry = {}
+            try:
+                entry["tp25"] = self._predict_v8_ensemble_single(X, "short_ic", "tp25", delta)
+            except Exception:
+                continue
+            for tp_target in ["tp10", "tp50"]:
+                try:
+                    entry[tp_target] = self._predict_v8_ensemble_single(X, "short_ic", tp_target, delta)
+                except Exception:
+                    pass
+            v5_scores[delta] = entry
+        if v5_scores:
+            result["v5_scores"] = v5_scores
+
+        # Long IC scores (ensemble replaces v7)
+        # Use tp25 as the primary "profitable" signal for v7_scores compatibility
+        long_deltas = sorted(set(
+            d for (s, t, w, d) in self._v8_ens_models
+            if s == "long_ic" and t in ("tp25", "tp10")
+        ))
+        v7_scores = {}
+        v7_detail = {}
+        for delta in long_deltas:
+            detail = {}
+            for tp_target in ["tp10", "tp25", "tp50"]:
+                try:
+                    detail[tp_target] = self._predict_v8_ensemble_single(
+                        X, "long_ic", tp_target, delta
+                    )
+                except Exception:
+                    pass
+            if detail:
+                # v7_scores expects a single float per delta — use tp25 as primary
+                v7_scores[delta] = detail.get("tp25", detail.get("tp10", 0.0))
+                v7_detail[delta] = detail
+        if v7_scores:
+            result["v7_scores"] = v7_scores
+            result["v7_detail"] = v7_detail
+
+        return result

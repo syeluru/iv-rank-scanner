@@ -12,8 +12,8 @@ BASE_DIR = Path.home() / 'Documents' / 'Projects' / 'iv-rank-scanner'
 MODEL_DIR = BASE_DIR / 'ml' / 'artifacts' / 'models' / 'v6' / 'ensemble'
 DATA_PATH = BASE_DIR / 'ml' / 'training_data' / 'training_dataset_multi_w25.csv'
 
-WINDOWS = ['1y', '6m', '3m', '1m']
-WEIGHTS = {'1y': 0.40, '6m': 0.30, '3m': 0.20, '1m': 0.10}
+WINDOWS = ['3y', '2y', '1y', '6m', '3m', '1m']
+WEIGHTS = {'3y': 0.20, '2y': 0.20, '1y': 0.20, '6m': 0.15, '3m': 0.15, '1m': 0.10}
 
 FEATURE_COLS = [
     'rv_close_5d', 'rv_close_10d', 'rv_close_20d', 'atr_14d_pct', 'gap_pct',

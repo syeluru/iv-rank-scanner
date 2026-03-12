@@ -55,8 +55,6 @@ from loguru import logger
 
 from config.settings import settings
 from execution.order_manager.ic_order_builder import IronCondorOrderBuilder
-from ml.models.trade_decision import TradeDecisionEngine, TradeAction
-from ml.models.strategy_scorer import StrategyScorer  # noqa: E402
 
 
 # Timezone
@@ -82,8 +80,9 @@ class TrackedIronCondor:
     label: str
     strikes: Dict           # same format as select_strikes() output
     quantity: int
-    fill_credit: float
+    fill_credit: float      # SHORT IC: positive (net credit). LONG IC: negative (-debit).
     portfolio_value: float  # live portfolio value from Schwab
+    is_long: bool = False   # True for long (debit) ICs, False for short (credit) ICs
 
     # Mutable state
     alerts_fired: Set[AlertLevel] = field(default_factory=set)
@@ -92,25 +91,33 @@ class TrackedIronCondor:
     is_closed: bool = False
 
     # Computed thresholds (set in __post_init__)
+    # SHORT IC: debit values (cost to close). Debit falling = profit.
+    # LONG IC: credit values (proceeds from close). Credit rising = profit.
     tp_25_debit: float = 0.0
     tp_50_debit: float = 0.0
     sl_warning_debit: float = 0.0
     sl_exit_debit: float = 0.0
 
-    # Fixed 25% TP debit (placed as limit order)
+    # Dynamic TP (set externally after daily P&L is computed)
     target_tp_debit: float = 0.0
 
-    # Credit-based SLTP (trailing profit lock): activates at 30%, locks 25%, trails every 5%
-    # Each tuple: (activation_pct, floor_pct, activation_debit, floor_debit)
+    # Tiered SLTP (trailing profit lock): ratcheting tiers from 1% to 5%
+    # Each tuple: (activation_pct, floor_pct, activation_value, floor_value)
     sltp_tiers: List[Tuple[float, float, float, float]] = field(default_factory=list)
     sltp_active_tier_idx: int = -1        # Index of highest activated tier (-1 = none)
-    sltp_floor_debit: float = 0.0         # Current active floor debit (from highest tier)
+    sltp_floor_debit: float = 0.0         # Current active floor value (from highest tier)
 
     def __post_init__(self):
-        # Round-trip transaction cost: 4 legs open + 4 legs close = 8 legs
         fee = (settings.BOT_COST_PER_LEG * 8) / 100  # per-share fee
         fee_dollars = settings.BOT_COST_PER_LEG * 8   # $5.20
 
+        if self.is_long:
+            self._init_long_ic_thresholds(fee, fee_dollars)
+        else:
+            self._init_short_ic_thresholds(fee, fee_dollars)
+
+    def _init_short_ic_thresholds(self, fee: float, fee_dollars: float):
+        """Short IC: sold for credit, buy back at debit. Debit falling = profit."""
         # TP: max debit to keep X% of credit after fees
         self.tp_25_debit = round(self.fill_credit * 0.75 - fee, 2)
         self.tp_50_debit = round(self.fill_credit * 0.50 - fee, 2)
@@ -126,20 +133,69 @@ class TrackedIronCondor:
                 self.fill_credit + (self.sl_exit_debit - self.fill_credit) / 2, 2
             )
 
-        # Credit-based SLTP: activates at 30% profit, locks 25%, trails every 5%
+        # Tiered SLTP: debit falling triggers higher tiers
         if self.fill_credit > 0 and self.quantity > 0:
             self.sltp_tiers = []
-            act_pct = settings.BOT_SLTP_ACTIVATE_PCT  # 0.30
-            step = settings.BOT_SLTP_STEP_PCT          # 0.05
-            offset = settings.BOT_SLTP_LOCK_OFFSET_PCT  # 0.05
-            while act_pct <= 1.0 + 1e-9:
-                floor_pct = act_pct - offset
-                act_debit = round(self.fill_credit * (1.0 - act_pct), 2)
-                flr_debit = round(self.fill_credit * (1.0 - floor_pct), 2)
-                self.sltp_tiers.append((act_pct, floor_pct, act_debit, flr_debit))
-                act_pct = round(act_pct + step, 4)
+            portfolio = self.portfolio_value
+            pct = settings.BOT_SLTP_START_PCT
+            while pct <= settings.BOT_SLTP_MAX_PCT + 1e-9:
+                floor_pct = pct - settings.BOT_SLTP_GAP_PCT
+                act_debit = round(
+                    self.fill_credit - (portfolio * pct / self.quantity + fee_dollars) / 100, 2
+                )
+                flr_debit = round(
+                    self.fill_credit - (portfolio * floor_pct / self.quantity + fee_dollars) / 100, 2
+                )
+                self.sltp_tiers.append((pct, floor_pct, act_debit, flr_debit))
+                pct = round(pct + settings.BOT_SLTP_STEP_PCT, 4)
             self.sltp_active_tier_idx = -1
             self.sltp_floor_debit = 0.0
+
+    def _init_long_ic_thresholds(self, fee: float, fee_dollars: float):
+        """Long IC: bought for debit, sell back for credit. Credit rising = profit.
+
+        For long ICs:
+        - fill_debit = abs(fill_credit)  (entry cost)
+        - current value = credit obtainable by closing (from long_ic_builder)
+        - TP: credit_to_close >= debit * (1 + tp_pct)
+        - SL: credit_to_close <= debit * (1 - sl_pct)
+        """
+        fill_debit = abs(self.fill_credit)  # e.g. 4.50
+
+        if fill_debit <= 0 or self.quantity <= 0:
+            return
+
+        tp_pct = settings.BOT_LONG_IC_TP_PCT   # 0.50 = +50% of debit
+        sl_pct = settings.BOT_LONG_IC_SL_PCT   # 0.40 = lose 40% of debit
+
+        # TP: close when credit-to-close reaches debit * (1 + tp_pct)
+        # tp_50 = aggressive TP (higher target), tp_25 = conservative TP
+        self.tp_50_debit = round(fill_debit * (1.0 + tp_pct) - fee, 2)
+        self.tp_25_debit = round(fill_debit * (1.0 + tp_pct * 0.5) - fee, 2)
+
+        # SL: close when credit-to-close drops to debit * (1 - sl_pct)
+        self.sl_exit_debit = round(fill_debit * (1.0 - sl_pct) + fee, 2)
+        self.sl_warning_debit = round(
+            fill_debit * (1.0 - sl_pct * 0.5) + fee, 2
+        )
+
+        # SLTP tiers for long ICs: credit rising triggers higher tiers
+        # Activation: credit >= debit + portfolio_gain; floor: credit >= debit + floor_gain
+        self.sltp_tiers = []
+        portfolio = self.portfolio_value
+        pct = settings.BOT_SLTP_START_PCT
+        while pct <= settings.BOT_SLTP_MAX_PCT + 1e-9:
+            floor_pct = pct - settings.BOT_SLTP_GAP_PCT
+            act_credit = round(
+                fill_debit + (portfolio * pct / self.quantity + fee_dollars) / 100, 2
+            )
+            flr_credit = round(
+                fill_debit + (portfolio * floor_pct / self.quantity + fee_dollars) / 100, 2
+            )
+            self.sltp_tiers.append((pct, floor_pct, act_credit, flr_credit))
+            pct = round(pct + settings.BOT_SLTP_STEP_PCT, 4)
+        self.sltp_active_tier_idx = -1
+        self.sltp_floor_debit = 0.0
 
 
 @dataclass
@@ -203,7 +259,7 @@ class ZeroDTEBot:
         settings.PAPER_TRADING = dry_run
 
         self.builder = IronCondorOrderBuilder()
-        # (long IC builder removed — see zero_dte_all_strategies.py)
+        self._long_ic_builder = None  # lazy-loaded
 
         # State
         self.already_traded_today = False
@@ -220,17 +276,9 @@ class ZeroDTEBot:
         self._v4_daily_data_cache = None   # cache daily data for v4 features
         self._chosen_delta = None          # multi-delta: chosen delta for entry
 
-        # Unified strategy decision state
-        self._trade_decision = None        # latest TradeDecision from unified engine
-        self._decision_engine = TradeDecisionEngine(
-            min_ev=settings.BOT_MIN_EV_THRESHOLD
-            if hasattr(settings, 'BOT_MIN_EV_THRESHOLD') else 0.10,
-            min_short_v3=0.45,
-            long_entry_start=settings.BOT_LONG_IC_ENTRY_START
-            if hasattr(settings, 'BOT_LONG_IC_ENTRY_START') else "11:00",
-            long_entry_end=settings.BOT_LONG_IC_ENTRY_END
-            if hasattr(settings, 'BOT_LONG_IC_ENTRY_END') else "12:30",
-        )
+        # v7 long IC state
+        self._trade_decision = None        # TradeDecision from decision engine
+        self._long_ic_active = False       # whether a long IC is currently open
 
         # Lazy-loaded components
         self._schwab_client = None
@@ -259,7 +307,12 @@ class ZeroDTEBot:
             self._predictor = MLPredictor()
         return self._predictor
 
-    # (long_ic_builder property removed — see zero_dte_all_strategies.py)
+    @property
+    def long_ic_builder(self):
+        if self._long_ic_builder is None:
+            from execution.order_manager.long_ic_order_builder import LongIronCondorOrderBuilder
+            self._long_ic_builder = LongIronCondorOrderBuilder()
+        return self._long_ic_builder
 
     @property
     def candle_loader(self):
@@ -371,9 +424,9 @@ class ZeroDTEBot:
             if quantity <= 0:
                 return None
 
-            # Compute TP/SL debits: ceiling TP at daily gain limit (SLTP tiers are primary exit)
+            # Compute TP/SL debits: 5% ceiling TP (SLTP tiers are primary exit)
             fee_dollars = settings.BOT_COST_PER_LEG * 8
-            max_gain = self.portfolio_value * settings.BOT_DAILY_GAIN_LIMIT_PCT
+            max_gain = self.portfolio_value * settings.BOT_SLTP_MAX_PCT
             tp_debit = credit - (max_gain / quantity + fee_dollars) / 100
             tp_debit = round(math.ceil(tp_debit * 20) / 20, 2)
             tp_debit = max(tp_debit, 0.05)
@@ -523,27 +576,28 @@ class ZeroDTEBot:
                 # ML scan -> entry -> build IC
                 entry_ic = await self._entry_phase()
 
-                if not entry_ic:
-                    # Check if unified engine recommended LONG_ONLY
-                    if (self._trade_decision
-                            and self._trade_decision.action == TradeAction.LONG_ONLY):
-                        logger.info(f"=== LONG IC RECOMMENDED at "
-                                    f"{int(self._trade_decision.long_delta*100)}δ "
-                                    f"(EV=${self._trade_decision.long_ev:+.2f}) ===")
-                        logger.info(f"  Entry window: "
-                                    f"{self._trade_decision.long_recommended_entry_start}"
-                                    f"-{self._trade_decision.long_recommended_entry_end} ET")
-                        logger.info(f"  Long IC execution is not yet automated.")
-                        logger.info(f"  Reasons:")
-                        for r in self._trade_decision.reasons:
-                            logger.info(f"    → {r}")
-                        play_sound(TP_SOUND)
-                        send_notification(
-                            "0DTE Bot — LONG IC Signal",
-                            f"Long IC @ {int(self._trade_decision.long_delta*100)}δ "
-                            f"EV=${self._trade_decision.long_ev:+.2f}"
-                        )
+                # Check if trade decision says LONG_ONLY — attempt long IC entry
+                if entry_ic is None and self._trade_decision:
+                    action = self._trade_decision.action.value
+                    if action == "long_only":
+                        logger.info("=== LONG IC ENTRY (v7 decision: long_only) ===")
+                        long_ic = await self._long_ic_entry_phase()
+                        if long_ic:
+                            trade_num += 1
+                            tracked_ics = [long_ic]
+                            # Skip to monitoring
+                            await self._monitoring_loop(tracked_ics)
+                            for ic in tracked_ics:
+                                self._log_trade_result_for_ic(ic, trade_num)
+                            logger.info(f"Long IC trade #{trade_num} complete.")
+                            if self.skip_wait:
+                                break
+                            self._reset_for_new_trade()
+                            await self._refresh_portfolio_value()
+                            await asyncio.sleep(5)
+                            continue
 
+                if not entry_ic:
                     # Don't quit for the day — keep looping to detect positions
                     # that may appear (manual entries, delayed fills, etc.)
                     # and to re-scan if still within the entry window.
@@ -602,8 +656,8 @@ class ZeroDTEBot:
                 first = ic.sltp_tiers[0]
                 last = ic.sltp_tiers[-1]
                 step = settings.BOT_SLTP_STEP_PCT
-                offset = settings.BOT_SLTP_LOCK_OFFSET_PCT
-                logger.info(f"    SLTP: {len(ic.sltp_tiers)} tiers, {step:.2%} steps, {offset:.1%} trailing offset")
+                gap = settings.BOT_SLTP_GAP_PCT
+                logger.info(f"    SLTP: {len(ic.sltp_tiers)} tiers, {step:.2%} steps, {gap:.1%} trailing gap")
                 logger.info(f"      First: {first[0]:.2%} activate @ ${first[2]:.2f}, floor @ ${first[3]:.2f}")
                 logger.info(f"      Last:  {last[0]:.2%} activate @ ${last[2]:.2f}, floor @ ${last[3]:.2f}")
 
@@ -725,8 +779,6 @@ class ZeroDTEBot:
         self._v3_cached_confidence = None
         self._v4_daily_data_cache = None
         self._chosen_delta = None
-        self._trade_decision = None
-        self._v8_cross_cache = None  # Reset cross-asset data for new day
 
     def _reset_for_new_trade(self):
         """Reset entry state between trades within the same day.
@@ -889,25 +941,6 @@ class ZeroDTEBot:
             elif not self.predictor.v6_ready:
                 logger.info("  ML v6 ensemble: not loaded — using fixed-time entry")
 
-            # v8 ensemble (highest priority)
-            if self.predictor.v8_ensemble_ready and settings.BOT_V8_ENABLED:
-                n_models = len(self.predictor._v8_ens_models)
-                n_windows = len(set(k[2] for k in self.predictor._v8_ens_models))
-                n_feat = len(self.predictor._v8_ens_feature_names) if self.predictor._v8_ens_feature_names else 0
-                weights = self.predictor._v8_ens_weights
-                logger.info(f"  ML v8 ensemble: loaded ({n_models} models, {n_windows} windows, {n_feat} features)")
-                logger.info(f"    Windows: {list(weights.keys())}")
-                logger.info(f"    Weights: {', '.join(f'{w}={v:.2f}' for w, v in weights.items())}")
-            elif self.predictor.v8_ready and settings.BOT_V8_ENABLED:
-                n_short = len(self.predictor._v8_short_models)
-                n_long = len(self.predictor._v8_long_models)
-                n_feat = len(self.predictor._v8_feature_names) if self.predictor._v8_feature_names else 0
-                logger.info(f"  ML v8 single: loaded ({n_short} short + {n_long} long models, {n_feat} features)")
-                logger.info(f"    Short deltas: {self.predictor.available_v8_short_deltas}")
-                logger.info(f"    Long deltas: {self.predictor.available_v8_long_deltas}")
-            elif settings.BOT_V8_ENABLED and not self.predictor.v8_ready:
-                logger.info("  ML v8: not loaded — falling back to v5/v7")
-
             # Informational: v3/v5/v4 status (no longer gate entry)
             if self.predictor.is_ready():
                 logger.info(f"  ML v3 model: loaded ({self.predictor.num_features} features) - informational only")
@@ -928,27 +961,33 @@ class ZeroDTEBot:
     async def _entry_phase(self) -> Optional[TrackedIronCondor]:
         """Run ML scan entry, wait for fill, return TrackedIronCondor or None.
 
-        Uses unified EV-based decision engine when available:
-        1. Score all 6 strategies (short/long × 3 deltas)
-        2. Pick the best trade(s) by expected value
-        3. Execute the recommended short IC (long IC handled in _run_trading_day)
-
-        Falls back to v6 ensemble or fixed-time entry if unified engine unavailable.
+        Now integrates v7 trade decision engine:
+        - If v7 says LONG_ONLY: skip short IC, enter long IC
+        - If v7 says BOTH: enter short IC, then also enter long IC
+        - If v7 says SHORT_ONLY: proceed with existing short IC logic
+        - If v7 says NEITHER: skip all trades
         """
-        # Try unified strategy selection first
-        use_unified = (
-            settings.BOT_UNIFIED_STRATEGY
-            and not self.skip_ml
-            and (self.predictor.v8_ensemble_ready or self.predictor.v8_ready or self.predictor.v5_ready or self.predictor.v7_ready)
-        )
+        # ── v7 Trade Decision (if available) ──
+        trade_decision = await self._get_trade_decision()
+        self._trade_decision = trade_decision
 
-        if use_unified:
-            logger.info("Unified strategy selection enabled — scanning all strategies")
-            if not self.skip_wait:
-                await self._wait_until(settings.BOT_V4_ENTRY_START)
-            return await self._unified_entry_scan()
+        if trade_decision:
+            logger.info(f"  Trade Decision: {trade_decision.action.value} "
+                        f"(confidence={trade_decision.confidence:.2f})")
+            for reason in trade_decision.reasons:
+                logger.info(f"    → {reason}")
 
-        # Fallback: v6 ensemble
+            if trade_decision.action.value == "neither":
+                logger.info("  Decision engine says NEITHER — skipping all trades today.")
+                return None
+
+            if trade_decision.action.value == "long_only":
+                logger.info("  Decision engine says LONG_ONLY — skipping short IC.")
+                # Long IC entry will be handled by _run_trading_day after this returns
+                return None
+
+        # ── Short IC entry (existing logic) ──
+        # Determine entry method: v6 ensemble or fixed-time fallback
         use_v6 = (
             settings.BOT_V6_ENABLED
             and not self.skip_ml
@@ -963,10 +1002,12 @@ class ZeroDTEBot:
             if not self.skip_wait:
                 await self._wait_until(settings.BOT_V4_ENTRY_START)
             entered = await self._entry_scan(use_v6=True)
+            # _entry_scan handles attempt_entry + wait_for_fill internally
             entry_filled = entered
         else:
+            # Fixed-time entry (fallback when v6 not available)
             if not self.skip_ml:
-                logger.info("No ML models available — using fixed-time entry")
+                logger.info("v6 ensemble not available — using fixed-time entry")
             if not self.skip_wait:
                 await self._wait_until(settings.BOT_ENTRY_TIME)
             entered = await self.attempt_entry()
@@ -987,191 +1028,178 @@ class ZeroDTEBot:
             portfolio_value=self.portfolio_value,
         )
 
-    async def _unified_entry_scan(self) -> Optional[TrackedIronCondor]:
-        """
-        Unified EV-based entry scan — scores all 6 strategies every scan interval.
+    async def _get_trade_decision(self):
+        """Run v3 + v7 trade decision engine. Returns TradeDecision or None."""
+        if not settings.BOT_V7_ENABLED or self.skip_ml:
+            return None
 
-        For each scan slot:
-        1. Fetch chain + 5-min candles
-        2. Score v3, v5 (per-delta), v7 (per-delta)
-        3. Run TradeDecisionEngine.decide() → picks best strategy by EV
-        4. Display full strategy scorecard
-        5. If SHORT_ONLY or BOTH → attempt short IC entry at recommended delta
-        6. If LONG_ONLY → store decision for _run_trading_day to handle
-        7. If NEITHER → wait for next scan slot
+        if not self.predictor.v7_ready:
+            logger.debug("v7 models not loaded — skipping trade decision engine")
+            return None
 
-        Returns TrackedIronCondor for short entry, or None.
-        Sets self._trade_decision so _run_trading_day can check for long IC.
-        """
-        import pandas as pd
+        try:
+            from ml.models.trade_decision import TradeDecisionEngine
 
-        scan_start = self._parse_time(settings.BOT_V4_ENTRY_START)
-        scan_end = self._parse_time(settings.BOT_V4_ENTRY_END)
-        interval = settings.BOT_V4_SCAN_INTERVAL
+            # Get v3 confidence (may already be cached)
+            v3_conf = self._v3_cached_confidence
+            if v3_conf is None:
+                chain = await self._fetch_0dte_chain()
+                if chain:
+                    v3_conf = await self._run_ml_prediction(chain)
+                    self._v3_cached_confidence = v3_conf
 
-        use_v8_ens = settings.BOT_V8_ENABLED and self.predictor.v8_ensemble_ready
-        use_v8 = settings.BOT_V8_ENABLED and self.predictor.v8_ready and not use_v8_ens
-
-        logger.info(f"--- Unified Strategy Scan ---")
-        logger.info(f"  Window: {settings.BOT_V4_ENTRY_START} - {settings.BOT_V4_ENTRY_END} ET")
-        logger.info(f"  Interval: {interval} min | Min EV: ${settings.BOT_MIN_EV_THRESHOLD:.2f}")
-        if use_v8_ens:
-            n_windows = len(set(k[2] for k in self.predictor._v8_ens_models))
-            logger.info(f"  Models: v8 ensemble ({n_windows} windows, "
-                         f"{len(self.predictor._v8_ens_models)} models)")
-        elif use_v8:
-            logger.info(f"  Models: v8 single "
-                         f"(short={len(self.predictor._v8_short_models)} long={len(self.predictor._v8_long_models)})")
-        else:
-            logger.info(f"  Models: v5={'YES' if self.predictor.v5_ready else 'no'} "
-                         f"v7={'YES' if self.predictor.v7_ready else 'no'}")
-
-        start_minutes = scan_start.hour * 60 + scan_start.minute
-        end_minutes = scan_end.hour * 60 + scan_end.minute
-        total_slots = (end_minutes - start_minutes) // interval
-        scan_count = 0
-
-        while True:
-            now = self._now_et()
-            if now.time() >= scan_end and not self.skip_wait:
-                logger.info(f"  Scan window closed at {settings.BOT_V4_ENTRY_END} ET. No entry today.")
+            if v3_conf is None:
                 return None
 
-            scan_count += 1
-            slot_time = now.strftime('%H:%M')
-            progress = f"[{scan_count}/{total_slots}]" if total_slots > 0 else f"[{scan_count}]"
-
-            # Fetch chain
-            chain = await self._fetch_0dte_chain()
-            if not chain:
-                logger.warning(f"  {progress} {slot_time} — chain unavailable, skipping slot")
-                if self.skip_wait:
-                    return None
-                await asyncio.sleep(interval * 60)
-                continue
-
-            # Run v3 pre-screen (cached for the day)
-            if self._v3_cached_confidence is None and not self.skip_ml and self.predictor.is_ready():
-                v3_conf = await self._run_ml_prediction(chain)
-                self._v3_cached_confidence = v3_conf
-
-            v3_conf = self._v3_cached_confidence or 0.5
-
-            # Fetch 5-min candles
+            # Get v7 scores for all loaded deltas
             candles = self._fetch_spx_5min_candles()
             if candles is None or len(candles) < 6:
-                logger.info(f"  {progress} {slot_time} — insufficient candles, waiting...")
-                if self.skip_wait:
-                    return None
-                await asyncio.sleep(interval * 60)
-                continue
-
-            atm_iv = self._extract_atm_iv(chain)
-
-            # Score all strategies
-            try:
-                # Use v8 ensemble > v8 single > v5/v7 fallback
-                if use_v8_ens or use_v8:
-                    v8_features = self._compute_v8_features(chain)
-                    if v8_features and use_v8_ens:
-                        all_scores = self.predictor.predict_v8_ensemble_all_strategies(
-                            v8_features, v3_confidence=v3_conf,
-                        )
-                        n_windows = len(set(k[2] for k in self.predictor._v8_ens_models))
-                        logger.info(f"    [v8 ensemble] {len(v8_features)} features, "
-                                    f"{n_windows} windows")
-                    elif v8_features and use_v8:
-                        all_scores = self.predictor.predict_v8_all_strategies(
-                            v8_features, v3_confidence=v3_conf,
-                        )
-                        logger.info(f"    [v8 single] {len(v8_features)} features → "
-                                    f"short deltas={self.predictor.available_v8_short_deltas} "
-                                    f"long deltas={self.predictor.available_v8_long_deltas}")
-                    else:
-                        logger.info("    v8 features unavailable, falling back to v5/v7")
-                        all_scores = self.predictor.predict_all_strategies(
-                            candles_5min=candles,
-                            daily_data=self._v4_daily_data_cache,
-                            option_atm_iv=atm_iv,
-                            v3_confidence=v3_conf,
-                        )
-                else:
-                    all_scores = self.predictor.predict_all_strategies(
-                        candles_5min=candles,
-                        daily_data=self._v4_daily_data_cache,
-                        option_atm_iv=atm_iv,
-                        v3_confidence=v3_conf,
-                    )
-
-                # Cache daily data
-                if self._v4_daily_data_cache is None and self.predictor._daily_cache:
-                    self._v4_daily_data_cache = self.predictor._daily_cache
-
-                # Run decision engine
-                decision = self._decision_engine.decide(
-                    v3_confidence=all_scores["v3_confidence"],
-                    v5_scores=all_scores.get("v5_scores"),
-                    v7_scores=all_scores.get("v7_scores"),
-                )
-                self._trade_decision = decision
-
-                # Display scorecard
-                logger.info(f"  {progress} {slot_time} | Decision: {decision.action.value}")
-                scorecard = self._decision_engine.scorer.display_scorecard(
-                    decision.all_candidates,
-                    self._decision_engine.min_ev,
-                )
-                for line in scorecard.split("\n"):
-                    logger.info(f"    {line}")
-                logger.info(f"  {decision.summary()}")
-                for r in decision.reasons:
-                    logger.info(f"    → {r}")
-
-                # Act on decision
-                if decision.has_short:
-                    short_delta = decision.short_delta or settings.BOT_SHORT_DELTA
-                    self._chosen_delta = short_delta
-                    logger.info(f"    >>> SHORT IC ENTRY at {int(short_delta*100)}δ "
-                                f"(EV=${decision.short_ev:+.2f})")
-                    entered = await self.attempt_entry(chain=chain, target_delta=short_delta)
-                    if entered:
-                        filled = await self.wait_for_entry_fill()
-                        if filled:
-                            return TrackedIronCondor(
-                                ic_id=0, label="IC-1", strikes=self.strikes,
-                                quantity=self.quantity, fill_credit=self.fill_credit,
-                                portfolio_value=self.portfolio_value,
-                            )
-                        logger.warning("    Entry did not fill. Cancelling and re-scanning.")
-                        await self._cancel_order_safe(self.entry_order_id)
-                        self._reset_entry_state()
-
-                elif decision.action == TradeAction.LONG_ONLY:
-                    logger.info(f"    >>> LONG IC recommended at {int(decision.long_delta*100)}δ "
-                                f"(EV=${decision.long_ev:+.2f})")
-                    logger.info(f"    Short IC blocked — returning None for _run_trading_day to handle long IC")
-                    return None
-
-                elif decision.action == TradeAction.NEITHER:
-                    logger.info(f"    Standing aside — no positive EV strategies")
-
-            except Exception as e:
-                logger.warning(f"  {progress} {slot_time} — strategy scoring error: {e}")
-
-            if self.skip_wait:
+                logger.warning("Insufficient candle data for v7 scoring")
                 return None
-            await asyncio.sleep(interval * 60)
+
+            chain = await self._fetch_0dte_chain()
+            atm_iv = self._extract_atm_iv(chain) if chain else 15.0
+
+            v7_scores = self.predictor.predict_v7_all_deltas(
+                candles_5min=candles,
+                daily_data=self._v4_daily_data_cache,
+                option_atm_iv=atm_iv,
+                v3_confidence=v3_conf,
+            )
+
+            if not v7_scores:
+                return None
+
+            # Log v7 scores
+            score_str = " | ".join(
+                f"d{int(d*100)}={s:.3f}" for d, s in sorted(v7_scores.items())
+            )
+            logger.info(f"  v7 long IC scores: {score_str}")
+
+            # Run decision engine
+            engine = TradeDecisionEngine()
+            decision = engine.decide(
+                v3_confidence=v3_conf,
+                v7_scores=v7_scores,
+            )
+
+            return decision
+
+        except Exception as e:
+            logger.warning(f"Trade decision engine error: {e}")
+            return None
+
+    async def _long_ic_entry_phase(self) -> Optional[TrackedIronCondor]:
+        """
+        Enter a LONG iron condor based on v7 trade decision.
+
+        Returns a TrackedIronCondor configured for long IC monitoring, or None.
+        """
+        if not self._trade_decision:
+            return None
+
+        delta = self._trade_decision.long_delta or settings.BOT_V7_PREFERRED_DELTA
+        logger.info(f"  Long IC: delta={delta}, entry window "
+                    f"{settings.BOT_LONG_IC_ENTRY_START}-{settings.BOT_LONG_IC_ENTRY_END}")
+
+        # Wait for long IC entry window
+        if not self.skip_wait:
+            await self._wait_until(settings.BOT_LONG_IC_ENTRY_START)
+
+        # Fetch chain
+        chain = await self._fetch_0dte_chain()
+        if not chain:
+            logger.error("Failed to fetch chain for long IC entry")
+            return None
+
+        # Select strikes using long IC builder
+        strikes = self.long_ic_builder.select_strikes(
+            chain, target_delta=delta, wing_width=settings.BOT_WING_WIDTH
+        )
+        if not strikes:
+            logger.error("Long IC strike selection failed")
+            return None
+
+        net_debit = strikes['net_debit']
+        logger.info(f"  Long IC debit: ${net_debit:.2f}")
+
+        # Position sizing: max risk = BOT_LONG_IC_MAX_RISK_PCT of portfolio
+        quantity = self.long_ic_builder.calculate_position_size(
+            debit=net_debit,
+            portfolio_value=self.portfolio_value,
+            max_risk_pct=settings.BOT_LONG_IC_MAX_RISK_PCT,
+            max_contracts=settings.BOT_MAX_CONTRACTS,
+        )
+        if quantity <= 0:
+            logger.error("Long IC position size = 0")
+            return None
+
+        logger.info(f"  Long IC quantity: {quantity} contracts "
+                    f"(max risk: ${net_debit * quantity * 100:.0f})")
+
+        if self.dry_run:
+            logger.info("  [PAPER] Long IC order would be placed here")
+            # Simulate fill
+            fill_debit = net_debit
+        else:
+            # Build and place order
+            order = self.long_ic_builder.build_entry_order(strikes, quantity)
+            try:
+                order_id = await self.schwab_client.place_order(order)
+                logger.info(f"  Long IC order placed: {order_id}")
+                # Wait for fill (reuse existing fill logic)
+                self.entry_order_id = order_id
+                self.quantity = quantity
+                filled = await self.wait_for_entry_fill()
+                if not filled:
+                    logger.warning("Long IC entry did not fill. Cancelling.")
+                    await self._cancel_order_safe(order_id)
+                    return None
+                fill_debit = net_debit  # Approximate; real fill from order status
+            except Exception as e:
+                logger.error(f"Long IC order placement failed: {e}")
+                return None
+
+        # Create a TrackedIronCondor for the long IC
+        tracked = TrackedIronCondor(
+            ic_id=100,  # Use higher ID to distinguish from short ICs
+            label="LONG-IC-1",
+            strikes=strikes,
+            quantity=quantity,
+            fill_credit=-fill_debit,  # Negative credit = debit position
+            portfolio_value=self.portfolio_value,
+            is_long=True,
+        )
+
+        logger.info(f"  Long IC entered: "
+                    f"{strikes.get('bought_put', {}).get('strike', '?')}/"
+                    f"{strikes.get('sold_put', {}).get('strike', '?')}p - "
+                    f"{strikes.get('bought_call', {}).get('strike', '?')}/"
+                    f"{strikes.get('sold_call', {}).get('strike', '?')}c "
+                    f"x{quantity} Debit: ${fill_debit:.2f}")
+        logger.info(f"  Long IC thresholds: "
+                    f"TP25 >= ${tracked.tp_25_debit:.2f}  "
+                    f"TP50 >= ${tracked.tp_50_debit:.2f}  |  "
+                    f"SL <= ${tracked.sl_exit_debit:.2f}  "
+                    f"SLwarn <= ${tracked.sl_warning_debit:.2f}")
+
+        return tracked
 
     async def _place_ceiling_tp(self, ic: TrackedIronCondor):
-        """Place fixed 25% TP limit order for an IC."""
-        tp_debit = ic.tp_25_debit
+        """Place 5% portfolio ceiling TP for an IC (short ICs only)."""
+        if ic.is_long:
+            logger.debug(f"  {ic.label}: skipping ceiling TP (long IC)")
+            return
+        fee_dollars = settings.BOT_COST_PER_LEG * 8
+        max_gain = ic.portfolio_value * settings.BOT_SLTP_MAX_PCT
+        tp_debit = ic.fill_credit - (max_gain / ic.quantity + fee_dollars) / 100
         tp_debit = round(math.ceil(tp_debit * 20) / 20, 2)
         tp_debit = max(tp_debit, 0.05)
         ic.target_tp_debit = tp_debit
 
         logger.info(
-            f"  {ic.label}: 25% TP ${tp_debit:.2f} x{ic.quantity} "
-            f"(SLTP activates at 30% profit)"
+            f"  {ic.label}: 5% ceiling TP ${tp_debit:.2f} x{ic.quantity} "
+            f"(SLTP tiers are primary exit)"
         )
         await self._place_tp_limit_order(ic, tp_debit)
 
@@ -1360,7 +1388,10 @@ class ZeroDTEBot:
                             logger.info(f"  === {ic.label}: TP limit order FILLED ===")
                             continue
 
-                    await self._monitor_short_ic(ic, chain, now, ic_unrealized)
+                    if ic.is_long:
+                        await self._monitor_long_ic(ic, chain, now, ic_unrealized)
+                    else:
+                        await self._monitor_short_ic(ic, chain, now, ic_unrealized)
 
                 # --- Cumulative multi-IC summary and combined SL check ---
                 still_open = [ic for ic in open_ics if not ic.is_closed]
@@ -1446,15 +1477,19 @@ class ZeroDTEBot:
                         f"  SLTP ratchet: {ic.label} floor -> {flr_pct:.2%} "
                         f"(debit ${debit:.2f} <= ${act_debit:.2f})"
                     )
-                    if idx > prev_tier_idx:
+                    prev_act_pct = ic.sltp_tiers[prev_tier_idx][0] if prev_tier_idx >= 0 else 0
+                    crossed_milestone = (
+                        int(act_pct * 200) > int(prev_act_pct * 200)
+                    )
+                    if crossed_milestone or prev_tier_idx < 0:
                         logger.info(
-                            f"  >>> {ic.label}: SLTP {act_pct:.0%} profit ACTIVATED "
-                            f"(lock {flr_pct:.0%} @ ${flr_debit:.2f})"
+                            f"  >>> {ic.label}: SLTP {act_pct:.1%} ACTIVATED "
+                            f"(floor ${flr_debit:.2f} = {flr_pct:.1%})"
                         )
                         play_sound(TP_SOUND)
                         send_notification(
-                            f"Lock {flr_pct:.0%} Profit - {ic.label}",
-                            f"Floor ${flr_debit:.2f}"
+                            f"Profit Lock {act_pct:.1%} - {ic.label}",
+                            f"Floor ${flr_debit:.2f} ({flr_pct:.1%})"
                         )
                     break
 
@@ -1462,11 +1497,11 @@ class ZeroDTEBot:
             if ic.sltp_active_tier_idx >= 0 and debit >= ic.sltp_floor_debit:
                 flr_pct = ic.sltp_tiers[ic.sltp_active_tier_idx][1]
                 logger.warning(
-                    f"  === {ic.label}: SLTP TRIGGERED — locking {flr_pct:.0%} profit "
+                    f"  === {ic.label}: SLTP TRIGGERED at {flr_pct:.1%} floor "
                     f"(debit ${debit:.2f} >= floor ${ic.sltp_floor_debit:.2f}) ==="
                 )
                 play_sound(SL_SOUND)
-                await self._close_ic(ic, f"sltp_lock_{flr_pct:.0%}")
+                await self._close_ic(ic, f"sltp_lock_{flr_pct:.1%}")
                 return
 
         # TP checks (debit falling = good)
@@ -1489,6 +1524,106 @@ class ZeroDTEBot:
         elif debit >= ic.sl_warning_debit and AlertLevel.SL_WARNING not in ic.alerts_fired:
             ic.alerts_fired.add(AlertLevel.SL_WARNING)
             alert_sl(ic, AlertLevel.SL_WARNING, debit)
+
+    async def _monitor_long_ic(self, ic: TrackedIronCondor, chain: dict,
+                               now, ic_unrealized: dict):
+        """Monitor a LONG iron condor. Credit-to-close rising = profit.
+
+        Long IC economics:
+        - Entry: paid fill_debit = abs(ic.fill_credit)
+        - Current value: credit obtainable by closing (selling inner legs, buying outer)
+        - Profit: credit_to_close > fill_debit
+        - Loss: credit_to_close < fill_debit (position lost value)
+        """
+        # Use long IC builder for correct valuation
+        credit_to_close = self.long_ic_builder.get_current_position_value(chain, ic.strikes)
+        if credit_to_close is None:
+            logger.debug(f"  {ic.label}: could not get position value")
+            return
+
+        fill_debit = abs(ic.fill_credit)  # original cost
+
+        # Unrealized P&L: profit = (credit_to_close - fill_debit) × qty × 100 - fees
+        fee_per_contract = settings.BOT_COST_PER_LEG * 8
+        unrealized_dollars = (credit_to_close - fill_debit) * ic.quantity * 100 - fee_per_contract * ic.quantity
+        ic_unrealized[ic.ic_id] = unrealized_dollars
+
+        pnl_pct = round((credit_to_close / fill_debit - 1) * 100) if fill_debit > 0 else 0
+        if ic.sltp_active_tier_idx >= 0:
+            act_pct = ic.sltp_tiers[ic.sltp_active_tier_idx][0]
+            flr_pct = ic.sltp_tiers[ic.sltp_active_tier_idx][1]
+            sltp_tag = f" [SLTP {act_pct:.1%}->{flr_pct:.1%} floor@${ic.sltp_floor_debit:.2f}]"
+        else:
+            sltp_tag = ""
+        sign = "+" if unrealized_dollars >= 0 else ""
+        logger.info(
+            f"  [{now.strftime('%H:%M:%S')}] {ic.label}: "
+            f"value ${credit_to_close:.2f}  P/L {pnl_pct:+d}%  |  "
+            f"unrealized {sign}${unrealized_dollars:,.0f} "
+            f"({ic.quantity}x ${credit_to_close:.2f} vs ${fill_debit:.2f} cost)"
+            f"{sltp_tag}"
+        )
+
+        # --- Tiered SLTP: ratcheting profit lock ---
+        # For long ICs: credit RISING = profit → higher credit activates higher tiers
+        if ic.sltp_tiers:
+            prev_tier_idx = ic.sltp_active_tier_idx
+            for idx in range(len(ic.sltp_tiers) - 1, ic.sltp_active_tier_idx, -1):
+                act_pct, flr_pct, act_credit, flr_credit = ic.sltp_tiers[idx]
+                if credit_to_close >= act_credit:  # INVERTED: credit rising = good
+                    ic.sltp_active_tier_idx = idx
+                    ic.sltp_floor_debit = flr_credit  # floor is a credit level
+                    logger.debug(
+                        f"  SLTP ratchet: {ic.label} floor -> {flr_pct:.2%} "
+                        f"(credit ${credit_to_close:.2f} >= ${act_credit:.2f})"
+                    )
+                    prev_act_pct = ic.sltp_tiers[prev_tier_idx][0] if prev_tier_idx >= 0 else 0
+                    crossed_milestone = (
+                        int(act_pct * 200) > int(prev_act_pct * 200)
+                    )
+                    if crossed_milestone or prev_tier_idx < 0:
+                        logger.info(
+                            f"  >>> {ic.label}: SLTP {act_pct:.1%} ACTIVATED "
+                            f"(floor ${flr_credit:.2f} = {flr_pct:.1%})"
+                        )
+                        play_sound(TP_SOUND)
+                        send_notification(
+                            f"Profit Lock {act_pct:.1%} - {ic.label}",
+                            f"Floor ${flr_credit:.2f} ({flr_pct:.1%})"
+                        )
+                    break
+
+            # Floor breached: credit dropped below lock-in (INVERTED from short)
+            if ic.sltp_active_tier_idx >= 0 and credit_to_close <= ic.sltp_floor_debit:
+                flr_pct = ic.sltp_tiers[ic.sltp_active_tier_idx][1]
+                logger.warning(
+                    f"  === {ic.label}: SLTP TRIGGERED at {flr_pct:.1%} floor "
+                    f"(credit ${credit_to_close:.2f} <= floor ${ic.sltp_floor_debit:.2f}) ==="
+                )
+                play_sound(SL_SOUND)
+                await self._close_ic(ic, f"sltp_lock_{flr_pct:.1%}")
+                return
+
+        # TP checks (credit rising = good) — INVERTED from short IC
+        if credit_to_close >= ic.tp_50_debit and AlertLevel.TP_50 not in ic.alerts_fired:
+            ic.alerts_fired.add(AlertLevel.TP_50)
+            ic.alerts_fired.add(AlertLevel.TP_25)
+            alert_tp(ic, AlertLevel.TP_50, credit_to_close)
+
+        elif credit_to_close >= ic.tp_25_debit and AlertLevel.TP_25 not in ic.alerts_fired:
+            ic.alerts_fired.add(AlertLevel.TP_25)
+            alert_tp(ic, AlertLevel.TP_25, credit_to_close)
+
+        # SL checks (credit falling = bad) — INVERTED from short IC
+        if credit_to_close <= ic.sl_exit_debit and AlertLevel.SL_EXIT not in ic.alerts_fired:
+            ic.alerts_fired.add(AlertLevel.SL_EXIT)
+            ic.alerts_fired.add(AlertLevel.SL_WARNING)
+            alert_sl(ic, AlertLevel.SL_EXIT, credit_to_close)
+            await self._close_ic(ic, "stop_loss_portfolio")
+
+        elif credit_to_close <= ic.sl_warning_debit and AlertLevel.SL_WARNING not in ic.alerts_fired:
+            ic.alerts_fired.add(AlertLevel.SL_WARNING)
+            alert_sl(ic, AlertLevel.SL_WARNING, credit_to_close)
 
     # ===== Process Cleanup =====
 
@@ -2327,299 +2462,6 @@ class ZeroDTEBot:
         if ivs:
             return sum(ivs) / len(ivs)
         return 15.0
-
-    # ── v8 feature computation helpers ────────────────────────────────────
-
-    def _fetch_spx_1min_candles(self) -> 'pd.DataFrame | None':
-        """Fetch today's SPX 1-min candles from ThetaData for v8 features."""
-        import pandas as pd
-        from datetime import date
-
-        today = date.today()
-        if today.weekday() >= 5:
-            return None
-
-        try:
-            url = "http://127.0.0.1:25503/v3/index/history/ohlc"
-            params = {
-                "symbol": "SPX",
-                "start_date": today.strftime("%Y%m%d"),
-                "end_date": today.strftime("%Y%m%d"),
-                "interval": "1m",
-                "start_time": "09:30:00",
-                "end_time": self._now_et().strftime("%H:%M:%S"),
-                "format": "json",
-            }
-            query = "&".join(f"{k}={v}" for k, v in params.items())
-            full_url = f"{url}?{query}"
-
-            req = urllib.request.Request(full_url)
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                data = json.loads(resp.read().decode())
-
-            response = data.get("response", data if isinstance(data, list) else [])
-            if response and isinstance(response[0], dict) and "data" in response[0]:
-                bars = []
-                for entry in response:
-                    for dp in entry.get("data", []):
-                        bars.append(dp)
-                response = bars
-
-            if not response:
-                return None
-
-            df = pd.DataFrame(response)
-            col_map = {}
-            for col in df.columns:
-                lower = col.lower()
-                if lower in ('open', 'high', 'low', 'close', 'timestamp', 'datetime', 'time'):
-                    col_map[col] = lower
-            if col_map:
-                df = df.rename(columns=col_map)
-
-            required = ['open', 'high', 'low', 'close']
-            if not all(c in df.columns for c in required):
-                return None
-
-            for col in required:
-                df[col] = pd.to_numeric(df[col], errors='coerce')
-            df = df.dropna(subset=required)
-
-            # Add timestamp column if missing (synthesize from index)
-            if 'timestamp' not in df.columns:
-                import pytz as _pytz
-                eastern = _pytz.timezone('US/Eastern')
-                base = eastern.localize(datetime.combine(today, time(9, 30)))
-                df['timestamp'] = [base + timedelta(minutes=i) for i in range(len(df))]
-
-            # Ensure timestamp is datetime (required for resample in v8 feature store)
-            df['timestamp'] = pd.to_datetime(df['timestamp'])
-
-            logger.debug(f"  Fetched {len(df)} 1-min SPX candles for v8")
-            return df
-
-        except Exception as e:
-            logger.warning(f"  Failed to fetch 1-min SPX candles: {e}")
-            return None
-
-    def _fetch_vix_1min_candles(self) -> 'pd.DataFrame | None':
-        """Fetch today's VIX 1-min candles from ThetaData."""
-        import pandas as pd
-        from datetime import date
-
-        today = date.today()
-        if today.weekday() >= 5:
-            return None
-
-        try:
-            url = "http://127.0.0.1:25503/v3/index/history/ohlc"
-            params = {
-                "symbol": "VIX",
-                "start_date": today.strftime("%Y%m%d"),
-                "end_date": today.strftime("%Y%m%d"),
-                "interval": "1m",
-                "start_time": "09:30:00",
-                "end_time": self._now_et().strftime("%H:%M:%S"),
-                "format": "json",
-            }
-            query = "&".join(f"{k}={v}" for k, v in params.items())
-            full_url = f"{url}?{query}"
-
-            req = urllib.request.Request(full_url)
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                data = json.loads(resp.read().decode())
-
-            response = data.get("response", data if isinstance(data, list) else [])
-            if response and isinstance(response[0], dict) and "data" in response[0]:
-                bars = []
-                for entry in response:
-                    for dp in entry.get("data", []):
-                        bars.append(dp)
-                response = bars
-
-            if not response:
-                return None
-
-            df = pd.DataFrame(response)
-            col_map = {}
-            for col in df.columns:
-                lower = col.lower()
-                if lower in ('open', 'high', 'low', 'close', 'timestamp'):
-                    col_map[col] = lower
-            if col_map:
-                df = df.rename(columns=col_map)
-
-            required = ['open', 'high', 'low', 'close']
-            if not all(c in df.columns for c in required):
-                return None
-
-            for col in required:
-                df[col] = pd.to_numeric(df[col], errors='coerce')
-
-            if 'timestamp' not in df.columns:
-                import pytz as _pytz
-                eastern = _pytz.timezone('US/Eastern')
-                base = eastern.localize(datetime.combine(today, time(9, 30)))
-                df['timestamp'] = [base + timedelta(minutes=i) for i in range(len(df))]
-
-            # Ensure timestamp is datetime (required for resample in v8 feature store)
-            df['timestamp'] = pd.to_datetime(df['timestamp'])
-
-            return df
-
-        except Exception as e:
-            logger.debug(f"  VIX 1-min candles unavailable: {e}")
-            return None
-
-    def _schwab_chain_to_v8(self, chain: dict) -> 'tuple[pd.DataFrame, pd.DataFrame]':
-        """
-        Convert Schwab option chain dict to v8 format DataFrames.
-
-        Returns (chain_df, chain_oi_df) suitable for v8 feature store.
-        """
-        import pandas as pd
-
-        underlying = chain.get('underlyingPrice', 0)
-        rows = []
-        oi_rows = []
-
-        for right_key, right_label in [('putExpDateMap', 'P'), ('callExpDateMap', 'C')]:
-            exp_map = chain.get(right_key, {})
-            if not exp_map:
-                continue
-            # Use first (nearest) expiration only
-            strikes_map = next(iter(exp_map.values()), {})
-            for strike_str, contracts in strikes_map.items():
-                try:
-                    strike = float(strike_str)
-                except (ValueError, TypeError):
-                    continue
-                contract = contracts[0] if isinstance(contracts, list) else contracts
-                if not isinstance(contract, dict):
-                    continue
-
-                rows.append({
-                    'strike': strike,
-                    'right': right_label,
-                    'bid': contract.get('bid', 0),
-                    'ask': contract.get('ask', 0),
-                    'delta': abs(contract.get('delta', 0)),
-                    'gamma': contract.get('gamma', 0),
-                    'theta': contract.get('theta', 0),
-                    'vega': contract.get('vega', 0),
-                    'implied_vol': contract.get('volatility', 0),
-                    'underlying_price': underlying,
-                    'bid_size': contract.get('bidSize', 0),
-                    'ask_size': contract.get('askSize', 0),
-                })
-                oi_rows.append({
-                    'strike': strike,
-                    'right': right_label,
-                    'open_interest': contract.get('openInterest', 0),
-                })
-
-        chain_df = pd.DataFrame(rows) if rows else pd.DataFrame(
-            columns=['strike', 'right', 'bid', 'ask', 'delta', 'gamma',
-                     'theta', 'vega', 'implied_vol', 'underlying_price']
-        )
-        oi_df = pd.DataFrame(oi_rows) if oi_rows else pd.DataFrame(
-            columns=['strike', 'right', 'open_interest']
-        )
-        return chain_df, oi_df
-
-    def _build_cross_asset_data(self) -> dict:
-        """Build cross-asset data dict for v8 features from yfinance."""
-        try:
-            import yfinance as yf
-            from datetime import date as _date
-
-            today = _date.today()
-            start = today - timedelta(days=30)
-
-            vix = yf.download('^VIX', start=str(start), end=str(today + timedelta(days=1)),
-                              progress=False, auto_adjust=True)
-            vix9d = yf.download('^VIX9D', start=str(start), end=str(today + timedelta(days=1)),
-                                progress=False, auto_adjust=True)
-            tlt = yf.download('TLT', start=str(start), end=str(today + timedelta(days=1)),
-                              progress=False, auto_adjust=True)
-
-            cross = {}
-
-            if not vix.empty and len(vix) >= 2:
-                vals = vix['Close'].values.flatten()
-                cross['vix_level'] = float(vals[-1])
-                cross['vix_change_1d'] = float(vals[-1] - vals[-2])
-                cross['vix_change_1d_pct'] = float((vals[-1] / vals[-2] - 1) * 100) if vals[-2] > 0 else 0
-                if len(vals) >= 10:
-                    sma10 = float(vals[-10:].mean())
-                    cross['vix_sma_10d_dist'] = float((vals[-1] - sma10) / sma10 * 100) if sma10 > 0 else 0
-                if len(vals) >= 20:
-                    sma20 = float(vals[-20:].mean())
-                    cross['vix_sma_20d_dist'] = float((vals[-1] - sma20) / sma20 * 100) if sma20 > 0 else 0
-                    pctile = float((vals[-1:] <= vals[-252:]).mean() * 100) if len(vals) >= 252 else 50.0
-                    cross['vix_percentile_1y'] = pctile
-
-            if not vix9d.empty and not vix.empty:
-                v9d = float(vix9d['Close'].values.flatten()[-1])
-                cross['vix9d_vs_vix'] = v9d / cross.get('vix_level', 20) if cross.get('vix_level', 0) > 0 else 1.0
-                cross['vvix_level'] = v9d  # Proxy
-
-            if not tlt.empty and len(tlt) >= 2:
-                tlt_vals = tlt['Close'].values.flatten()
-                cross['yield_10y'] = float(tlt_vals[-1])
-                cross['yield_10y_change'] = float(tlt_vals[-1] - tlt_vals[-2])
-
-            return cross
-        except Exception as e:
-            logger.debug(f"  Cross-asset data unavailable: {e}")
-            return {}
-
-    def _compute_v8_features(self, chain: dict) -> 'dict | None':
-        """
-        Compute full v8 feature vector from live data.
-
-        Gathers SPX 1-min candles, VIX candles, option chain, cross-asset
-        data, and runs the v8 feature store pipeline.
-        """
-        import pandas as pd
-
-        try:
-            # Fetch live data
-            spx_1m = self._fetch_spx_1min_candles()
-            if spx_1m is None or len(spx_1m) < 5:
-                logger.warning("  v8: insufficient 1-min candles")
-                return None
-
-            vix_1m = self._fetch_vix_1min_candles()
-            chain_df, chain_oi = self._schwab_chain_to_v8(chain)
-            spx_price = chain.get('underlyingPrice', 0)
-
-            # Cross-asset data (cached for the day)
-            if not hasattr(self, '_v8_cross_cache') or self._v8_cross_cache is None:
-                self._v8_cross_cache = self._build_cross_asset_data()
-            cross_data = self._v8_cross_cache or {}
-
-            # Build data dict for v8 feature store
-            data = {
-                'spx_1m': spx_1m,
-                'vix_1m': vix_1m if vix_1m is not None else pd.DataFrame(),
-                'chain': chain_df,
-                'chain_oi': chain_oi,
-                'cross_data': cross_data,
-                'spx_price': spx_price,
-                'entry_time': self._now_et(),
-            }
-
-            # Compute features
-            from ml.features.v8.feature_store import compute_all_features
-            features = compute_all_features(data)
-
-            logger.debug(f"  v8 features computed: {len(features)} features")
-            return features
-
-        except Exception as e:
-            logger.warning(f"  v8 feature computation failed: {e}")
-            return None
 
     def _score_all_deltas(self, candles, atm_iv, chain) -> list:
         """

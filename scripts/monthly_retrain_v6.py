@@ -115,6 +115,8 @@ def retrain_for_month(dataset_path: Path, month_label: str, dry_run: bool = Fals
     
     # Windows configuration
     windows = [
+        ('3y', 756),
+        ('2y', 504),
         ('1y', 252),
         ('6m', 126),
         ('3m', 63),
