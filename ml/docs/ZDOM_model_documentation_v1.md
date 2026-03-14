@@ -231,7 +231,7 @@ SPX 0DTE options are among the most liquid options in the world, with tight bid-
 1. **Intraday feature warmup** — Features like opening range (ORB), first 15-min return, first 30-min return/range/direction, and open drive strength require 9:30–9:59 bars to compute. Without this warmup period, the model would have null intraday features for early entries. These features are critical for capturing the day's character before we start trading.
 2. **Wide bid-ask spreads at open** — The first 30 minutes of trading have significantly wider bid-ask spreads on SPX 0DTE options. Our mid-price fill assumption is least reliable during this period. Market makers are still adjusting to overnight moves, order flow is chaotic, and liquidity is thin. Entering during this window would introduce systematic slippage that isn't captured in our mid-price simulation.
 
-**Empirical validation (Sai, 2026-03-14):** Analysis of 4.5M option snapshots across 762 trading days (5–45 delta, bid > 0) confirms the 10:00 AM start time. The tightest median relative spread occurs at 9:41 ET (2.99%), but the optimal sustained window where spreads remain within 10% of the tightest is **9:32–11:14 ET**. At 9:30 the spread is still noisy from the open. By 10:00 it has settled to 4.08% — tight enough for reliable mid fills and past the feature warmup period. Full spread analysis in Section 17.
+**Empirical validation (Sai, 2026-03-14):** Analysis of 4.5M option snapshots across 762 trading days (5–45 delta, bid > 0) confirms the 10:00 AM start time. Absolute dollar spreads are mostly stable through the day (median $0.10, varying by delta), but the execution cost *ratio* (spread as % of premium) is lowest in the morning when options have the most time value. The best execution cost window is **9:32–11:14 ET**. By 14:00, theta decay has shrunk premiums enough that the same dollar spread eats roughly double the fraction of your credit. Full spread analysis in Section 15.
 
 ### Why no entries after 3:00 PM
 - **Gamma acceleration** — After 3:00 PM, 0DTE options experience extreme gamma acceleration. Small moves in SPX cause outsized changes in option prices. This makes iron condor positions highly unpredictable in the final hour, and the P&L swings become disproportionate to the credit collected.
@@ -522,18 +522,41 @@ This section documents two empirical studies conducted on the full 56.3M-row int
 | 15:30 | $0.10 | 6.90% | $0.09 | 9.72% |
 | 15:45 | $0.10 | 8.70% | $0.09 | 11.97% |
 
-- **Tightest spread:** 2.99% at 9:41 ET
-- **Optimal sustained window** (within 10% of tightest): **9:32–11:14 ET**
-- **Spread widens to 1.5x tightest at:** 13:59 ET
-- After 15:00, spreads expand rapidly — by 15:45 relative spread is 2.9x the tightest
+**Absolute spread distribution.** SPX 0DTE options trade on $0.05 tick increments. Across all 4.49M observations, the three most common spreads are $0.05 (36%), $0.10 (42%), and $0.20 (19%) — accounting for 96% of all data. The median is $0.10 at most times of day, but the spread varies meaningfully by delta: 5–10 delta options cluster at $0.05–$0.10 (cheap OTM options), while 30–45 delta options have median $0.20, p90 of $0.70, and p95 of $1.30.
 
-The median dollar spread stays pinned at $0.10 (the minimum tick) throughout the day. The relative spread widens because option mid prices shrink as theta decay accelerates — the $0.10 tick becomes a larger fraction of the option's value.
+**Full spread distribution at key times (all delta buckets combined):**
+
+| Time | Mean | p25 | p50 | p75 | p90 | p95 |
+|------|------|-----|-----|-----|-----|-----|
+| 10:00 | $0.27 | $0.10 | $0.10 | $0.20 | $0.40 | $0.60 |
+| 10:30 | $0.12 | $0.05 | $0.10 | $0.20 | $0.20 | $0.20 |
+| 12:00 | $0.11 | $0.05 | $0.10 | $0.10 | $0.20 | $0.20 |
+| 14:00 | $0.16 | $0.05 | $0.10 | $0.10 | $0.20 | $0.40 |
+| 15:00 | $0.09 | $0.05 | $0.10 | $0.10 | $0.20 | $0.20 |
+
+**Spread at 10:00 AM by delta bucket:**
+
+| Delta | Mean | p50 | p75 | p90 | p95 |
+|-------|------|-----|-----|-----|-----|
+| 5–10 | $0.10 | $0.10 | $0.10 | $0.15 | $0.20 |
+| 10–15 | $0.17 | $0.10 | $0.15 | $0.25 | $0.35 |
+| 15–20 | $0.29 | $0.10 | $0.20 | $0.40 | $0.60 |
+| 20–30 | $0.35 | $0.20 | $0.30 | $0.50 | $0.80 |
+| 30–45 | $0.46 | $0.20 | $0.30 | $0.70 | $1.30 |
+
+Absolute dollar spreads are mostly stable through the day — the median doesn't change much from 10:00 to 15:00. The relative spread (spread / mid) widens because the denominator shrinks: as theta decay crushes 0DTE option premiums, the same dollar spread becomes a larger percentage of the option's value.
+
+**Why the relative spread matters for IC trading:** The relative spread determines how much of your collected credit gets eaten by execution cost. An IC has 4 legs. If you're collecting $2.40 in credit at 10:00 and paying ~$0.40–$0.80 in total spread cost (depending on deltas), that's 17–33% of your edge. At 14:30, when theta has decayed the credit to $1.20, the same dollar spread cost takes 33–67%. Later entries pay a similar absolute cost but surrender a larger fraction of their premium to the bid-ask.
+
+- **Lowest execution cost ratio:** morning window (9:32–11:14 ET), when premiums are highest relative to the spread
+- **Execution cost ratio approximately doubles by:** ~14:00 ET, as mid prices shrink
+- After 15:00, cost ratios expand rapidly — by 15:45, relative spread is 2.9x the morning level
 
 ![Spread by Time of Day](../../output/microstructure_analysis/spread_by_time.png)
 
 #### Spread by delta bucket
 
-Lower-delta options (5–10 delta) consistently have wider relative spreads (~6% all day, rising to 15%+ by 15:30) because the mid price is small relative to the $0.10 tick. Higher-delta options (30–45 delta) maintain tight 1–2% relative spreads through most of the day. Our 10-delta short strikes sit in the widest-spread bucket — this is an inherent cost of trading far-OTM wings.
+The same tick-size mechanism explains the delta bucket differences. Lower-delta options (5–10 delta) have smaller premiums, so the $0.10 tick is a larger percentage (~6% all day, rising to 15%+ by 15:30). Higher-delta options (30–45 delta) have larger premiums, keeping the relative spread at 1–2% through most of the day. Our 10-delta short strikes sit in the widest-spread bucket — this is an inherent cost of trading far-OTM wings, not a liquidity issue.
 
 ![Spread by Delta Bucket](../../output/microstructure_analysis/spread_by_time_delta.png)
 
@@ -551,7 +574,7 @@ Lower-delta options (5–10 delta) consistently have wider relative spreads (~6%
 | 14:00–15:00 | -0.405 | 40,717 |
 | 15:00–16:00 | -0.198 | 41,826 |
 
-Higher VIX = **tighter** relative spreads. This is counterintuitive — you'd expect high-vol environments to have wider spreads. The explanation is mechanical: when VIX is elevated, option premiums are higher (larger mid price), but the absolute dollar spread stays pinned at the $0.10 tick. The spread as a percentage of mid therefore shrinks. Conversely, in low-VIX environments (VIX < 15), options are cheap and the $0.10 tick becomes a larger fraction of the premium.
+Higher VIX = **tighter** relative spreads. This follows the same mechanism as the intraday pattern: when VIX is elevated, option premiums are higher (larger mid price), but the absolute dollar spread stays pinned at the $0.10 tick. The spread as a percentage of mid therefore shrinks. Conversely, in low-VIX environments (VIX < 15), options are cheap and the $0.10 tick becomes a larger fraction of the premium. This is not about market maker behavior — it's the same tick-size arithmetic that explains the intraday spread curve.
 
 The correlation is strongest during core trading hours (10:00–12:00, r = -0.43 to -0.46) and weakens at the open and close when other factors dominate spread dynamics.
 
@@ -561,9 +584,9 @@ The correlation is strongest during core trading hours (10:00–12:00, r = -0.43
 
 #### Spread conclusions
 
-1. **10:00 AM start is validated.** Spreads are near-tightest from 10:00–11:14. The 30-minute warmup period (9:30–9:59) coincides with the noisiest spread period.
-2. **Mid-fill assumption holds through ~14:00.** After 14:00, relative spreads start widening meaningfully (5%+ for 10-delta options). This aligns with the gamma acceleration discussed below.
-3. **Low-VIX days have worse fill quality.** The inverse VIX-spread relationship means our mid-fill assumption is weakest on exactly the days where IC premiums are thinnest. Something to watch in paper trading.
+1. **10:00 AM start is validated** — but for execution cost ratio, not liquidity. The absolute spread is $0.10 all day. Morning entries are better because you collect more premium per dollar of spread cost. The 30-minute warmup period (9:30–9:59) also coincides with the open auction noise.
+2. **Execution cost doubles by ~14:00.** After 14:00, theta has decayed enough that the fixed $0.10 tick eats 5%+ of your 10-delta option premiums. Combined with the gamma acceleration (Section 15.2), afternoon entries pay more in spread cost while taking on more gamma risk — a compounding disadvantage.
+3. **Low-VIX days have the worst execution cost ratio.** When premiums are thin (VIX < 15), the $0.10 tick takes a larger bite out of every leg. Our mid-fill assumption is weakest on exactly the days where IC premiums are thinnest. Something to watch in paper trading.
 
 ---
 
