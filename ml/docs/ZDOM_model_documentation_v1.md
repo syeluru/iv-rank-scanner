@@ -181,6 +181,24 @@ Each TP level produces a different class balance. Lower TPs are easier to hit (h
 | TP45 | 68.5% | 1,488,233 | 685,093 |
 | TP50 | 67.2% | 1,459,440 | 713,886 |
 
+### Exit scenario distributions (full dataset, 2.17M trades)
+
+The exit reason tells us *how* each trade resolved — whether it hit the take-profit target, hit the stop-loss, or was carried to close. This distribution shifts meaningfully across TP levels and reveals the underlying dynamics of the strategy.
+
+| TP Level | TP Hit | SL Hit | Close Win | Close Loss |
+|----------|--------|--------|-----------|------------|
+| TP10 | 86.8% | 6.4% | 1.9% | 4.9% |
+| TP15 | 81.0% | 8.7% | 3.4% | 6.8% |
+| TP20 | 75.5% | 10.8% | 5.3% | 8.5% |
+| TP25 | 69.9% | 12.6% | 7.5% | 10.0% |
+| TP30 | 64.4% | 14.2% | 10.2% | 11.3% |
+| TP35 | 59.1% | 15.5% | 13.1% | 12.3% |
+| TP40 | 53.9% | 16.6% | 16.3% | 13.2% |
+| TP45 | 48.7% | 17.6% | 19.7% | 13.9% |
+| TP50 | 43.8% | 18.4% | 23.3% | 14.5% |
+
+At lower TP levels (TP10-TP15), the vast majority of trades resolve cleanly — they hit TP quickly and the SL rarely triggers. As TP targets get more aggressive, fewer trades hit TP before close, and more trades drift into the carry-to-close scenarios. By TP50, nearly 38% of trades are carried to close without hitting either threshold, splitting roughly 60/40 between close_win and close_loss. The SL rate roughly triples from TP10 (6.4%) to TP50 (18.4%), reflecting that higher TP targets give losing trades more time to deteriorate before the race resolves.
+
 ---
 
 ## 6. Execution Logic (how we would trade this live)
