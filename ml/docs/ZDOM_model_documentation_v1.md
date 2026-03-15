@@ -444,7 +444,32 @@ ThetaData intraday greeks are our ground truth for option pricing. We assume the
 Mid price fills are our central assumption for both entry and exit. SPX 0DTE options trade over $1B in notional daily and have tight spreads during core hours (10am-3pm). However, mid fills are not guaranteed — during fast markets, the true fill price may be closer to the unfavorable side of the spread. Paper trading on Tradier sandbox will validate this assumption before live deployment.
 
 - No slippage modeled in V1 — mid entry, mid exit
-- No commissions modeled in V1 (typically ~$0.65/contract, negligible vs trade P&L)
+- No commissions/fees modeled in V1 — fee-adjusted EV will be incorporated in V2
+
+### Transaction costs (Tradier, Pro Plus plan — pending confirmation)
+
+The following fee structure is based on Tradier's published pricing page as of March 2026. **Matto is calling Tradier to confirm the exact all-in cost per SPX option contract** — these numbers should be treated as estimates until verified.
+
+| Fee | Per Contract | Source |
+|-----|-------------|--------|
+| Tradier commission (Pro Plus) | $0.10 | Tradier pricing page |
+| SPX exchange fee (Cboe pass-through) | $0.60 | Tradier "single listed index option fee" |
+| Clearing fee | $0.0775 | Tradier ($15/leg max) |
+| TAF regulatory | $0.00279 | Tradier |
+| ORF regulatory | $0.02295 | Tradier |
+| Trade reporting | $0.000072 | Tradier |
+| **Total per contract** | **$0.8033** | |
+
+For a 4-leg Iron Condor at 1 contract per leg:
+- **Open**: $3.21 (4 × $0.8033)
+- **Close**: $3.21 (4 × $0.8033)
+- **Round-trip total**: $6.43
+- **Breakeven**: trade must profit > $0.0643 in option price terms ($6.43 actual) to be net positive
+- **As % of avg credit**: ~1.1% of the ~$591 credit collected
+
+Assignment/exercise fee is $9.00 per transaction if applicable. Pro Plus plan costs $35/month.
+
+> **Action item**: Confirm exact fee structure with Tradier. The $0.60 SPX exchange fee is the biggest cost component and needs verification — Cboe's published rate is $0.45 for customer orders with premium ≥ $1.00, so Tradier may be marking up the pass-through. Fee-adjusted EV analysis will be built into V2.
 
 ### Feature computation assumptions
 All intraday features are computed using data up to and including the current minute — no look-ahead. This has been verified in `build_intraday_features.py`:
