@@ -532,12 +532,47 @@ models/v1/
 
 ---
 
-## 15. Version Roadmap
+## 15. Feature Importance (V1)
+
+V1 uses XGBoost's built-in gain-based importance (total reduction in loss contributed by each feature across all trees). The top features for TP10 XGB (best model, AUC 0.7297) are dominated by intraday features, validating the hypothesis that *when* you enter matters more than macro context.
+
+| Rank | Feature | Gain | Category |
+|------|---------|------|----------|
+| 1 | intraday_range_pct | 895.6 | Price Action |
+| 2 | entry_hour | 685.8 | Fundamental |
+| 3 | total_call_volume | 679.4 | Options Flow |
+| 4 | qqq_spx_ratio | 582.6 | Cross-Asset |
+| 5 | iv_25d_put | 534.7 | Volatility - Implied |
+| 6 | max_pain_distance_pts | 453.8 | Greeks / Positioning |
+| 7 | strat_IC_45d_25w | 415.1 | Fundamental |
+| 8 | hy_spread | 409.6 | Macro / Rates |
+| 9 | iv_25d_call | 389.8 | Volatility - Implied |
+| 10 | total_put_volume | 383.2 | Options Flow |
+
+Split count (frequency of use) tells a different story: `minutes_since_open` is used 273 times (most frequent) but ranks only 18th by gain. The model uses time-of-day for fine-grained partitioning but each split contributes less individually.
+
+### Feature importance methods for V2
+
+V1 uses gain-based importance only. For V2, we should evaluate more rigorous methods:
+
+1. **SHAP (SHapley Additive exPlanations)** - Game-theory-based marginal contribution of each feature. Most principled method but computationally expensive on 2M+ rows. Can show per-prediction explanations, not just global importance.
+
+2. **Permutation importance** - Shuffle one feature at a time, re-score (not retrain), measure AUC drop. Fast, model-agnostic, and measures actual prediction impact rather than tree structure.
+
+3. **Leave-one-out / Drop-column importance** - Retrain the model without each feature, compare AUC. Most rigorous but requires 284 retrains. Captures feature interactions that permutation importance misses.
+
+4. **Ablation study** - Drop entire feature categories (e.g., remove all macro features), retrain, measure AUC impact. Efficient way to assess category-level contributions.
+
+> **Action item (Matto)**: Reach out to PNC contact about the feature importance methodology used on the debit card model. They used split count (frequency) but there was discussion of an alternative leave-one-out approach that may be more appropriate for our use case.
+
+---
+
+## 16. Version Roadmap
 
 | Version | Purpose | Status |
 |---------|---------|--------|
 | **ZDOM V1** | Entry go/no-go: should I enter this IC at this minute? | **Training** |
-| ZDOM V2 | Add VIX/VIX1D 1-min intraday features, ensemble methods, feature pruning to top 20-30 | Planned |
+| ZDOM V2 | VIX/VIX1D intraday features, ensemble methods, feature pruning, fee-adjusted EV, advanced feature importance (see below) | Planned |
 | ZDOM V3 | Live trade monitoring: predict mid-trade TP vs SL outcome, dynamic stop-loss | Planned |
 | ZDOM V4 | Structure selection: IC vs butterfly vs jade lizard vs credit spread by regime | Planned |
 
