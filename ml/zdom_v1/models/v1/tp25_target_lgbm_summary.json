@@ -1,0 +1,32 @@
+{
+  "key": "tp25_target_lgbm",
+  "target": "tp25_target",
+  "model_type": "lgbm",
+  "test_auc": 0.6816287792917899,
+  "holdout_auc": 0.6906633995399566,
+  "baseline_wr": 0.7698,
+  "baseline_ev": 0.033,
+  "n_features": 284,
+  "params": {
+    "scale_pos_weight": "0.29021948416370635",
+    "n_estimators": "327",
+    "max_depth": "7",
+    "learning_rate": "0.05084819668822098",
+    "num_leaves": "38",
+    "subsample": "0.9518625641692007",
+    "colsample_bytree": "0.7476990585200797",
+    "min_child_weight": "16",
+    "reg_alpha": "1.9248152115419213",
+    "reg_lambda": "2.3746246885681956"
+  },
+  "trained_at": "2026-03-14T09:10:14.716563",
+  "split_info": {
+    "train_days": 526,
+    "test_days": 106,
+    "holdout_days": 106,
+    "gap_days": 7,
+    "train_range": "2023-02-27 -> 2025-04-03",
+    "test_range": "2025-04-15 -> 2025-09-16",
+    "holdout_range": "2025-09-26 -> 2026-02-27"
+  }
+}

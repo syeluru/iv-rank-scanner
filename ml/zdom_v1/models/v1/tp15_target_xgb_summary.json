@@ -1,0 +1,32 @@
+{
+  "key": "tp15_target_xgb",
+  "target": "tp15_target",
+  "model_type": "xgb",
+  "test_auc": 0.7015057198191893,
+  "holdout_auc": 0.7082516666189945,
+  "baseline_wr": 0.8376,
+  "baseline_ev": 0.0298,
+  "n_features": 284,
+  "params": {
+    "scale_pos_weight": "0.18358237438053518",
+    "n_estimators": "529",
+    "max_depth": "6",
+    "learning_rate": "0.06063526736022712",
+    "subsample": "0.6693733750040144",
+    "colsample_bytree": "0.9924826458699906",
+    "min_child_weight": "26",
+    "gamma": "0.9072503345787518",
+    "reg_alpha": "1.86068496154885",
+    "reg_lambda": "4.5528759463332795"
+  },
+  "trained_at": "2026-03-14T07:27:18.273251",
+  "split_info": {
+    "train_days": 526,
+    "test_days": 106,
+    "holdout_days": 106,
+    "gap_days": 7,
+    "train_range": "2023-02-27 -> 2025-04-03",
+    "test_range": "2025-04-15 -> 2025-09-16",
+    "holdout_range": "2025-09-26 -> 2026-02-27"
+  }
+}
