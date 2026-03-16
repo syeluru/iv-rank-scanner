@@ -572,11 +572,11 @@ V1 uses gain-based importance only. For V2, we should evaluate more rigorous met
 | Version | Purpose | Status |
 |---------|---------|--------|
 | **ZDOM V1** | Entry go/no-go: should I enter this IC at this minute? | **Complete** |
-| ZDOM V2 | Feature enrichment, fee-adjusted targets, ensemble, entry timing | Planned |
+| ZDOM V2 | Fee-adjusted targets, intraday VIX/VIX1D/greeks features, entry timing optimization | Planned |
 | ZDOM V3 | Live trade monitoring, dynamic stop-loss | Planned |
 | ZDOM V4 | Structure selection (IC vs butterfly vs jade lizard vs credit spread) | Planned |
 
-### ZDOM V2 — Feature Enrichment & Fee-Adjusted Targets
+### ZDOM V2 — Fee-Adjusted Targets & Intraday Feature Enrichment
 
 **Target definition changes:**
 - Adjust target to account for transaction costs. Currently the target treats any profit > $0 as a win, but after Tradier fees ($6.43 round-trip per IC), many "wins" are actually losses. V2 will subtract fees from the credit before running the TP vs SL race, so the target reflects real-world profitability. Once fees are confirmed with Tradier (call scheduled), the exact breakeven threshold will be baked into the target construction.
@@ -588,28 +588,18 @@ V1 uses gain-based importance only. For V2, we should evaluate more rigorous met
 - Intraday greeks/positioning: live GEX/DEX recalculated each minute with rolling MAs (5m, 15m, 30m). The daily GEX snapshot is stale by afternoon — live positioning data would capture real-time dealer hedging flows.
 - Intraday IV features: live ATM IV, skew shifts, IV momentum throughout the day. IV changes intraday as market moves — capturing these dynamics could improve entry timing.
 
-**Feature pruning:**
-- Reduce from 284 to top 20-30 most important features. V1 showed that intraday features dominate — many macro/calendar features may be adding noise. Methods to evaluate: permutation importance, SHAP, ablation studies by category, and potentially leave-one-out (LOO) importance (pending PNC contact input on methodology).
-
-**Ensemble methods:**
-- Combine XGB + LGBM predictions via stacking, blending, or weighted vote instead of picking one winner. V1 showed XGB and LGBM alternate as winners across TP levels — an ensemble could capture both models' strengths.
-- Experiment with training on different date ranges and combining predictions.
+**Feature importance analysis (not pruning):**
+- We are NOT pruning features in V2. Tree models handle irrelevant features well. Instead, we focus on understanding which features drive predictions using advanced methods: SHAP, permutation importance, and potentially LOO (pending PNC contact input on methodology). This informs future feature engineering, not feature removal.
 
 **Entry timing optimization:**
 - V1 analysis showed 11:00-11:59 entries have the best win rate (77.2%) and EV ($0.085), while 14:00-14:59 entries have 57.5% carry-to-close rate. V2 should either weight entry times or add an entry timing sub-model that predicts the optimal entry window for the day.
 
-**Advanced feature importance:**
+**Advanced feature importance methods:**
 - SHAP (Shapley Additive exPlanations) for per-prediction explanations
 - Permutation importance for model-agnostic feature ranking
 - Leave-one-out / drop-column importance (retrain without each feature, compare AUC)
 - Ablation by category (drop all macro features, retrain, measure impact)
 - Action item: reach out to PNC contact about LOO methodology used on debit card model
-
-**VIX regime gate:**
-- Add a VIX-based regime filter as a soft blocker. When VIX is in certain ranges, the model's predictions may be less reliable. This could be a simple threshold or a learned regime classifier.
-
-**Neural network baseline:**
-- Try MLP (multi-layer perceptron) after tree models are optimized. Neural nets may capture non-linear feature interactions that trees miss, especially with the enriched intraday feature set.
 
 ### ZDOM V3 — Live Trade Monitoring & Dynamic Stop-Loss
 
