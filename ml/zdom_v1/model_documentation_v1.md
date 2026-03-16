@@ -375,42 +375,48 @@ The subsample strategy is key to making this tractable: tuning on 500K rows take
 
 ## 11. Evaluation & Analysis
 
-### Primary metric: AUC (ROC)
-Area under the ROC curve measures how well the model **ranks** entries by risk. A model with AUC 0.75 means that a randomly chosen winning entry will be scored higher than a randomly chosen losing entry 75% of the time. AUC ≥ 0.70 is our minimum threshold for a model to be considered useful.
+### Model quality metric: AUC (ROC)
+Area under the ROC curve measures how well each model **ranks** entries by risk. A model with AUC 0.75 means that a randomly chosen winning entry will be scored higher than a randomly chosen losing entry 75% of the time. AUC >= 0.70 is our minimum threshold for a model to be considered useful. AUC is used to confirm each model can discriminate — it is not the operational metric.
 
-AUC is the right metric for model selection because we care about ranking, not calibrated probabilities. We don't need the model to output accurate probabilities — we need it to consistently rank good entries above bad entries. The skip rate analysis then converts this ranking ability into operational value.
+### Evaluation method: Walk-forward backtest on holdout data
+The primary evaluation is a **walk-forward backtest** that simulates actual day-by-day trading on the 106-day holdout period (Sep 2025 - Feb 2026). This is not a static population analysis — it simulates sequential trading where one trade must close before the next one opens, portfolio value compounds, and drawdowns are tracked.
 
-### Operational metric: Skip rate analysis
-AUC tells us the model can discriminate. Skip rate analysis tells us **how much value that discrimination creates** in dollar terms.
+At each minute during the holdout, the system:
+1. Runs all **9 TP models** (TP10-TP50) to score the current entry
+2. For each of the **9 IC strategies** available at that minute, each model outputs a probability
+3. Computes **EV = probability x credit** for each of the 81 combinations (9 models x 9 strategies)
+4. Applies the **skip rate threshold** — any combination with probability below the cutoff is excluded
+5. **Picks the single highest EV combination** — that is the trade entered
+6. Waits for the trade to resolve (TP hit, SL hit, or carry to close), then repeats
 
-For each skip rate (5%, 10%, 15%, 20%, 25%, 30%):
-1. Score all holdout entries with the trained model
-2. **Rank-order by probability** (model confidence)
-3. **Remove the bottom N%** — these are the entries the model is least confident about (the riskiest according to the model)
-4. Measure the **remaining population's** win rate and EV per trade
-5. Compare to the **baseline**: entering every trade with no model
+This means the system dynamically selects the best TP model x IC strategy pair every minute based on real-time model confidence and available credit. It is not locked to a single TP level or strategy — some minutes IC_45d x TP45 wins, other minutes IC_10d x TP15 wins, depending on conditions.
 
-This answers the key question: "If I use the model to skip the riskiest 20% of entries, how much does my win rate and EV improve?"
-
-### Why skip rate over probability cutoff?
-A raw probability cutoff (e.g., P > 0.65) is hard to compare across models with different calibrations. One model's 0.65 might be another model's 0.72. Skip rate (remove bottom 20%) is model-agnostic, intuitive, and directly maps to an operational decision: "How selective do I want to be?" It also makes it easy to compare across TP levels and algorithms.
+### Skip rates
+The skip rate determines the minimum probability threshold for entry. At each skip rate (20% to 40% in 1% increments), all entries with model probability below the Nth percentile cutoff are excluded before selecting the max EV trade. Higher skip rates = more selective = fewer but higher-quality trades.
 
 ### Baseline comparison
-The baseline represents the naive strategy: enter every single trade in the holdout period with no model and no blockers. This is the "what if we just sold premium indiscriminately" scenario.
+The baseline runs the same walk-forward simulation with 0% skip rate — enter the best EV trade at every opportunity with no model filtering. This represents the rules-based approach of always trading the highest-EV combination available.
 
-- **Baseline** = enter every trade in the holdout period (no model, no blockers)
-- **ZDOM at X% skip** = enter only the trades above the X-percentile threshold
-- Same date range (2025-09-26 → 2026-02-27), same 106 days, same universe of entries — apples to apples
-- The model doesn't change trade outcomes, it selects which trades to enter
+- **Baseline** = walk-forward with 0% skip (enter every opportunity)
+- **ZDOM** = walk-forward with N% skip (model filters out low-confidence entries)
+- Same holdout period, same simulation logic — the only difference is the skip threshold
 
-The holdout period (Sep 2025 – Feb 2026) includes months with negative EV (Oct-Nov 2025 were particularly bad for ICs) as well as positive months (Jan-Feb 2026). This makes the baseline near-breakeven ($0.03-0.04/trade for TP25), which is realistic — selling premium blindly is barely profitable. If the model can show meaningful lift above this realistic baseline, that's a strong signal.
+### Output: 9x9 EV matrix
+The walk-forward produces a matrix showing how often each TP model x IC strategy combination was selected and its aggregate performance. This tells us which combinations the system gravitates toward and where the real edge lives.
 
 ### What matters
-- **Precision** (avoiding false positives) is more important than recall
-  - FP = model says ENTER, trade loses → real money lost
-  - FN = model says SKIP, trade would have won → no cost, just missed opportunity
-- **EV lift** at practical skip rates (10–25%) is the key decision metric
-- **Total PnL** also matters — high EV per trade but very few trades may not be optimal
+- **Precision** over recall — FP (entering a losing trade) costs real money, FN (skipping a winner) is just missed opportunity
+- **Total return** and **max drawdown** from the walk-forward — not just per-trade EV
+- **Sharpe ratio** — risk-adjusted return across the holdout
+- **Win rate** — of trades actually entered, what % were profitable
+
+### Results
+See `analysis/backtests/summary_with_05d.csv` for the full walk-forward results across all skip rates. Key findings:
+- S1 (sequential, max contracts) at 30% skip: **+157.5% return, Sharpe 2.13, 58.8% WR**
+- S2 (diversified) at 36% skip: **+164.8% return, Sharpe 2.18, 68.4% WR**
+- Baseline (0% skip): S1 +44.7%, S2 +65.6% — model adds significant value
+- IC_05d is critical for re-entry chaining — without it, returns collapse (see `summary_no_05d.csv`)
+- IC_45d and IC_40d drive the majority of dollar PnL through high-credit trades
 
 ---
 
