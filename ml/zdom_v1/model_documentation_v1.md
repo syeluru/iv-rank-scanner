@@ -588,6 +588,15 @@ V1 uses gain-based importance only. For V2, we should evaluate more rigorous met
 - Intraday greeks/positioning: live GEX/DEX recalculated each minute with rolling MAs (5m, 15m, 30m). The daily GEX snapshot is stale by afternoon — live positioning data would capture real-time dealer hedging flows.
 - Intraday IV features: live ATM IV, skew shifts, IV momentum throughout the day. IV changes intraday as market moves — capturing these dynamics could improve entry timing.
 
+**Cross-timeframe ratio features:**
+A new systematic feature category that captures how the current moment compares to recent history, and how recent history compares to the longer trend. V1 has a few ad-hoc versions of this (e.g., `intraday_ma15_vs_sma_7d`, `rvol_intraday_vs_5d`), but V2 will build this out as a full category across all major signals.
+
+- **Intraday vs short-term (sub-1-hour vs 1-30 days):** How does right now compare to the recent past? Examples: current 30-min realized vol / 5-day avg daily RV, current SPX return vs 5-day avg return, intraday VIX level vs 10-day VIX mean, current IV vs 20-day IV mean, intraday GEX vs 5-day avg GEX. These ratios tell the model whether the current minute is "normal" relative to recent conditions or an outlier.
+
+- **Short-term vs long-term (1-30 days vs 30+ days):** How does the recent past compare to the longer trend? Examples: 5-day HV / 60-day HV (vol compression/expansion), 10-day VIX mean / 90-day VIX mean, 20-day credit spreads / 60-day credit spreads, 5-day SPX return / 60-day SPX return. These capture regime transitions — when short-term diverges from long-term, it signals a shift in market character that affects IC outcomes.
+
+This creates a two-layer signal: the intraday-vs-short layer captures "is right now unusual for this week," and the short-vs-long layer captures "is this week unusual for this quarter." Together they give the model a multi-scale view of where we are relative to normal.
+
 **Feature importance analysis (not pruning):**
 - We are NOT pruning features in V2. Tree models handle irrelevant features well. Instead, we focus on understanding which features drive predictions using advanced methods: SHAP, permutation importance, and potentially LOO (pending PNC contact input on methodology). This informs future feature engineering, not feature removal.
 
