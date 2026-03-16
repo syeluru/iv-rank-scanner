@@ -2,19 +2,21 @@
 ZDOM V1 Walk-Forward Backtest Simulator.
 
 Simulates realistic trading on holdout data using trained XGBoost/LightGBM models.
-Evaluates 2 portfolio strategies × 7 slippage scenarios × 21 skip rates (294 configs).
-Excludes IC_05d_25w (5-delta) strategies which were empirically shown to destroy returns.
+
+Modes:
+  Default (no-5d):  Excludes IC_05d_25w, skip 20-40%, slip $0-$0.30 (294 configs)
+  --shadow-5d:      Includes IC_05d_25w in model selection but "shadow places" them
+                    (locks BP, follows TP/SL lifecycle, but $0 PnL). Skip 10-40%.
 
 Strategies:
   1. "Best EV, Max Contracts" — single best combo, all contracts
   2. "Diversified, Max Buying Power" — spread across top-K combos
 
 Usage:
-  python3 scripts/backtest_walkforward.py                    # full sim
+  python3 scripts/backtest_walkforward.py                    # no-5d mode
+  python3 scripts/backtest_walkforward.py --shadow-5d        # shadow 5-delta mode
   python3 scripts/backtest_walkforward.py --walkthrough      # 1-day trace only
-  python3 scripts/backtest_walkforward.py --no-tune          # skip Optuna (fast)
   python3 scripts/backtest_walkforward.py --strategy 1       # single strategy
-  python3 scripts/backtest_walkforward.py --skip-rates 0.10 0.20  # subset
 """
 
 import argparse
@@ -32,8 +34,8 @@ import pandas as pd
 
 warnings.filterwarnings("ignore")
 
-PROJECT_DIR = Path(__file__).resolve().parent.parent
-DATA_DIR = PROJECT_DIR / "data"
+PROJECT_DIR = Path(__file__).resolve().parent.parent.parent  # ml/zdom_v1/
+DATA_DIR = PROJECT_DIR / "data_join"
 MODELS_DIR = PROJECT_DIR / "models" / "v1"
 OUTPUT_DIR = PROJECT_DIR / "output" / "backtest"
 MODELS_DIR.mkdir(parents=True, exist_ok=True)
@@ -41,7 +43,11 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
-STRATEGIES = [f"IC_{d:02d}d_25w" for d in range(10, 50, 5)]  # Exclude 5-delta
+STRATEGIES_ALL = [f"IC_{d:02d}d_25w" for d in range(5, 50, 5)]   # All 9 deltas
+STRATEGIES_NO5D = [f"IC_{d:02d}d_25w" for d in range(10, 50, 5)]  # Exclude 5-delta
+SHADOW_STRATEGY = "IC_05d_25w"  # Strategy to shadow-place (locks BP, $0 PnL)
+STRATEGIES = STRATEGIES_NO5D  # Default; overridden by --shadow-5d in main()
+
 TP_LEVELS = [f"tp{p}" for p in range(10, 55, 5)]
 TARGETS = [f"{tp}_target" for tp in TP_LEVELS]
 
@@ -52,7 +58,8 @@ FEES_PER_SHARE = 0.052  # $5.20 RT / 100 shares
 START_PORTFOLIO = 10_000
 
 EXIT_SLIPS = [round(x * 0.05, 2) for x in range(7)]  # 0.00, 0.05, ..., 0.30
-SKIP_RATES = [round(0.20 + i * 0.01, 2) for i in range(21)]  # 0.20, 0.21, ..., 0.40
+SKIP_RATES_NO5D = [round(0.20 + i * 0.01, 2) for i in range(21)]  # 0.20 → 0.40
+SKIP_RATES_SHADOW = [round(0.10 + i * 0.01, 2) for i in range(31)]  # 0.10 → 0.40
 
 # Meta columns (not features) — from train_v1.py
 _TP_META = []
@@ -85,6 +92,7 @@ class Position:
     exit_debit: float   # per share
     qty: int            # contracts
     ev: float           # EV at entry
+    shadow: bool = False  # Shadow-placed (locks BP but $0 PnL)
 
 
 @dataclass
@@ -103,6 +111,7 @@ class TradeRecord:
     qty: int
     pnl_total: float
     portfolio_after: float
+    shadow: bool = False  # Shadow trade (BP locked, $0 PnL)
 
 
 # ── Data Loading & Splitting ─────────────────────────────────────────────────
@@ -464,10 +473,11 @@ def _get_candidates(day_df, entry_time, ev_lookup, cutoffs, skip_rate,
 
 
 def simulate_strategy1(day_df, ev_lookup, cutoffs, skip_rate, exit_slip,
-                       portfolio, optimization="joint"):
+                       portfolio, optimization="joint", shadow_5d=False):
     """Strategy 1: Best EV, Max Contracts.
 
     Pick best combo, enter all contracts. Re-enter after TP, stop after SL.
+    If shadow_5d=True, 5-delta trades lock BP but generate $0 PnL.
     """
     trades = []
     buying_power = int(portfolio // BUYING_POWER_PER_CONTRACT)
@@ -492,11 +502,16 @@ def simulate_strategy1(day_df, ev_lookup, cutoffs, skip_rate, exit_slip,
         # Pick the best EV candidate
         best = candidates[0]
         qty = buying_power
+        is_shadow = shadow_5d and best["strategy"] == SHADOW_STRATEGY
 
-        # Compute PnL
-        pnl_per_share = (best["credit"] - best["exit_debit"]
-                         - exit_slip - FEES_PER_SHARE)
-        pnl_total = pnl_per_share * 100 * qty
+        # Compute PnL (shadow trades get $0)
+        if is_shadow:
+            pnl_per_share = 0.0
+            pnl_total = 0.0
+        else:
+            pnl_per_share = (best["credit"] - best["exit_debit"]
+                             - exit_slip - FEES_PER_SHARE)
+            pnl_total = pnl_per_share * 100 * qty
 
         portfolio += pnl_total
         buying_power = int(portfolio // BUYING_POWER_PER_CONTRACT)
@@ -513,12 +528,13 @@ def simulate_strategy1(day_df, ev_lookup, cutoffs, skip_rate, exit_slip,
             exit_slip=exit_slip,
             fees=FEES_PER_SHARE,
             pnl_per_share=pnl_per_share,
-            qty=qty,
+            qty=qty if not is_shadow else 0,
             pnl_total=pnl_total,
             portfolio_after=portfolio,
+            shadow=is_shadow,
         ))
 
-        # SL → done for the day
+        # SL → done for the day (even for shadow trades)
         if best["exit_reason"] in ("sl", "close_loss"):
             break
 
@@ -545,10 +561,12 @@ def simulate_strategy1(day_df, ev_lookup, cutoffs, skip_rate, exit_slip,
 
 
 def simulate_strategy2(day_df, ev_lookup, cutoffs, skip_rate, exit_slip,
-                       portfolio, optimization="joint"):
+                       portfolio, optimization="joint", shadow_5d=False):
     """Strategy 2: Diversified, Max Buying Power.
 
     Distribute contracts across top-K combos. Replace TP exits, not SL.
+    If shadow_5d=True, 5-delta trades occupy allocation slots and lock BP
+    but generate $0 PnL.
     """
     trades = []
     total_bp = int(portfolio // BUYING_POWER_PER_CONTRACT)
@@ -606,6 +624,7 @@ def simulate_strategy2(day_df, ev_lookup, cutoffs, skip_rate, exit_slip,
             if qty <= 0:
                 continue
 
+            is_shadow = shadow_5d and cand["strategy"] == SHADOW_STRATEGY
             pos = Position(
                 strategy=cand["strategy"],
                 tp_level=cand["tp_level"],
@@ -616,6 +635,7 @@ def simulate_strategy2(day_df, ev_lookup, cutoffs, skip_rate, exit_slip,
                 exit_debit=cand["exit_debit"],
                 qty=qty,
                 ev=cand["ev"],
+                shadow=is_shadow,
             )
             new_positions.append(pos)
             active_strategies.add(cand["strategy"])
@@ -641,12 +661,18 @@ def simulate_strategy2(day_df, ev_lookup, cutoffs, skip_rate, exit_slip,
         pos = active_positions.pop(0)
         active_strategies.discard(pos.strategy)
 
-        # Record trade
-        pnl_per_share = pos.credit - pos.exit_debit - exit_slip - FEES_PER_SHARE
-        pnl_total = pnl_per_share * 100 * pos.qty
+        # Shadow trades: BP returns but $0 PnL
+        if pos.shadow:
+            pnl_per_share = 0.0
+            pnl_total = 0.0
+            record_qty = 0
+        else:
+            pnl_per_share = pos.credit - pos.exit_debit - exit_slip - FEES_PER_SHARE
+            pnl_total = pnl_per_share * 100 * pos.qty
+            record_qty = pos.qty
 
         portfolio += pnl_total
-        available_bp += pos.qty  # Return buying power
+        available_bp += pos.qty  # Return buying power (shadow or real)
 
         trades.append(TradeRecord(
             day=str(pos.entry_time.date()),
@@ -660,12 +686,13 @@ def simulate_strategy2(day_df, ev_lookup, cutoffs, skip_rate, exit_slip,
             exit_slip=exit_slip,
             fees=FEES_PER_SHARE,
             pnl_per_share=pnl_per_share,
-            qty=pos.qty,
+            qty=record_qty,
             pnl_total=pnl_total,
             portfolio_after=portfolio,
+            shadow=pos.shadow,
         ))
 
-        # TP → replace with new position
+        # TP → replace with new position (shadow or real)
         if pos.exit_reason in ("tp", "close_win"):
             # Recalculate total available BP
             total_bp = int(portfolio // BUYING_POWER_PER_CONTRACT)
@@ -692,7 +719,7 @@ def simulate_strategy2(day_df, ev_lookup, cutoffs, skip_rate, exit_slip,
 
 def simulate(holdout_scored, strategy_type, exit_slip, skip_rate,
              ev_lookup, cutoffs, optimization="joint",
-             start_portfolio=START_PORTFOLIO):
+             start_portfolio=START_PORTFOLIO, shadow_5d=False):
     """Run full simulation across all holdout days.
 
     Returns: (equity_curve, trade_log, summary_stats)
@@ -709,12 +736,12 @@ def simulate(holdout_scored, strategy_type, exit_slip, skip_rate,
         if strategy_type == 1:
             day_trades, portfolio = simulate_strategy1(
                 day_df, ev_lookup, cutoffs, skip_rate, exit_slip,
-                portfolio, optimization,
+                portfolio, optimization, shadow_5d=shadow_5d,
             )
         else:
             day_trades, portfolio = simulate_strategy2(
                 day_df, ev_lookup, cutoffs, skip_rate, exit_slip,
-                portfolio, optimization,
+                portfolio, optimization, shadow_5d=shadow_5d,
             )
 
         all_trades.extend(day_trades)
@@ -743,6 +770,7 @@ def _compute_summary(equity_curve, trades, strategy_type, exit_slip,
             "sharpe": 0.0,
             "win_rate": 0.0,
             "n_trades": 0,
+            "n_shadow": 0,
             "trades_per_day": 0.0,
             "final_portfolio": start_portfolio,
         }
@@ -775,9 +803,11 @@ def _compute_summary(equity_curve, trades, strategy_type, exit_slip,
     else:
         sharpe = 0.0
 
-    # Win rate
-    wins = sum(1 for t in trades if t.pnl_total > 0)
-    win_rate = wins / len(trades) if trades else 0.0
+    # Win rate (only count real trades)
+    real_trades = [t for t in trades if not t.shadow]
+    shadow_trades = [t for t in trades if t.shadow]
+    wins = sum(1 for t in real_trades if t.pnl_total > 0)
+    win_rate = wins / len(real_trades) if real_trades else 0.0
 
     n_days = len(equity_curve) - 1  # exclude "start"
 
@@ -790,10 +820,11 @@ def _compute_summary(equity_curve, trades, strategy_type, exit_slip,
         "max_drawdown_pct": round(max_dd * 100, 2),
         "sharpe": round(sharpe, 2),
         "win_rate": round(win_rate * 100, 1),
-        "n_trades": len(trades),
-        "trades_per_day": round(len(trades) / max(n_days, 1), 2),
+        "n_trades": len(real_trades),
+        "n_shadow": len(shadow_trades),
+        "trades_per_day": round(len(real_trades) / max(n_days, 1), 2),
         "final_portfolio": round(final_portfolio, 2),
-        "avg_pnl": round(np.mean([t.pnl_total for t in trades]), 2),
+        "avg_pnl": round(np.mean([t.pnl_total for t in real_trades]), 2) if real_trades else 0.0,
     }
 
 
@@ -879,19 +910,23 @@ def print_summary_table(summaries):
     print(f"  BACKTEST RESULTS SUMMARY")
     print(f"{'='*110}\n")
 
+    has_shadow = any(s.get("n_shadow", 0) > 0 for s in summaries)
+    shadow_hdr = f"  {'Shadow':>7s}" if has_shadow else ""
+
     print(f"  {'Strat':>5s}  {'Slip':>5s}  {'Skip':>5s}  {'Opt':>6s}  "
           f"{'Return%':>8s}  {'MaxDD%':>7s}  {'Sharpe':>7s}  "
-          f"{'WinRate':>7s}  {'Trades':>7s}  {'T/Day':>6s}  "
+          f"{'WinRate':>7s}  {'Trades':>7s}{shadow_hdr}  {'T/Day':>6s}  "
           f"{'Final$':>10s}  {'AvgPnL':>8s}")
-    print(f"  {'-'*105}")
+    print(f"  {'-'*115}")
 
     for s in sorted(summaries, key=lambda x: (x["strategy"], x["exit_slip"],
                                                x["skip_rate"])):
+        shadow_col = f"  {s.get('n_shadow', 0):>7,}" if has_shadow else ""
         print(f"  S{s['strategy']:>4d}  ${s['exit_slip']:.2f}  "
               f"{s['skip_rate']:>4.0%}  {s['optimization']:>6s}  "
               f"{s['total_return_pct']:>+7.1f}%  {s['max_drawdown_pct']:>6.1f}%  "
               f"{s['sharpe']:>7.2f}  {s['win_rate']:>6.1f}%  "
-              f"{s['n_trades']:>7,}  {s['trades_per_day']:>5.1f}  "
+              f"{s['n_trades']:>7,}{shadow_col}  {s['trades_per_day']:>5.1f}  "
               f"${s['final_portfolio']:>9,.0f}  ${s.get('avg_pnl', 0):>+7.1f}")
 
 
@@ -924,6 +959,7 @@ def save_results(summaries, all_trades, equity_curves):
                     "qty": t.qty,
                     "pnl_total": t.pnl_total,
                     "portfolio_after": t.portfolio_after,
+                    "shadow": t.shadow,
                 })
         trade_df = pd.DataFrame(trade_records)
         trade_file = OUTPUT_DIR / "trade_log.csv"
@@ -946,6 +982,8 @@ def save_results(summaries, all_trades, equity_curves):
 
 def main():
     parser = argparse.ArgumentParser(description="ZDOM V1 Walk-Forward Backtest")
+    parser.add_argument("--shadow-5d", action="store_true",
+                        help="Shadow-place 5-delta trades (lock BP, $0 PnL)")
     parser.add_argument("--walkthrough", action="store_true",
                         help="Run 1-day walkthrough only (for verification)")
     parser.add_argument("--no-tune", action="store_true",
@@ -955,23 +993,39 @@ def main():
     parser.add_argument("--strategy", type=int, choices=[1, 2], default=None,
                         help="Run only one strategy (default: both)")
     parser.add_argument("--skip-rates", nargs="*", type=float, default=None,
-                        help="Skip rates to test (default: 0.20 to 0.40 in 1%% increments)")
+                        help="Skip rates to test")
     parser.add_argument("--slips", nargs="*", type=float, default=None,
                         help="Exit slippage values (default: 0.00 to 0.30 in $0.05 increments)")
     parser.add_argument("--portfolio", type=float, default=START_PORTFOLIO,
                         help=f"Starting portfolio (default: ${START_PORTFOLIO:,})")
     args = parser.parse_args()
 
-    skip_rates = args.skip_rates or SKIP_RATES
+    # Set mode-dependent defaults
+    global STRATEGIES, OUTPUT_DIR
+    shadow_5d = args.shadow_5d
+    if shadow_5d:
+        STRATEGIES = STRATEGIES_ALL
+        default_skip_rates = SKIP_RATES_SHADOW
+        mode_label = "SHADOW 5-DELTA"
+        OUTPUT_DIR = PROJECT_DIR / "output" / "backtest_shadow5d"
+    else:
+        STRATEGIES = STRATEGIES_NO5D
+        default_skip_rates = SKIP_RATES_NO5D
+        mode_label = "NO 5-DELTA"
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    skip_rates = args.skip_rates or default_skip_rates
     exit_slips = args.slips or EXIT_SLIPS
     strategies = [args.strategy] if args.strategy else [1, 2]
 
     print(f"\n{'='*80}")
-    print(f"  ZDOM V1 Walk-Forward Backtest Simulator")
+    print(f"  ZDOM V1 Walk-Forward Backtest Simulator — {mode_label}")
     print(f"{'='*80}")
+    print(f"  Mode:        {mode_label}")
     print(f"  Strategies:  {strategies}")
+    print(f"  IC Deltas:   {STRATEGIES}")
     print(f"  Slippage:    {exit_slips}")
-    print(f"  Skip rates:  {skip_rates}")
+    print(f"  Skip rates:  {len(skip_rates)} values ({min(skip_rates):.0%} → {max(skip_rates):.0%})")
     print(f"  Portfolio:   ${args.portfolio:,.2f}")
     print(f"  Tuning:      {'OFF' if args.no_tune else f'Optuna ({args.n_trials} trials)'}")
 
@@ -1070,6 +1124,7 @@ def main():
                     ev_lookup, cutoffs,
                     optimization="joint",
                     start_portfolio=args.portfolio,
+                    shadow_5d=shadow_5d,
                 )
 
                 all_summaries.append(summary)

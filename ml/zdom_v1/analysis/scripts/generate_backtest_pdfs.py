@@ -20,11 +20,11 @@ from matplotlib.backends.backend_pdf import PdfPages
 import numpy as np
 import pandas as pd
 
-PROJECT_DIR = Path(__file__).resolve().parent.parent
-OUTPUT_DIR = PROJECT_DIR / "analysis" / "backtests"
+PROJECT_DIR = Path(__file__).resolve().parent.parent.parent  # ml/zdom_v1/
+OUTPUT_DIR = PROJECT_DIR / "output" / "backtest"  # default; overridable via --dir
 
-# Show subset of skip rates for equity curves (too many to show all 21)
-CURVE_SKIP_RATES = [0.20, 0.25, 0.30, 0.35, 0.40]
+# Show subset of skip rates for equity curves (auto-detected from data)
+CURVE_SKIP_RATES = [0.20, 0.25, 0.30, 0.35, 0.40]  # default; overridden in main()
 
 SLIP_LABELS = {
     0.00: ("S1", "Perfect Mid Fills"),
@@ -120,7 +120,7 @@ def render_summary_page(fig, summary_df, slip, slip_label, slip_desc):
 
     title = f"ZDOM V1 Backtest — Scenario {slip_label}: {slip_desc}"
     subtitle = (f"Exit Slippage: ${slip:.2f}/share  |  Fees: $0.052/share  |  "
-                f"Starting Portfolio: $10,000  |  Strategies: IC_10d-IC_45d (no 5-delta)")
+                f"Starting Portfolio: $10,000")
     ax.text(0.5, 0.97, title, transform=ax.transAxes, fontsize=14,
             fontweight="bold", ha="center", va="top")
     ax.text(0.5, 0.935, subtitle, transform=ax.transAxes, fontsize=8,
@@ -436,10 +436,32 @@ def render_skip_rate_comparison_page(fig, summary_df, slip):
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
-    print("Loading backtest results...")
-    summary_df = pd.read_csv(OUTPUT_DIR / "summary.csv")
-    trades_df = pd.read_csv(OUTPUT_DIR / "trade_log.csv")
-    equity_df = pd.read_csv(OUTPUT_DIR / "equity_curves.csv")
+    import argparse
+    parser = argparse.ArgumentParser(description="Generate backtest PDF reports")
+    parser.add_argument("--dir", type=str, default=None,
+                        help="Input/output directory (default: OUTPUT_DIR)")
+    parser.add_argument("--suffix", type=str, default="",
+                        help="Suffix for PDF filenames (e.g. '_shadow5d')")
+    args = parser.parse_args()
+
+    out_dir = Path(args.dir) if args.dir else OUTPUT_DIR
+    suffix = args.suffix
+
+    print(f"Loading backtest results from {out_dir}...")
+    summary_df = pd.read_csv(out_dir / "summary.csv")
+
+    # Auto-detect curve skip rates (pick ~5 evenly spaced from available)
+    global CURVE_SKIP_RATES
+    all_skips = sorted(summary_df["skip_rate"].unique())
+    if len(all_skips) <= 5:
+        CURVE_SKIP_RATES = all_skips
+    else:
+        step = max(1, len(all_skips) // 5)
+        CURVE_SKIP_RATES = [all_skips[i] for i in range(0, len(all_skips), step)][:5]
+        if all_skips[-1] not in CURVE_SKIP_RATES:
+            CURVE_SKIP_RATES[-1] = all_skips[-1]
+    trades_df = pd.read_csv(out_dir / "trade_log.csv")
+    equity_df = pd.read_csv(out_dir / "equity_curves.csv")
 
     print(f"  {len(summary_df)} summary rows, {len(trades_df):,} trades, "
           f"{len(equity_df):,} equity points")
@@ -448,7 +470,7 @@ def main():
 
     for slip in slips:
         slip_label, slip_desc = SLIP_LABELS.get(slip, (f"${slip:.2f}", "Custom"))
-        pdf_path = OUTPUT_DIR / f"backtest_{slip_label.lower()}_slip{slip:.2f}.pdf"
+        pdf_path = out_dir / f"backtest_{slip_label.lower()}_slip{slip:.2f}{suffix}.pdf"
 
         print(f"\nGenerating {pdf_path.name}...")
 
@@ -500,7 +522,7 @@ def main():
 
         print(f"  Saved: {pdf_path}")
 
-    print(f"\nDone. {len(slips)} PDFs saved to {OUTPUT_DIR}/")
+    print(f"\nDone. {len(slips)} PDFs saved to {out_dir}/")
 
 
 if __name__ == "__main__":
