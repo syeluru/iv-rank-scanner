@@ -1,8 +1,9 @@
 """
 ZDOM V1 Walk-Forward Backtest Simulator.
 
-Simulates realistic trading on holdout data using trained XGBoost models.
-Evaluates 2 portfolio strategies × 4 slippage scenarios × 5 skip rates.
+Simulates realistic trading on holdout data using trained XGBoost/LightGBM models.
+Evaluates 2 portfolio strategies × 7 slippage scenarios × 21 skip rates (294 configs).
+Excludes IC_05d_25w (5-delta) strategies which were empirically shown to destroy returns.
 
 Strategies:
   1. "Best EV, Max Contracts" — single best combo, all contracts
@@ -40,7 +41,7 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
-STRATEGIES = [f"IC_{d:02d}d_25w" for d in range(5, 50, 5)]
+STRATEGIES = [f"IC_{d:02d}d_25w" for d in range(10, 50, 5)]  # Exclude 5-delta
 TP_LEVELS = [f"tp{p}" for p in range(10, 55, 5)]
 TARGETS = [f"{tp}_target" for tp in TP_LEVELS]
 
@@ -50,8 +51,8 @@ BUYING_POWER_PER_CONTRACT = 2500
 FEES_PER_SHARE = 0.052  # $5.20 RT / 100 shares
 START_PORTFOLIO = 10_000
 
-EXIT_SLIPS = [0.00, 0.10, 0.20, 0.30]
-SKIP_RATES = [0.05, 0.10, 0.20, 0.30, 0.40]
+EXIT_SLIPS = [round(x * 0.05, 2) for x in range(7)]  # 0.00, 0.05, ..., 0.30
+SKIP_RATES = [round(0.20 + i * 0.01, 2) for i in range(21)]  # 0.20, 0.21, ..., 0.40
 
 # Meta columns (not features) — from train_v1.py
 _TP_META = []
@@ -954,9 +955,9 @@ def main():
     parser.add_argument("--strategy", type=int, choices=[1, 2], default=None,
                         help="Run only one strategy (default: both)")
     parser.add_argument("--skip-rates", nargs="*", type=float, default=None,
-                        help="Skip rates to test (default: 0.05 0.10 0.20 0.30 0.40)")
+                        help="Skip rates to test (default: 0.20 to 0.40 in 1%% increments)")
     parser.add_argument("--slips", nargs="*", type=float, default=None,
-                        help="Exit slippage values (default: 0.00 0.10 0.20 0.30)")
+                        help="Exit slippage values (default: 0.00 to 0.30 in $0.05 increments)")
     parser.add_argument("--portfolio", type=float, default=START_PORTFOLIO,
                         help=f"Starting portfolio (default: ${START_PORTFOLIO:,})")
     args = parser.parse_args()
@@ -1076,7 +1077,7 @@ def main():
                 all_equity_curves[key] = eq
 
                 # Progress
-                if sim_count % 5 == 0 or sim_count == total_sims:
+                if sim_count % 20 == 0 or sim_count == total_sims:
                     elapsed = time.time() - t0
                     print(f"  [{sim_count}/{total_sims}] {key}: "
                           f"return={summary['total_return_pct']:+.1f}%, "
