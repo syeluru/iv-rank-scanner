@@ -571,126 +571,78 @@ V1 uses gain-based importance only. For V2, we should evaluate more rigorous met
 
 | Version | Purpose | Status |
 |---------|---------|--------|
-| **ZDOM V1** | Entry go/no-go: should I enter this IC at this minute? | **Training** |
-| ZDOM V2 | Massively expanded intraday feature set (see V2 Feature Plan below), fee-adjusted EV, advanced feature importance | Planned |
-| ZDOM V3 | Live trade monitoring: predict mid-trade TP vs SL outcome, dynamic stop-loss | Planned |
-| ZDOM V4 | Structure selection: IC vs butterfly vs jade lizard vs credit spread by regime | Planned |
+| **ZDOM V1** | Entry go/no-go: should I enter this IC at this minute? | **Complete** |
+| ZDOM V2 | Feature enrichment, fee-adjusted targets, ensemble, entry timing | Planned |
+| ZDOM V3 | Live trade monitoring, dynamic stop-loss | Planned |
+| ZDOM V4 | Structure selection (IC vs butterfly vs jade lizard vs credit spread) | Planned |
 
-### ZDOM V2 Feature Plan
+### ZDOM V2 — Feature Enrichment & Fee-Adjusted Targets
 
-V2 expands V1's 284 features with deep intraday market microstructure, options positioning, volatility surface modeling, and cross-day support/resistance. These features were researched and prototyped in the v8 feature engineering effort (see `ml/features/` and `ml/archive/features/v8/`). The goal is to give the model much richer minute-level context about *why* a given entry is risky or safe — not just what the market looks like, but what the options market is telling us.
+**Target definition changes:**
+- Adjust target to account for transaction costs. Currently the target treats any profit > $0 as a win, but after Tradier fees ($6.43 round-trip per IC), many "wins" are actually losses. V2 will subtract fees from the credit before running the TP vs SL race, so the target reflects real-world profitability. Once fees are confirmed with Tradier (call scheduled), the exact breakeven threshold will be baked into the target construction.
+- Fix the floating point breakeven issue (~14K trades with PnL = $0.00 tagged as close_win). Round debit to 4 decimals before comparing.
 
-#### New Feature Categories for V2
+**New intraday features:**
+- VIX 1-min intraday features: VIX returns (5m/10m/15m/30m), VIX vs intraday VWAP, VIX intraday range, VIX momentum. Currently we only have daily VIX — adding minute-level VIX gives the model real-time fear gauge information.
+- VIX1D 1-min intraday features: same treatment. VIX1D is specifically designed for 0DTE and should be highly predictive.
+- Intraday greeks/positioning: live GEX/DEX recalculated each minute with rolling MAs (5m, 15m, 30m). The daily GEX snapshot is stale by afternoon — live positioning data would capture real-time dealer hedging flows.
+- Intraday IV features: live ATM IV, skew shifts, IV momentum throughout the day. IV changes intraday as market moves — capturing these dynamics could improve entry timing.
 
-**1. Support/Resistance Across Days (30 features)** — `ml/features/support_resistance.py`
-- Prior-day high/low/close as S/R levels + distance-to-level features
-- 5-day rolling range analysis: expanding/contracting range, position within range
-- Peak/valley detection on multi-day price history (local extrema as key levels)
-- Fibonacci retracements from recent swing high/low
-- Camarilla pivot points (R1-R4, S1-S4)
-- Swing structure: higher highs/higher lows count, trend quality score
+**Feature pruning:**
+- Reduce from 284 to top 20-30 most important features. V1 showed that intraday features dominate — many macro/calendar features may be adding noise. Methods to evaluate: permutation importance, SHAP, ablation studies by category, and potentially leave-one-out (LOO) importance (pending PNC contact input on methodology).
 
-**2. Trendline & Pattern Features (22 features)** — `ml/features/trendlines.py`
-- Linear regression trendlines fit to swing highs and swing lows separately
-- Convergence/divergence of high/low trendlines → wedge/triangle detection
-- Pattern proxies: wedge, channel, triangle, broadening formation
-- Trendline slope z-scores (current slope vs recent history)
-- Multi-timeframe trendline agreement (1-min, 5-min, 15-min alignment)
-- Distance to trendline (how far price is from the regression line)
+**Ensemble methods:**
+- Combine XGB + LGBM predictions via stacking, blending, or weighted vote instead of picking one winner. V1 showed XGB and LGBM alternate as winners across TP levels — an ensemble could capture both models' strengths.
+- Experiment with training on different date ranges and combining predictions.
 
-**3. Statistical Regime Detection (14 features)** — `ml/features/statistical_regime.py`
-- Hurst exponent (trending vs mean-reverting regime, H > 0.5 = trending)
-- Shannon entropy & spectral entropy of returns (randomness/predictability)
-- Return autocorrelation structure (lag-1 through lag-5)
-- Hidden Markov Model regime probabilities (2-3 state: low-vol, trending, crisis)
-- Change-point detection (structural breaks in the return series)
-- Return skewness & kurtosis (tail risk indicators)
-- `regime_composite` — combined signal from HMM + vol regime + trend alignment
+**Entry timing optimization:**
+- V1 analysis showed 11:00-11:59 entries have the best win rate (77.2%) and EV ($0.085), while 14:00-14:59 entries have 57.5% carry-to-close rate. V2 should either weight entry times or add an entry timing sub-model that predicts the optimal entry window for the day.
 
-**4. Options Positioning — GEX/DEX (9 features)**
-- Net dealer delta exposure (DEX) and normalized DEX
-- GEX change over 1 hour (momentum of gamma positioning)
-- Gamma imbalance: call vs put gamma ratio shift
-- Pin strike proximity: distance to max-gamma strike
-- Probability of staying within IC range (GEX-derived)
-- IC net delta/theta/vega at entry
+**Advanced feature importance:**
+- SHAP (Shapley Additive exPlanations) for per-prediction explanations
+- Permutation importance for model-agnostic feature ranking
+- Leave-one-out / drop-column importance (retrain without each feature, compare AUC)
+- Ablation by category (drop all macro features, retrain, measure impact)
+- Action item: reach out to PNC contact about LOO methodology used on debit card model
 
-**5. Volatility Surface — SVI Parameterization (6 features)**
-- SVI model fit to the 0DTE smile: `a` (min variance), `b` (slope), `c` (convexity)
-- Fit quality (RMSE), min-variance strike location
-- Left/right curvature asymmetry ratio
+**VIX regime gate:**
+- Add a VIX-based regime filter as a soft blocker. When VIX is in certain ranges, the model's predictions may be less reliable. This could be a simple threshold or a learned regime classifier.
 
-**6. Advanced Skew Features (11 features)**
-- 25-delta and 10-delta put-call skew
-- Skew slope via linear regression of IV vs moneyness + z-score vs 20d history
-- Skew convexity (quadratic curvature term)
-- Skew change (hourly), skew flow signal
-- Put/call IV spread at IC short strikes
-- `skew_x_vix_percentile` interaction
+**Neural network baseline:**
+- Try MLP (multi-layer perceptron) after tree models are optimized. Neural nets may capture non-linear feature interactions that trees miss, especially with the enriched intraday feature set.
 
-**7. Jump Detection & Semivariance (15 features)**
-- Bipower variation (robust jump-free vol estimator)
-- Jump test statistic, jump detected flag, relative jump contribution
-- Positive vs negative jump variation (directional jump decomposition)
-- Realized upside/downside semivariance + ratio
-- Realized quarticity (4th moment — detects tail moves)
-- IQ ratio (integrated quarticity jump test)
+### ZDOM V3 — Live Trade Monitoring & Dynamic Stop-Loss
 
-**8. Advanced Realized Vol Estimators (8 features)**
-- Parkinson (high-low range based, 5.2x more efficient than close-to-close)
-- Garman-Klass (OHLC based, 7.4x efficient)
-- Rogers-Satchell (directional semi-estimator)
-- Yang-Zhang (jump-robust, 14x efficient)
-- RV acceleration, vol-of-vol, RV surprise z-score
-- GK RV vs close-to-close RV ratio
+**Mid-trade prediction model:**
+- A second model that runs after entry, using live mark-to-market (MtM) data plus greeks as features. Predicts whether the open position is heading toward TP or SL. Could trigger early exits before the full SL is hit, reducing loss magnitude.
 
-**9. Max Pain & Open Interest (13 features)**
-- Max pain strike + signed/absolute distance from spot
-- Highest call/put OI strikes, call/put wall distances
-- OI concentration (Herfindahl index)
-- OI near money, OI at round numbers
-- OI-weighted average delta
-- Prob of touching short put/call strikes
+**Dynamic stop-loss:**
+- Instead of a fixed 2x credit SL for the entire trade, implement a linearly decreasing SL: 2x credit at entry, decaying toward 1x credit by close. The logic is that as the day progresses and time decay accelerates, the acceptable loss threshold should tighten.
 
-**10. Option Volume & Activity (11 features)**
-- Total/call/put volume, volume distribution (near-money %, OTM put/call %)
-- Unusual activity score (deviation from typical volume patterns)
-- Premium spent on puts vs calls, premium-weighted P/C ratio
-- Volume surge ratio (current vs historical avg for time-of-day)
+**Pending research from Sai:**
+- Gamma exposure dynamics after 3:00 PM — how gamma acceleration affects IC positions in the final hour
+- Bid-ask spread analysis throughout the day — validates the mid-price fill assumption and identifies optimal entry/exit windows
+- Sai identified the optimal trading time period — this analysis should be incorporated to validate or adjust the 10:00 AM start and 3:00 PM cutoff
 
-**11. Spreads & Liquidity (9 features)**
-- Bid-ask spread at ATM (absolute and relative)
-- Spreads at short put/call strikes
-- Spread slope vs OTM distance
-- Wing spread ratio, put/call wing liquidity, liquidity asymmetry
+### ZDOM V4 — Structure Selection
 
-**12. Interaction Features (9 features)**
-- `vrp_x_gex_sign` — VRP × GEX regime (mean-revert vs trend)
-- `semivar_x_gex` — downside semivariance × GEX sign
-- `skew_x_vix_percentile` — skew slope × VIX percentile
-- `jump_x_vix_change` — jump detected × VIX % change
-- `orb_width_x_adx` — opening range × ADX
-- `autocorr_x_efficiency` — autocorrelation × efficiency ratio
-- `fomc_x_vrp` — FOMC flag × VRP
-- `gap_x_vix` — overnight gap × VIX level
-- `max_pain_x_oi_conc` — max pain distance × OI concentration
+**Strategy selection model:**
+- Given the day's market conditions (regime, vol level, skew, positioning), predict which option structure performs best:
+  - Iron Condor (low vol, no directional bias, VIX 15-25)
+  - Iron Butterfly (very low vol, tight range expected)
+  - Put Credit Spread (bullish bias detected)
+  - Call Credit Spread (bearish bias, risk-off)
+  - Jade Lizard (bullish with elevated put skew)
+  - Wide Strangle (post-FOMC resolution, expected large move)
+- This is a multi-class classification problem where the target is "which structure had the best risk-adjusted return today"
+- Requires building target simulations for each structure type (currently only ICs are simulated)
 
-#### V2 Data Availability
+### ZDOM V5+ — Future Considerations
 
-| Tier | Source | New Features | Status |
-|------|--------|-------------|--------|
-| Tier 1 | SPX 1-min OHLCV (have) | S/R, trendlines, regime, advanced technicals (~66) | Ready — compute from existing data |
-| Tier 2 | 0DTE intraday greeks (have) | GEX/DEX, skew, SVI, OI, volume, spreads (~70) | Ready — compute from existing data |
-| Tier 3 | VIX/VIX1D 1-min (have) | Enhanced VIX features, VRP | Ready — compute from existing data |
-
-All V2 features are computable from data we already have. No new data sources required.
-
-#### V2 Other Improvements
-- **Fee-adjusted EV**: incorporate Tradier round-trip costs ($6.43/IC) into skip rate analysis
-- **Advanced feature importance**: SHAP values, permutation importance, category-level ablation study
-- **Feature pruning**: drop low-importance features from V1's 284 to reduce noise
-- **Ensemble methods**: stacking XGB + LGBM predictions, potentially adding CatBoost
-- **Walk-forward CV**: replace static 70/15/15 split with rolling walk-forward validation
+- **Strike selection optimization**: given TRADE and structure type, what delta for short/long legs? Currently fixed per strategy — a model could dynamically select deltas based on the vol surface shape.
+- **Layered entry**: open one wing first, wait for confirmation, add second wing (or don't). Requires real-time position management logic.
+- **Portfolio-level optimization**: across multiple simultaneous positions, optimize total portfolio Greeks (delta-neutral, gamma exposure limits).
+- **Live data pipeline**: real-time scoring via ThetaData websocket feed rather than batch processing.
 
 ---
 
@@ -710,3 +662,8 @@ All V2 features are computable from data we already have. No new data sources re
 | 2026-03-14 | Hard blockers separated from model — applied at execution only, not during training |
 | 2026-03-14 | Baseline defined as enter-everything (no model, no blockers) for clean comparison |
 | 2026-03-14 | ZDOM V1 training: 18 models (9 TP × 2 algorithms), 50 Optuna trials each |
+| 2026-03-15 | Walk-forward backtest on holdout: S1 +157% at 30% skip, S2 +165% at 36% skip |
+| 2026-03-15 | IC_05d identified as critical for re-entry chaining (without it, returns collapse) |
+| 2026-03-15 | Expanded version roadmap: V2-V5 detailed with fee-adjusted targets, intraday features, ensemble, dynamic SL |
+| 2026-03-15 | Full project pushed to GitHub (syeluru/iv-rank-scanner/ml/zdom_v1/) |
+| 2026-03-15 | Project reorganized: data_collection -> feature_engineering -> data_join -> models -> analysis -> execution |
