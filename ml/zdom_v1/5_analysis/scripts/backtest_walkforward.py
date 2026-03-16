@@ -8,15 +8,24 @@ Modes:
   --shadow-5d:      Includes IC_05d_25w in model selection but "shadow places" them
                     (locks BP, follows TP/SL lifecycle, but $0 PnL). Skip 10-40%.
 
+Sizing:
+  --max-qty 0       Unlimited (default) — full buying power
+  --max-qty 1       Fixed 1 contract per entry
+  --max-qty 10      Cap at 10 contracts per entry (S2: per position, not total)
+
+Data split:
+  --data-split holdout   Default — use holdout set
+  --data-split test      Use test set (between train and holdout)
+
 Strategies:
   1. "Best EV, Max Contracts" — single best combo, all contracts
   2. "Diversified, Max Buying Power" — spread across top-K combos
 
 Usage:
-  python3 scripts/backtest_walkforward.py                    # no-5d mode
-  python3 scripts/backtest_walkforward.py --shadow-5d        # shadow 5-delta mode
-  python3 scripts/backtest_walkforward.py --walkthrough      # 1-day trace only
-  python3 scripts/backtest_walkforward.py --strategy 1       # single strategy
+  python3 scripts/backtest_walkforward.py --shadow-5d                     # shadow, holdout
+  python3 scripts/backtest_walkforward.py --shadow-5d --max-qty 1         # 1-contract flat
+  python3 scripts/backtest_walkforward.py --shadow-5d --data-split test   # test data
+  python3 scripts/backtest_walkforward.py --shadow-5d --max-qty 10        # 10-cap
 """
 
 import argparse
@@ -473,14 +482,18 @@ def _get_candidates(day_df, entry_time, ev_lookup, cutoffs, skip_rate,
 
 
 def simulate_strategy1(day_df, ev_lookup, cutoffs, skip_rate, exit_slip,
-                       portfolio, optimization="joint", shadow_5d=False):
+                       portfolio, optimization="joint", shadow_5d=False,
+                       max_qty=0):
     """Strategy 1: Best EV, Max Contracts.
 
     Pick best combo, enter all contracts. Re-enter after TP, stop after SL.
     If shadow_5d=True, 5-delta trades lock BP but generate $0 PnL.
+    max_qty: 0=unlimited, >0=cap contracts per entry.
     """
     trades = []
     buying_power = int(portfolio // BUYING_POWER_PER_CONTRACT)
+    if max_qty > 0:
+        buying_power = min(buying_power, max_qty)
     if buying_power <= 0:
         return trades, portfolio
 
@@ -552,6 +565,8 @@ def simulate_strategy1(day_df, ev_lookup, cutoffs, skip_rate, exit_slip,
                 break
             # Update buying power for re-entry
             buying_power = int(portfolio // BUYING_POWER_PER_CONTRACT)
+            if max_qty > 0:
+                buying_power = min(buying_power, max_qty)
             if buying_power <= 0:
                 break
         else:
@@ -561,12 +576,14 @@ def simulate_strategy1(day_df, ev_lookup, cutoffs, skip_rate, exit_slip,
 
 
 def simulate_strategy2(day_df, ev_lookup, cutoffs, skip_rate, exit_slip,
-                       portfolio, optimization="joint", shadow_5d=False):
+                       portfolio, optimization="joint", shadow_5d=False,
+                       max_qty=0):
     """Strategy 2: Diversified, Max Buying Power.
 
     Distribute contracts across top-K combos. Replace TP exits, not SL.
     If shadow_5d=True, 5-delta trades occupy allocation slots and lock BP
     but generate $0 PnL.
+    max_qty: 0=unlimited, >0=cap contracts per individual position.
     """
     trades = []
     total_bp = int(portfolio // BUYING_POWER_PER_CONTRACT)
@@ -621,6 +638,8 @@ def simulate_strategy2(day_df, ev_lookup, cutoffs, skip_rate, exit_slip,
         new_positions = []
         for i, cand in enumerate(selected):
             qty = base + (1 if i < extra else 0)
+            if max_qty > 0:
+                qty = min(qty, max_qty)
             if qty <= 0:
                 continue
 
@@ -719,7 +738,7 @@ def simulate_strategy2(day_df, ev_lookup, cutoffs, skip_rate, exit_slip,
 
 def simulate(holdout_scored, strategy_type, exit_slip, skip_rate,
              ev_lookup, cutoffs, optimization="joint",
-             start_portfolio=START_PORTFOLIO, shadow_5d=False):
+             start_portfolio=START_PORTFOLIO, shadow_5d=False, max_qty=0):
     """Run full simulation across all holdout days.
 
     Returns: (equity_curve, trade_log, summary_stats)
@@ -737,11 +756,13 @@ def simulate(holdout_scored, strategy_type, exit_slip, skip_rate,
             day_trades, portfolio = simulate_strategy1(
                 day_df, ev_lookup, cutoffs, skip_rate, exit_slip,
                 portfolio, optimization, shadow_5d=shadow_5d,
+                max_qty=max_qty,
             )
         else:
             day_trades, portfolio = simulate_strategy2(
                 day_df, ev_lookup, cutoffs, skip_rate, exit_slip,
                 portfolio, optimization, shadow_5d=shadow_5d,
+                max_qty=max_qty,
             )
 
         all_trades.extend(day_trades)
@@ -998,21 +1019,45 @@ def main():
                         help="Exit slippage values (default: 0.00 to 0.30 in $0.05 increments)")
     parser.add_argument("--portfolio", type=float, default=START_PORTFOLIO,
                         help=f"Starting portfolio (default: ${START_PORTFOLIO:,})")
+    parser.add_argument("--max-qty", type=int, default=0,
+                        help="Max contracts per entry (0=unlimited, 1=flat, 10=capped)")
+    parser.add_argument("--data-split", choices=["holdout", "test"], default="holdout",
+                        help="Which data split to simulate on (default: holdout)")
     args = parser.parse_args()
 
     # Set mode-dependent defaults
     global STRATEGIES, OUTPUT_DIR
     shadow_5d = args.shadow_5d
+    max_qty = args.max_qty
+    data_split = args.data_split
+
     if shadow_5d:
         STRATEGIES = STRATEGIES_ALL
         default_skip_rates = SKIP_RATES_SHADOW
         mode_label = "SHADOW 5-DELTA"
-        OUTPUT_DIR = PROJECT_DIR / "output" / "backtest_shadow5d"
     else:
         STRATEGIES = STRATEGIES_NO5D
         default_skip_rates = SKIP_RATES_NO5D
         mode_label = "NO 5-DELTA"
+
+    # Build output directory name
+    out_name = "backtest_shadow5d" if shadow_5d else "backtest"
+    if data_split == "test":
+        out_name += "_test"
+    if max_qty == 1:
+        out_name += "_1ct"
+    elif max_qty > 1:
+        out_name += f"_{max_qty}cap"
+    OUTPUT_DIR = PROJECT_DIR / "output" / out_name
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Sizing label
+    if max_qty == 0:
+        sizing_label = "Max BP (unlimited)"
+    elif max_qty == 1:
+        sizing_label = "Fixed 1 contract"
+    else:
+        sizing_label = f"Capped at {max_qty} contracts/entry"
 
     skip_rates = args.skip_rates or default_skip_rates
     exit_slips = args.slips or EXIT_SLIPS
@@ -1022,12 +1067,15 @@ def main():
     print(f"  ZDOM V1 Walk-Forward Backtest Simulator — {mode_label}")
     print(f"{'='*80}")
     print(f"  Mode:        {mode_label}")
+    print(f"  Data split:  {data_split.upper()}")
+    print(f"  Sizing:      {sizing_label}")
     print(f"  Strategies:  {strategies}")
     print(f"  IC Deltas:   {STRATEGIES}")
     print(f"  Slippage:    {exit_slips}")
     print(f"  Skip rates:  {len(skip_rates)} values ({min(skip_rates):.0%} → {max(skip_rates):.0%})")
     print(f"  Portfolio:   ${args.portfolio:,.2f}")
     print(f"  Tuning:      {'OFF' if args.no_tune else f'Optuna ({args.n_trials} trials)'}")
+    print(f"  Output:      {OUTPUT_DIR}")
 
     # Phase 1: Load data
     print(f"\n── Phase 1: Data Loading ──")
@@ -1088,21 +1136,29 @@ def main():
     print(f"\n── Phase 3: Pre-computing EV & Cutoffs ──")
     ev_lookup = precompute_ev_lookup(train_df, feature_cols)
 
-    # Score holdout
-    print(f"\n── Phase 4: Scoring Holdout ──")
-    holdout_scored = score_holdout(holdout_df, models, feature_cols)
+    # Select data split for simulation
+    if data_split == "test":
+        sim_df = test_df
+        split_label = "TEST"
+    else:
+        sim_df = holdout_df
+        split_label = "HOLDOUT"
+
+    # Score simulation data
+    print(f"\n── Phase 4: Scoring {split_label} ──")
+    sim_scored = score_holdout(sim_df, models, feature_cols)
 
     # Pre-compute skip cutoffs
-    cutoffs = precompute_skip_cutoffs(holdout_scored, skip_rates)
+    cutoffs = precompute_skip_cutoffs(sim_scored, skip_rates)
     print(f"  Cutoffs computed for {len(cutoffs)} (strategy, TP, skip_rate) combos")
 
     # Walkthrough mode
     if args.walkthrough:
-        run_walkthrough(holdout_scored, ev_lookup, cutoffs)
+        run_walkthrough(sim_scored, ev_lookup, cutoffs)
         return
 
     # Phase 5: Run all simulations
-    print(f"\n── Phase 5: Running Simulations ──")
+    print(f"\n── Phase 5: Running Simulations ({split_label}) ──")
     total_sims = len(strategies) * len(exit_slips) * len(skip_rates)
     print(f"  {total_sims} simulation configs")
 
@@ -1120,11 +1176,12 @@ def main():
                 key = f"S{strat}_slip{slip:.2f}_skip{sr:.2f}"
 
                 eq, trades, summary = simulate(
-                    holdout_scored, strat, slip, sr,
+                    sim_scored, strat, slip, sr,
                     ev_lookup, cutoffs,
                     optimization="joint",
                     start_portfolio=args.portfolio,
                     shadow_5d=shadow_5d,
+                    max_qty=max_qty,
                 )
 
                 all_summaries.append(summary)

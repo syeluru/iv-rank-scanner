@@ -23,6 +23,10 @@ from ml.features.v8.positioning import compute_positioning_features
 from ml.features.v8.order_flow import compute_order_flow_features
 from ml.features.v8.cross_asset import compute_cross_asset_features
 from ml.features.v8.market_internals import compute_market_internals_features
+from ml.features.v8.price_action import compute_price_action_features
+from ml.features.v8.support_resistance import compute_support_resistance_features
+from ml.features.v8.trendlines import compute_trendline_features
+from ml.features.v8.statistical_regime import compute_statistical_regime_features
 from ml.features.technical_indicators import compute_all_technical_indicators
 
 
@@ -138,7 +142,37 @@ def compute_all_features(data: dict) -> dict:
     )
     features.update(internals_features)
 
-    # 10. Technical Indicators (11 features from existing v4 module)
+    # 10. Price Action (~32 features)
+    pa_features = compute_price_action_features(
+        spx_1m=spx_1m,
+        vix_1m=vix_1m,
+    )
+    features.update(pa_features)
+
+    # 11. Support & Resistance (~30 features)
+    sr_features = compute_support_resistance_features(
+        spx_1m=spx_1m,
+        prior_days_1m=data.get('prior_days_1m'),
+        spx_price=spx_price,
+    )
+    features.update(sr_features)
+
+    # 12. Trendlines (~21 features)
+    tl_features = compute_trendline_features(
+        spx_1m=spx_1m,
+        prior_days_1m=data.get('prior_days_1m'),
+        spx_price=spx_price,
+    )
+    features.update(tl_features)
+
+    # 13. Statistical & Regime (~14 features)
+    stat_features = compute_statistical_regime_features(
+        spx_1m=spx_1m,
+        prior_days_1m=data.get('prior_days_1m'),
+    )
+    features.update(stat_features)
+
+    # 14. Technical Indicators (11 features from existing v4 module)
     # Resample 1-min to 5-min for the technical indicators
     spx_5m = _resample_to_5min(spx_1m) if not spx_1m.empty else pd.DataFrame()
     tech_features = compute_all_technical_indicators(spx_5m)

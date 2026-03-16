@@ -159,6 +159,11 @@ def compute_realized_vol_features(
         "rv_surprise": np.nan,
         "max_5min_return_abs": np.nan,
         "overnight_to_intraday_ratio": np.nan,
+        "vrp_intraday_roc": np.nan,
+        "yang_zhang_rv_30m": np.nan,
+        "rv_5m_30m_ratio": np.nan,
+        "realized_skewness_30m": np.nan,
+        "realized_kurtosis_30m": np.nan,
     }
 
     if spx_1m is None or spx_1m.empty or len(spx_1m) < 6:
@@ -428,5 +433,83 @@ def compute_realized_vol_features(
             result["overnight_to_intraday_ratio"] = np.nan
     else:
         result["overnight_to_intraday_ratio"] = np.nan
+
+    # --- 31. vrp_intraday_roc (rate of change of intraday VRP proxy) ---
+    if n_ret >= 12:
+        rv_first_half = float(np.sum(returns_5m[:n_ret // 2] ** 2))
+        rv_second_half = float(np.sum(returns_5m[n_ret // 2:] ** 2))
+        if rv_first_half > 1e-15:
+            result["vrp_intraday_roc"] = float((rv_second_half - rv_first_half) / rv_first_half)
+        else:
+            result["vrp_intraday_roc"] = np.nan
+    else:
+        result["vrp_intraday_roc"] = np.nan
+
+    # --- 32. yang_zhang_rv_30m (YZ estimator on last 6 5-min bars) ---
+    if n5 >= 6:
+        o6 = o5[-6:]
+        h6 = h5[-6:]
+        l6 = l5[-6:]
+        c6 = c5[-6:]
+        mask6 = (o6 > 0) & (h6 > 0) & (l6 > 0) & (c6 > 0) & (h6 >= l6)
+        if np.sum(mask6) >= 3:
+            o_m = o6[mask6]
+            h_m = h6[mask6]
+            l_m = l6[mask6]
+            c_m = c6[mask6]
+            n_v = len(o_m)
+            log_oc = np.log(o_m[1:] / c_m[:-1])
+            overnight_var = np.var(log_oc, ddof=1) if len(log_oc) > 1 else 0.0
+            log_co = np.log(c_m / o_m)
+            close_open_var = np.var(log_co, ddof=1) if len(log_co) > 1 else 0.0
+            rs_vals = (
+                np.log(h_m / c_m) * np.log(h_m / o_m)
+                + np.log(l_m / c_m) * np.log(l_m / o_m)
+            )
+            rs_var = max(np.mean(rs_vals), 0.0)
+            k = 0.34 / (1.34 + (n_v + 1) / (n_v - 1))
+            yz_var = overnight_var + k * close_open_var + (1 - k) * rs_var
+            result["yang_zhang_rv_30m"] = float(np.sqrt(max(yz_var, 0.0) * 78 * 252) * 100)
+        else:
+            result["yang_zhang_rv_30m"] = np.nan
+    else:
+        result["yang_zhang_rv_30m"] = np.nan
+
+    # --- 33. rv_5m_30m_ratio (recent vs session RV ratio) ---
+    if n_ret >= 6:
+        rv_recent_6 = float(np.sum(returns_5m[-6:] ** 2))
+        if rv_5min > 1e-15:
+            result["rv_5m_30m_ratio"] = float(rv_recent_6 / rv_5min)
+        else:
+            result["rv_5m_30m_ratio"] = np.nan
+    else:
+        result["rv_5m_30m_ratio"] = np.nan
+
+    # --- 34. realized_skewness_30m ---
+    lookback = min(6, n_ret)
+    if lookback >= 3:
+        window_rets = returns_5m[-lookback:]
+        std_r = np.std(window_rets, ddof=1)
+        if std_r > 1e-15:
+            result["realized_skewness_30m"] = float(
+                np.mean(((window_rets - np.mean(window_rets)) / std_r) ** 3)
+            )
+        else:
+            result["realized_skewness_30m"] = np.nan
+    else:
+        result["realized_skewness_30m"] = np.nan
+
+    # --- 35. realized_kurtosis_30m ---
+    if lookback >= 3:
+        window_rets = returns_5m[-lookback:]
+        std_r = np.std(window_rets, ddof=1)
+        if std_r > 1e-15:
+            result["realized_kurtosis_30m"] = float(
+                np.mean(((window_rets - np.mean(window_rets)) / std_r) ** 4) - 3.0
+            )
+        else:
+            result["realized_kurtosis_30m"] = np.nan
+    else:
+        result["realized_kurtosis_30m"] = np.nan
 
     return result

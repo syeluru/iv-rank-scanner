@@ -380,4 +380,131 @@ def compute_time_event_features(
     # --- 25. week_of_year ---
     result["week_of_year"] = float(dt.isocalendar()[1])
 
+    # --- 26. theta_decay_proxy: 1/sqrt(minutes_to_close) ---
+    if minutes_to_close > 0:
+        result["theta_decay_proxy"] = float(1.0 / np.sqrt(minutes_to_close))
+    else:
+        result["theta_decay_proxy"] = float(1.0 / np.sqrt(1))  # cap at 1 min
+
+    # --- 27. session_fraction_squared ---
+    session_frac = max(minutes_since_open, 0) / 390.0
+    result["session_fraction_squared"] = float(session_frac ** 2)
+
+    # --- 28-30. Gaussian proximity kernels for FOMC/CPI/NFP ---
+    # exp(-0.5*(hours/24)^2) — peaks at event day, decays over days
+    hours_to_fomc = _hours_to_specific_event(dt, FOMC_DATES)
+    hours_to_cpi = _hours_to_specific_event(dt, CPI_DATES)
+    hours_to_nfp = _hours_to_nfp_event(dt)
+
+    result["fomc_proximity_kernel"] = float(
+        np.exp(-0.5 * (hours_to_fomc / 24.0) ** 2)
+    ) if np.isfinite(hours_to_fomc) else 0.0
+
+    result["cpi_proximity_kernel"] = float(
+        np.exp(-0.5 * (hours_to_cpi / 24.0) ** 2)
+    ) if np.isfinite(hours_to_cpi) else 0.0
+
+    result["nfp_proximity_kernel"] = float(
+        np.exp(-0.5 * (hours_to_nfp / 24.0) ** 2)
+    ) if np.isfinite(hours_to_nfp) else 0.0
+
+    # --- 31-33. Post-event hours (hours since last FOMC/CPI/NFP) ---
+    result["post_fomc_hours"] = _hours_since_event(dt, FOMC_DATES)
+    result["post_cpi_hours"] = _hours_since_event(dt, CPI_DATES)
+    result["post_nfp_hours"] = _hours_since_nfp(dt)
+
+    # --- 34. Pre-event compression flag ---
+    # Within 24h before any macro event
+    min_hours_ahead = min(
+        h for h in [hours_to_fomc, hours_to_cpi, hours_to_nfp]
+        if np.isfinite(h)
+    ) if any(np.isfinite(h) for h in [hours_to_fomc, hours_to_cpi, hours_to_nfp]) else np.nan
+    result["pre_event_compression"] = 1.0 if (np.isfinite(min_hours_ahead) and 0 < min_hours_ahead <= 24) else 0.0
+
+    # --- 35. Event cluster density (number of macro events within 5 trading days) ---
+    cluster_count = 0
+    today = dt.date()
+    for offset in range(-5, 6):
+        check_date = today + timedelta(days=offset)
+        date_str_check = check_date.strftime("%Y-%m-%d")
+        if date_str_check in FOMC_DATES or date_str_check in CPI_DATES or _is_nfp_day(
+            datetime(check_date.year, check_date.month, check_date.day)
+        ):
+            cluster_count += 1
+    result["event_cluster_density"] = float(cluster_count)
+
     return result
+
+
+def _hours_to_specific_event(dt: datetime, event_dates: set) -> float:
+    """Hours until next event from the given set."""
+    today = dt.date()
+    candidates = []
+    for ds in event_dates:
+        d = datetime.strptime(ds, "%Y-%m-%d").date()
+        if d >= today:
+            candidates.append(d)
+    if not candidates:
+        return np.nan
+    next_event = min(candidates)
+    # FOMC at 14:00, CPI/NFP at 8:30
+    next_str = next_event.strftime("%Y-%m-%d")
+    event_hour = 14 if next_str in FOMC_DATES else 8
+    event_minute = 0 if next_str in FOMC_DATES else 30
+    event_dt = datetime(next_event.year, next_event.month, next_event.day, event_hour, event_minute)
+    naive_dt = dt.replace(tzinfo=None) if dt.tzinfo else dt
+    delta = (event_dt - naive_dt).total_seconds() / 3600.0
+    return float(max(delta, 0.0))
+
+
+def _hours_to_nfp_event(dt: datetime) -> float:
+    """Hours until next NFP (first Friday of month)."""
+    today = dt.date()
+    for m_offset in range(3):
+        year = dt.year
+        month = dt.month + m_offset
+        if month > 12:
+            year += 1
+            month -= 12
+        nfp = _first_friday(year, month).date()
+        if nfp >= today:
+            event_dt = datetime(nfp.year, nfp.month, nfp.day, 8, 30)
+            naive_dt = dt.replace(tzinfo=None) if dt.tzinfo else dt
+            delta = (event_dt - naive_dt).total_seconds() / 3600.0
+            return float(max(delta, 0.0))
+    return np.nan
+
+
+def _hours_since_event(dt: datetime, event_dates: set) -> float:
+    """Hours since most recent past event."""
+    today = dt.date()
+    candidates = []
+    for date_str in event_dates:
+        d = datetime.strptime(date_str, "%Y-%m-%d").date()
+        if d <= today:
+            candidates.append(d)
+    if not candidates:
+        return np.nan
+    last_event = max(candidates)
+    event_dt = datetime(last_event.year, last_event.month, last_event.day, 14, 0)
+    naive_dt = dt.replace(tzinfo=None) if dt.tzinfo else dt
+    delta = (naive_dt - event_dt).total_seconds() / 3600.0
+    return float(max(delta, 0.0))
+
+
+def _hours_since_nfp(dt: datetime) -> float:
+    """Hours since most recent NFP."""
+    today = dt.date()
+    for m_offset in range(3):
+        year = dt.year
+        month = dt.month - m_offset
+        if month < 1:
+            year -= 1
+            month += 12
+        nfp = _first_friday(year, month).date()
+        if nfp <= today:
+            event_dt = datetime(nfp.year, nfp.month, nfp.day, 8, 30)
+            naive_dt = dt.replace(tzinfo=None) if dt.tzinfo else dt
+            delta = (naive_dt - event_dt).total_seconds() / 3600.0
+            return float(max(delta, 0.0))
+    return np.nan

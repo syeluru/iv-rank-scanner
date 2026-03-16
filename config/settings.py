@@ -32,6 +32,17 @@ class Settings(BaseSettings):
     ALPACA_PAPER_TRADING: bool = True  # Use paper trading endpoint
     ALPACA_ENABLE_STREAMING: bool = True
 
+    # ===== Tradier Configuration =====
+    TRADIER_API_TOKEN: str = ""
+    TRADIER_ACCOUNT_ID: str = ""
+    TRADIER_SANDBOX: bool = True  # Use sandbox endpoint for paper trading
+    TRADIER_RATE_LIMIT_CALLS: int = 120  # 120/min production, 60/min sandbox
+    TRADIER_RATE_LIMIT_PERIOD: int = 60
+
+    # ===== Broker Selection =====
+    # Choose broker: 'schwab' or 'tradier'
+    BROKER: str = "schwab"
+
     # ===== ThetaData Configuration =====
     THETADATA_USERNAME: str = ""
     THETADATA_PASSWORD: str = ""
@@ -277,6 +288,10 @@ class Settings(BaseSettings):
             and self.SCHWAB_API_SECRET
             and self.SCHWAB_ACCOUNT_ID
         )
+
+    def validate_tradier_credentials(self) -> bool:
+        """Check if Tradier API credentials are configured."""
+        return bool(self.TRADIER_API_TOKEN and self.TRADIER_ACCOUNT_ID)
 
     def validate_alpaca_credentials(self) -> bool:
         """Check if Alpaca API credentials are configured."""

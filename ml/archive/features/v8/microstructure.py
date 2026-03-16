@@ -45,7 +45,10 @@ def _get_atm_rows(chain: pd.DataFrame, spx_price: float) -> pd.DataFrame:
 
     dists = np.abs(unique_strikes - spx_price)
     n_strikes = min(2, len(unique_strikes))
-    nearest_idx = np.argpartition(dists, n_strikes)[:n_strikes]
+    if n_strikes <= 1:
+        nearest_idx = np.array([np.argmin(dists)]) if len(dists) > 0 else np.array([], dtype=int)
+    else:
+        nearest_idx = np.argpartition(dists, n_strikes)[:n_strikes]
     nearest_strikes = unique_strikes[nearest_idx]
 
     return df[df['strike'].isin(nearest_strikes)]

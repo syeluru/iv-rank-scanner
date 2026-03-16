@@ -4069,8 +4069,39 @@ def main():
                         help='Testing: skip ML/ThetaData')
     parser.add_argument('--strikes', type=str, default=None,
                         help='Manual short strikes as "PUT,CALL" (e.g. "6750,6920"). Bypasses delta selection.')
+    parser.add_argument('--env-file', type=str, default=None,
+                        help='Path to alternate .env file (e.g. .env.account2) for multi-account support')
 
     args = parser.parse_args()
+
+    # Reload settings from alternate .env file if specified
+    if args.env_file:
+        from config.settings import Settings
+        import config.settings as settings_module
+        env_path = Path(args.env_file)
+        if not env_path.exists():
+            print(f"Error: env file not found: {env_path}")
+            return
+        new_settings = Settings(_env_file=str(env_path))
+        settings_module.settings = new_settings
+        # Re-import so our local `settings` ref points to the new object
+        globals()['settings'] = new_settings
+        # Propagate new settings to all modules that cached the import
+        import execution.broker_api.schwab_client as schwab_mod
+        import execution.broker_api.auth_manager as auth_mgr_mod
+        import execution.order_manager.ic_order_builder as ic_mod
+        schwab_mod.settings = new_settings
+        auth_mgr_mod.settings = new_settings
+        ic_mod.settings = new_settings
+        # Reinitialize auth_manager with new credentials/token path
+        from execution.broker_api.auth_manager import AuthManager
+        new_auth = AuthManager(
+            api_key=new_settings.SCHWAB_API_KEY,
+            app_secret=new_settings.SCHWAB_API_SECRET,
+            token_path=new_settings.SCHWAB_TOKEN_PATH,
+        )
+        auth_mgr_mod.auth_manager = new_auth
+        print(f"Loaded settings from {env_path} (account: {new_settings.SCHWAB_ACCOUNT_ID})")
 
     # Parse manual strikes
     manual_strikes = None
@@ -4101,8 +4132,9 @@ def main():
 
     # Configure logging (rotation handles multi-day persistence)
     logger.remove()
+    acct_suffix = f"_{settings.SCHWAB_ACCOUNT_ID}" if args.env_file else ""
     logger.add(sys.stderr, level="INFO", format="{time:HH:mm:ss} | {level:<7} | {message}")
-    log_path = Path("logs") / "zero_dte_bot.log"
+    log_path = Path("logs") / f"zero_dte_bot{acct_suffix}.log"
     log_path.parent.mkdir(exist_ok=True)
     logger.add(str(log_path), level="DEBUG", rotation="10 MB", retention="30 days")
 

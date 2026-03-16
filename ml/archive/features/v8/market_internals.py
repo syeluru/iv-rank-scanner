@@ -198,6 +198,27 @@ def compute_market_internals_features(spx_1m: pd.DataFrame, vix_1m: pd.DataFrame
     else:
         features['vix_intraday_change_pct'] = np.nan
 
+    # 16. vix_sma_30min - 30-minute simple moving average of VIX close
+    if has_vix:
+        vix = vix_1m.copy().reset_index(drop=True)
+        vix_c = vix['close'].values.astype(np.float64)
+        lookback = min(30, len(vix_c))
+        if lookback >= 1:
+            features['vix_sma_30min'] = float(np.mean(vix_c[-lookback:]))
+        else:
+            features['vix_sma_30min'] = np.nan
+    else:
+        features['vix_sma_30min'] = np.nan
+
+    # 17. vix_sma_30min_dist_pct - current VIX vs its 30-min SMA (% deviation)
+    vix_sma = features.get('vix_sma_30min', np.nan)
+    if has_vix and not np.isnan(vix_sma) and vix_sma > 0:
+        vix = vix_1m.copy().reset_index(drop=True)
+        vix_current = float(vix['close'].iloc[-1])
+        features['vix_sma_30min_dist_pct'] = (vix_current - vix_sma) / vix_sma * 100
+    else:
+        features['vix_sma_30min_dist_pct'] = np.nan
+
     return features
 
 
@@ -355,4 +376,5 @@ def _all_feature_names() -> list:
         'opening_range_width', 'opening_range_breakout_status',
         'morning_trend_established', 'range_expansion_rate',
         'spx_vix_correlation', 'vix_intraday_change_pct',
+        'vix_sma_30min', 'vix_sma_30min_dist_pct',
     ]
