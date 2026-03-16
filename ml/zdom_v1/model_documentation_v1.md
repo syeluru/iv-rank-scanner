@@ -572,9 +572,125 @@ V1 uses gain-based importance only. For V2, we should evaluate more rigorous met
 | Version | Purpose | Status |
 |---------|---------|--------|
 | **ZDOM V1** | Entry go/no-go: should I enter this IC at this minute? | **Training** |
-| ZDOM V2 | VIX/VIX1D intraday features, ensemble methods, feature pruning, fee-adjusted EV, advanced feature importance (see below) | Planned |
+| ZDOM V2 | Massively expanded intraday feature set (see V2 Feature Plan below), fee-adjusted EV, advanced feature importance | Planned |
 | ZDOM V3 | Live trade monitoring: predict mid-trade TP vs SL outcome, dynamic stop-loss | Planned |
 | ZDOM V4 | Structure selection: IC vs butterfly vs jade lizard vs credit spread by regime | Planned |
+
+### ZDOM V2 Feature Plan
+
+V2 expands V1's 284 features with deep intraday market microstructure, options positioning, volatility surface modeling, and cross-day support/resistance. These features were researched and prototyped in the v8 feature engineering effort (see `ml/features/` and `ml/archive/features/v8/`). The goal is to give the model much richer minute-level context about *why* a given entry is risky or safe — not just what the market looks like, but what the options market is telling us.
+
+#### New Feature Categories for V2
+
+**1. Support/Resistance Across Days (30 features)** — `ml/features/support_resistance.py`
+- Prior-day high/low/close as S/R levels + distance-to-level features
+- 5-day rolling range analysis: expanding/contracting range, position within range
+- Peak/valley detection on multi-day price history (local extrema as key levels)
+- Fibonacci retracements from recent swing high/low
+- Camarilla pivot points (R1-R4, S1-S4)
+- Swing structure: higher highs/higher lows count, trend quality score
+
+**2. Trendline & Pattern Features (22 features)** — `ml/features/trendlines.py`
+- Linear regression trendlines fit to swing highs and swing lows separately
+- Convergence/divergence of high/low trendlines → wedge/triangle detection
+- Pattern proxies: wedge, channel, triangle, broadening formation
+- Trendline slope z-scores (current slope vs recent history)
+- Multi-timeframe trendline agreement (1-min, 5-min, 15-min alignment)
+- Distance to trendline (how far price is from the regression line)
+
+**3. Statistical Regime Detection (14 features)** — `ml/features/statistical_regime.py`
+- Hurst exponent (trending vs mean-reverting regime, H > 0.5 = trending)
+- Shannon entropy & spectral entropy of returns (randomness/predictability)
+- Return autocorrelation structure (lag-1 through lag-5)
+- Hidden Markov Model regime probabilities (2-3 state: low-vol, trending, crisis)
+- Change-point detection (structural breaks in the return series)
+- Return skewness & kurtosis (tail risk indicators)
+- `regime_composite` — combined signal from HMM + vol regime + trend alignment
+
+**4. Options Positioning — GEX/DEX (9 features)**
+- Net dealer delta exposure (DEX) and normalized DEX
+- GEX change over 1 hour (momentum of gamma positioning)
+- Gamma imbalance: call vs put gamma ratio shift
+- Pin strike proximity: distance to max-gamma strike
+- Probability of staying within IC range (GEX-derived)
+- IC net delta/theta/vega at entry
+
+**5. Volatility Surface — SVI Parameterization (6 features)**
+- SVI model fit to the 0DTE smile: `a` (min variance), `b` (slope), `c` (convexity)
+- Fit quality (RMSE), min-variance strike location
+- Left/right curvature asymmetry ratio
+
+**6. Advanced Skew Features (11 features)**
+- 25-delta and 10-delta put-call skew
+- Skew slope via linear regression of IV vs moneyness + z-score vs 20d history
+- Skew convexity (quadratic curvature term)
+- Skew change (hourly), skew flow signal
+- Put/call IV spread at IC short strikes
+- `skew_x_vix_percentile` interaction
+
+**7. Jump Detection & Semivariance (15 features)**
+- Bipower variation (robust jump-free vol estimator)
+- Jump test statistic, jump detected flag, relative jump contribution
+- Positive vs negative jump variation (directional jump decomposition)
+- Realized upside/downside semivariance + ratio
+- Realized quarticity (4th moment — detects tail moves)
+- IQ ratio (integrated quarticity jump test)
+
+**8. Advanced Realized Vol Estimators (8 features)**
+- Parkinson (high-low range based, 5.2x more efficient than close-to-close)
+- Garman-Klass (OHLC based, 7.4x efficient)
+- Rogers-Satchell (directional semi-estimator)
+- Yang-Zhang (jump-robust, 14x efficient)
+- RV acceleration, vol-of-vol, RV surprise z-score
+- GK RV vs close-to-close RV ratio
+
+**9. Max Pain & Open Interest (13 features)**
+- Max pain strike + signed/absolute distance from spot
+- Highest call/put OI strikes, call/put wall distances
+- OI concentration (Herfindahl index)
+- OI near money, OI at round numbers
+- OI-weighted average delta
+- Prob of touching short put/call strikes
+
+**10. Option Volume & Activity (11 features)**
+- Total/call/put volume, volume distribution (near-money %, OTM put/call %)
+- Unusual activity score (deviation from typical volume patterns)
+- Premium spent on puts vs calls, premium-weighted P/C ratio
+- Volume surge ratio (current vs historical avg for time-of-day)
+
+**11. Spreads & Liquidity (9 features)**
+- Bid-ask spread at ATM (absolute and relative)
+- Spreads at short put/call strikes
+- Spread slope vs OTM distance
+- Wing spread ratio, put/call wing liquidity, liquidity asymmetry
+
+**12. Interaction Features (9 features)**
+- `vrp_x_gex_sign` — VRP × GEX regime (mean-revert vs trend)
+- `semivar_x_gex` — downside semivariance × GEX sign
+- `skew_x_vix_percentile` — skew slope × VIX percentile
+- `jump_x_vix_change` — jump detected × VIX % change
+- `orb_width_x_adx` — opening range × ADX
+- `autocorr_x_efficiency` — autocorrelation × efficiency ratio
+- `fomc_x_vrp` — FOMC flag × VRP
+- `gap_x_vix` — overnight gap × VIX level
+- `max_pain_x_oi_conc` — max pain distance × OI concentration
+
+#### V2 Data Availability
+
+| Tier | Source | New Features | Status |
+|------|--------|-------------|--------|
+| Tier 1 | SPX 1-min OHLCV (have) | S/R, trendlines, regime, advanced technicals (~66) | Ready — compute from existing data |
+| Tier 2 | 0DTE intraday greeks (have) | GEX/DEX, skew, SVI, OI, volume, spreads (~70) | Ready — compute from existing data |
+| Tier 3 | VIX/VIX1D 1-min (have) | Enhanced VIX features, VRP | Ready — compute from existing data |
+
+All V2 features are computable from data we already have. No new data sources required.
+
+#### V2 Other Improvements
+- **Fee-adjusted EV**: incorporate Tradier round-trip costs ($6.43/IC) into skip rate analysis
+- **Advanced feature importance**: SHAP values, permutation importance, category-level ablation study
+- **Feature pruning**: drop low-importance features from V1's 284 to reduce noise
+- **Ensemble methods**: stacking XGB + LGBM predictions, potentially adding CatBoost
+- **Walk-forward CV**: replace static 70/15/15 split with rolling walk-forward validation
 
 ---
 
