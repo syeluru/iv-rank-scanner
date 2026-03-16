@@ -250,6 +250,30 @@ SPX 0DTE options are among the most liquid options in the world, with tight bid-
 
 > **Pending research from Sai:** Sai has analysis on gamma exposure dynamics after 3:00 PM and the optimal close/cutoff time. He found the optimal trading time period — this analysis should be incorporated to validate the 3:00 PM cutoff.
 
+### Running ZDOM (paper or live)
+
+The entire execution system is two scripts: `live_orchestrator.py` (the loop) and `live_features.py` (the feature builder). Everything else is data they consume.
+
+**Prerequisites:**
+1. Python 3.14 with packages: `pip install -r requirements.txt` (pandas, numpy, xgboost, lightgbm, scikit-learn, requests)
+2. Trained model pickles in `models/v1/` (18 files — 9 TP levels x best algorithm)
+3. Daily feature parquets in `data/` (symlinked from `data_collection/raw/` and `feature_engineering/outputs/`)
+4. Environment variables: `TRADIER_PAPER_TOKEN` and `TRADIER_ACCOUNT_ID` (or set in `.env.development`)
+
+**To run:**
+```bash
+# Paper trading (Tradier sandbox)
+python3 execution/scripts/live_orchestrator.py --portfolio 10000
+
+# Dry run (score only, no orders placed)
+python3 execution/scripts/live_orchestrator.py --dry-run --portfolio 10000
+
+# Custom skip rate
+python3 execution/scripts/live_orchestrator.py --portfolio 10000 --skip-rate 0.25
+```
+
+The orchestrator runs from 10:00-15:00 ET, scoring every minute. Trade logs are written to `execution/logs/trades_YYYY-MM-DD.csv`. Monitor progress with `tail -f execution/logs/live_YYYY-MM-DD.log`.
+
 ---
 
 ## 7. Features
@@ -540,30 +564,6 @@ models/v1/
 | `train_v1.py` | `analysis/scripts/` | Train XGB + LGBM with Optuna, evaluate, save artifacts |
 | `backtest_walkforward.py` | `analysis/scripts/` | Walk-forward backtest simulation on holdout |
 | `daily_fetch.sh` | `data_collection/scripts/` | Daily cron: fetch all data sources |
-
-### Running ZDOM (paper or live)
-
-The entire execution system is two scripts: `live_orchestrator.py` (the loop) and `live_features.py` (the feature builder). Everything else is data they consume.
-
-**Prerequisites:**
-1. Python 3.14 with packages: `pip install -r requirements.txt` (pandas, numpy, xgboost, lightgbm, scikit-learn, requests)
-2. Trained model pickles in `models/v1/` (18 files — 9 TP levels x best algorithm)
-3. Daily feature parquets in `data/` (symlinked from `data_collection/raw/` and `feature_engineering/outputs/`)
-4. Environment variables: `TRADIER_PAPER_TOKEN` and `TRADIER_ACCOUNT_ID` (or set in `.env.development`)
-
-**To run:**
-```bash
-# Paper trading (Tradier sandbox)
-python3 execution/scripts/live_orchestrator.py --portfolio 10000
-
-# Dry run (score only, no orders placed)
-python3 execution/scripts/live_orchestrator.py --dry-run --portfolio 10000
-
-# Custom skip rate
-python3 execution/scripts/live_orchestrator.py --portfolio 10000 --skip-rate 0.25
-```
-
-The orchestrator runs from 10:00-15:00 ET, scoring every minute. Trade logs are written to `execution/logs/trades_YYYY-MM-DD.csv`. Monitor progress with `tail -f execution/logs/live_YYYY-MM-DD.log`.
 
 ### Reproducibility
 - Random seed: 42 (all models)
