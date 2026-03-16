@@ -211,12 +211,13 @@ The system runs all 9 TP models simultaneously, scoring every available IC strat
 
 1. **Compute features** — pull latest SPX 1-min bar, update intraday features (returns, VWAP, realized vol, squeeze, etc.)
 2. **Check hard blockers** — if any blocker is active (FOMC, CPI, VIX > 35, etc.), skip the entire day
-3. **Score all combinations** — run all 9 TP models on the current feature vector. For each of the 9 IC strategies, each model outputs a probability. This produces up to 81 (model × strategy) combinations.
+3. **Score all combinations** — run all 9 TP models on the current feature vector. For each of the 9 IC strategies, each model outputs a probability. This produces up to 81 (model x strategy) combinations.
 4. **Apply skip rate threshold** — exclude any combination where the model probability falls below the skip rate cutoff for that (strategy, TP) cell
-5. **Compute EV** — for each surviving combination: `EV = probability × credit` where credit is the IC mid price available at that minute for that strategy
-6. **Pick the highest EV** — enter that trade. Place a **limit order at mid price**.
-7. **Fill window** — give it 1 minute to fill (e.g., 10:00:00 to 10:00:59). If not filled by 10:01:00, cancel and re-score at the next minute.
-8. **One trade at a time** — do not enter a new position while one is open. Wait for the current trade to resolve, then repeat from step 1.
+5. **Compute EV** — for each surviving combination: `EV = probability x credit` where credit is the IC mid price available at that minute for that strategy
+6. **5-delta shadow filter** — if the highest EV combination is an IC_05d strategy, **do not trade**. Log it as a shadow trade and skip this minute entirely. The reasoning: IC_05d has extremely thin credit ($0.50-$1.00) that cannot absorb slippage and fees. More importantly, when the model's best available opportunity is a 5-delta IC, it signals that market conditions are not favorable for premium selling at any meaningful delta. The 5-delta selection acts as a **market conditions indicator** — it means none of the real strategies (10d-45d) have attractive risk/reward at this moment. Sitting out is the correct response. Shadow logging tracks what would have happened for future analysis.
+7. **Pick the highest EV (10d-45d only)** — if the winner is IC_10d through IC_45d, enter that trade. Place a **limit order at mid price**.
+8. **Fill window** — give it 1 minute to fill (e.g., 10:00:00 to 10:00:59). If not filled by 10:01:00, cancel and re-score at the next minute.
+9. **One trade at a time** — do not enter a new position while one is open. Wait for the current trade to resolve, then repeat from step 1.
 
 ### Exit flow (while a position is open)
 
