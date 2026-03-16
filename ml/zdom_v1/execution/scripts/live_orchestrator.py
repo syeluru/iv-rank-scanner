@@ -36,8 +36,8 @@ LOG_DIR.mkdir(parents=True, exist_ok=True)
 # ── Config ───────────────────────────────────────────────────────────────────
 
 TRADIER_BASE_URL = "https://sandbox.tradier.com/v1"
-TRADIER_TOKEN = os.environ.get("TRADIER_PAPER_TOKEN", "A1VyyktzcqhRHWqHYDGtp74DhlxT")
-TRADIER_ACCOUNT_ID = os.environ.get("TRADIER_ACCOUNT_ID", "VA38004009")
+TRADIER_TOKEN = os.environ.get("TRADIER_PAPER_TOKEN", "YOUR_TRADIER_TOKEN_HERE")
+TRADIER_ACCOUNT_ID = os.environ.get("TRADIER_ACCOUNT_ID", "YOUR_ACCOUNT_ID_HERE")
 
 PORTFOLIO_START = 10_000
 BUYING_POWER_PER_CONTRACT = 2500
