@@ -58,11 +58,13 @@ python3 6_execution/scripts/live_orchestrator.py --dry-run --portfolio 10000
 | `5_analysis/results/ZDOM_V1_Results.pdf` | Training results PDF |
 | `4_models/v1/tp10_target_xgb.pkl` | Best model (TP10 XGB) |
 
-## Version Roadmap
+## Documentation
 
-| Version | Focus |
-|---------|-------|
-| **V1** | Entry go/no-go (complete) |
-| V2 | Fee-adjusted targets, intraday VIX/greeks features, cross-timeframe ratios |
-| V3 | Live trade monitoring, dynamic stop-loss |
-| V4 | Structure selection (IC vs butterfly vs jade lizard) |
+See `model_documentation_v1.md` for the full model documentation including:
+- Target definition and assumptions
+- Feature dictionary (284 features)
+- Training methodology and evaluation results
+- Execution logic and 5-delta shadow filter
+- Hard blockers and risk controls
+- Version roadmap (V1-V5)
+- Transaction cost analysis
