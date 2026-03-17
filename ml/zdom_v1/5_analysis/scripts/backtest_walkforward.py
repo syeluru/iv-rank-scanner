@@ -157,7 +157,7 @@ def apply_blockers(df):
         (df["is_nfp_day"] == 1) |
         (df["is_gdp_day"] == 1) |
         (df["is_mag7_earnings_day"] == 1) |
-        (df["vix_close"] > 35) |
+        (df.get("vix_close", df.get("vix_intraday_prior_min_close", pd.Series(dtype=float))).fillna(0) > 35) |
         (df["gap_pct"].abs() > 1.5)
     ).fillna(False)
     df["_blocked"] = blocked
