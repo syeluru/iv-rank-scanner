@@ -1,7 +1,8 @@
 """
 ZDOM V1 Live Orchestrator — Paper Trading on Tradier Sandbox.
 
-Runs the full scoring + execution loop from 10:00-15:00 ET.
+Data collection starts at 9:30 ET (1-min bars via ThetaData for ORB + features).
+Scoring + execution loop runs from 10:00-15:00 ET.
 One trade at a time. 5-delta shadow filter. Tracks internal $10K portfolio.
 
 Usage:
@@ -16,6 +17,7 @@ import os
 import pickle
 import sys
 import time
+import urllib.request
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -50,10 +52,116 @@ TRADEABLE_STRATEGIES = [f"IC_{d:02d}d_25w" for d in range(10, 50, 5)]
 TP_LEVELS = [f"tp{p}" for p in range(10, 55, 5)]
 
 SL_MULT = 2.0
+DATA_COLLECTION_START_HOUR = 9
+DATA_COLLECTION_START_MIN = 30
 ENTRY_START_HOUR = 10
 ENTRY_START_MIN = 0
 CLOSE_HOUR = 15
 CLOSE_MIN = 0
+
+THETADATA_BASE_URL = "http://127.0.0.1:25503"
+
+# ── ThetaData API ───────────────────────────────────────────────────────────
+
+def _parse_thetadata_response(data):
+    """Parse ThetaData JSON response into a flat list of bar dicts.
+
+    ThetaData v3 can return either:
+      - {"response": [{...bar...}, ...]}
+      - {"response": [{"data": [{...bar...}, ...]}]}
+    This handles both formats.
+    """
+    response = data.get("response", data if isinstance(data, list) else [])
+    if response and isinstance(response[0], dict) and "data" in response[0]:
+        bars = []
+        for entry in response:
+            for dp in entry.get("data", []):
+                bars.append(dp)
+        return bars
+    return response
+
+
+def fetch_thetadata_bars(date_str, start_time=None, end_time=None):
+    """Fetch 1-min SPX bars from ThetaData for a given date.
+
+    Args:
+        date_str: Date in YYYY-MM-DD format.
+        start_time: Optional start time as "HH:MM:SS".
+        end_time: Optional end time as "HH:MM:SS".
+
+    Returns:
+        List of bar dicts with keys: datetime, open, high, low, close.
+        Returns empty list on failure.
+    """
+    try:
+        date_compact = date_str.replace("-", "")
+        params = {
+            "symbol": "SPX",
+            "start_date": date_compact,
+            "end_date": date_compact,
+            "interval": "1m",
+            "format": "json",
+        }
+        if start_time:
+            params["start_time"] = start_time
+        if end_time:
+            params["end_time"] = end_time
+
+        query = "&".join(f"{k}={v}" for k, v in params.items())
+        full_url = f"{THETADATA_BASE_URL}/v3/index/history/ohlc?{query}"
+
+        req = urllib.request.Request(full_url)
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode())
+
+        response = _parse_thetadata_response(data)
+        if not response:
+            return []
+
+        bars = []
+        for bar_data in response:
+            ts = bar_data.get("timestamp") or bar_data.get("datetime")
+            bars.append({
+                "datetime": pd.Timestamp(ts) if ts else datetime.now(),
+                "open": float(bar_data.get("open", bar_data.get("Open", 0))),
+                "high": float(bar_data.get("high", bar_data.get("High", 0))),
+                "low": float(bar_data.get("low", bar_data.get("Low", 0))),
+                "close": float(bar_data.get("close", bar_data.get("Close", 0))),
+            })
+        return bars
+    except Exception as e:
+        print(f"  [warn] ThetaData fetch failed: {e}")
+        return []
+
+
+def fetch_thetadata_latest_bar(now):
+    """Fetch the T-1 completed 1-min SPX bar from ThetaData.
+
+    Uses the Universal T-1 rule: fetches the bar that just completed,
+    not the one currently in progress.
+
+    Args:
+        now: Current datetime.
+
+    Returns:
+        Bar dict or None on failure.
+    """
+    try:
+        # T-1: fetch the bar that ended 1 minute ago
+        bar_end = now.replace(second=0, microsecond=0)
+        bar_start = bar_end - timedelta(minutes=1)
+
+        date_str = now.strftime("%Y-%m-%d")
+        start_time = bar_start.strftime("%H:%M:%S")
+        end_time = bar_end.strftime("%H:%M:%S")
+
+        bars = fetch_thetadata_bars(date_str, start_time=start_time, end_time=end_time)
+        if bars:
+            return bars[-1]  # last completed bar
+        return None
+    except Exception:
+        return None
+
 
 # ── Tradier API ──────────────────────────────────────────────────────────────
 
@@ -316,21 +424,100 @@ def run(args):
     position_open = False
     open_position = None
     last_quote_time = None
+    thetadata_available = True  # assume available, set False on repeated failures
 
-    # Main scoring loop
-    print(f"\nWaiting for 10:00 ET to start scoring...\n")
+    # ── Data Collection Phase (9:30 - 10:00) ────────────────────────────────
+    # Collect 1-min bars from 9:30 so the ORB and intraday features are
+    # populated before the scoring loop starts at 10:00.
+    data_collection_start = datetime.now().replace(
+        hour=DATA_COLLECTION_START_HOUR, minute=DATA_COLLECTION_START_MIN, second=0)
+    scoring_start = datetime.now().replace(
+        hour=ENTRY_START_HOUR, minute=ENTRY_START_MIN, second=0)
+    market_close_time = datetime.now().replace(
+        hour=CLOSE_HOUR, minute=CLOSE_MIN, second=0)
+
+    print(f"\nData collection starts at {DATA_COLLECTION_START_HOUR}:{DATA_COLLECTION_START_MIN:02d}")
+    print(f"Scoring starts at {ENTRY_START_HOUR}:{ENTRY_START_MIN:02d}\n")
+
+    # Wait until data collection start
+    now = datetime.now()
+    if now < data_collection_start:
+        wait = (data_collection_start - now).seconds
+        print(f"  Waiting {wait//60}m {wait%60}s until data collection start ({DATA_COLLECTION_START_HOUR}:{DATA_COLLECTION_START_MIN:02d})...")
+        while datetime.now() < data_collection_start:
+            remaining = (data_collection_start - datetime.now()).seconds
+            if remaining > 60:
+                time.sleep(60)
+            else:
+                time.sleep(1)
+
+    # If we're past data collection start, backfill any bars we missed
+    now = datetime.now()
+    if now >= data_collection_start and now <= market_close_time:
+        backfill_end = min(now, scoring_start)
+        today_str = now.strftime("%Y-%m-%d")
+        print(f"  [{now.strftime('%H:%M:%S')}] Backfilling bars from ThetaData (9:30 to {backfill_end.strftime('%H:%M')})...")
+
+        bars = fetch_thetadata_bars(
+            today_str,
+            start_time="09:30:00",
+            end_time=backfill_end.strftime("%H:%M:%S"),
+        )
+        if bars:
+            for bar in bars:
+                fb.add_bar(bar)
+            print(f"  [{now.strftime('%H:%M:%S')}] Backfilled {len(bars)} bars from ThetaData")
+        else:
+            print(f"  [{now.strftime('%H:%M:%S')}] No ThetaData bars available — will use Tradier quotes as fallback")
+            thetadata_available = False
+
+    # Live data collection loop: accumulate bars from 9:30 until scoring starts
+    now = datetime.now()
+    if now < scoring_start and now >= data_collection_start:
+        print(f"  [{now.strftime('%H:%M:%S')}] Collecting live bars until scoring starts at {ENTRY_START_HOUR}:{ENTRY_START_MIN:02d}...")
+
+        while datetime.now() < scoring_start:
+            now = datetime.now()
+            # Wait until the next minute boundary + a few seconds for the bar to complete
+            next_min = now.replace(second=0, microsecond=0) + timedelta(minutes=1)
+            sleep_secs = (next_min - now).total_seconds() + 3  # +3s for bar completion
+            if sleep_secs > 0:
+                time.sleep(sleep_secs)
+
+            now = datetime.now()
+            if now >= scoring_start:
+                break
+
+            bar = fetch_thetadata_latest_bar(now)
+            if bar:
+                fb.add_bar(bar)
+                print(f"  [{now.strftime('%H:%M:%S')}] Bar #{len(fb.bars):>3d} | "
+                      f"O={bar['open']:.2f} H={bar['high']:.2f} L={bar['low']:.2f} C={bar['close']:.2f}")
+            elif thetadata_available:
+                # ThetaData returned nothing — try a Tradier quote as fallback
+                spx_quote = get_spx_quote()
+                if spx_quote and spx_quote.get("last"):
+                    fb.add_bar_from_quote(spx_quote)
+                    print(f"  [{now.strftime('%H:%M:%S')}] Bar #{len(fb.bars):>3d} (Tradier fallback) | "
+                          f"last={spx_quote['last']:.2f}")
+
+        print(f"  [{datetime.now().strftime('%H:%M:%S')}] Data collection complete — {len(fb.bars)} bars accumulated")
+        if fb.orb_range:
+            print(f"  ORB: high={fb.orb_high:.2f} low={fb.orb_low:.2f} range={fb.orb_range:.2f}")
+
+    # ── Main Scoring Loop ────────────────────────────────────────────────────
+    print(f"\nStarting scoring loop...\n")
 
     while True:
         now = datetime.now()
 
-        # Check if within trading window
-        market_open = now.replace(hour=ENTRY_START_HOUR, minute=ENTRY_START_MIN, second=0)
+        scoring_start = now.replace(hour=ENTRY_START_HOUR, minute=ENTRY_START_MIN, second=0)
         market_close = now.replace(hour=CLOSE_HOUR, minute=CLOSE_MIN, second=0)
 
-        if now < market_open:
-            wait = (market_open - now).seconds
+        if now < scoring_start:
+            wait = (scoring_start - now).seconds
             if wait > 60:
-                print(f"  [{now.strftime('%H:%M:%S')}] Market opens in {wait//60}m {wait%60}s")
+                print(f"  [{now.strftime('%H:%M:%S')}] Scoring starts in {wait//60}m {wait%60}s")
                 time.sleep(min(wait - 30, 60))
                 continue
             time.sleep(1)
@@ -428,13 +615,17 @@ def run(args):
         # No position open — score and potentially enter
         print(f"  [{now.strftime('%H:%M:%S')}] Scoring...", end="")
 
-        # Get live SPX quote and accumulate bar
-        spx_quote = get_spx_quote()
-        if not spx_quote or not spx_quote.get("last"):
-            print(" no SPX quote")
-            time.sleep(60)
-            continue
-        fb.add_bar_from_quote(spx_quote)
+        # Fetch T-1 completed bar from ThetaData (preferred) or Tradier quote (fallback)
+        bar = fetch_thetadata_latest_bar(now) if thetadata_available else None
+        if bar:
+            fb.add_bar(bar)
+        else:
+            spx_quote = get_spx_quote()
+            if not spx_quote or not spx_quote.get("last"):
+                print(" no SPX quote")
+                time.sleep(60)
+                continue
+            fb.add_bar_from_quote(spx_quote)
 
         chain = get_option_chain(today)
         if not chain:

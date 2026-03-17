@@ -21,7 +21,10 @@ DATA_DIR = PROJECT_DIR / "data"
 class LiveFeatureBuilder:
     """Builds feature vectors for live scoring."""
 
-    def __init__(self):
+    def __init__(self, data_dir=None):
+        if data_dir is not None:
+            global DATA_DIR
+            DATA_DIR = Path(data_dir)
         self.daily_features = None
         self.daily_smas = {}
         self.daily_rvols = {}
@@ -60,7 +63,6 @@ class LiveFeatureBuilder:
             "vanna_charm_features.parquet", "momentum_features.parquet",
             "breadth_features.parquet", "cross_asset_features.parquet",
             "vol_expansion_features.parquet", "microstructure_features.parquet",
-            "macro_regime.parquet", "presidential_cycles.parquet",
         ]
         for pf in parquets:
             try:
@@ -73,18 +75,20 @@ class LiveFeatureBuilder:
             except Exception as e:
                 print(f"  [warn] {pf}: {e}")
 
-        # VIX daily
-        try:
-            df = pd.read_parquet(DATA_DIR / "vix_daily.parquet")
-            df["date"] = pd.to_datetime(df["date"])
-            row = df.sort_values("date").iloc[-1]
-            for col in ["vix_open", "vix_high", "vix_low", "vix_close"]:
-                if col in df.columns:
-                    daily[col] = row[col]
-                elif col.replace("vix_", "") in df.columns:
-                    daily[col] = row[col.replace("vix_", "")]
-        except Exception as e:
-            print(f"  [warn] vix_daily: {e}")
+        # VIX daily (optional — VIX features also in options_features/iv_surface)
+        vix_path = DATA_DIR / "vix_daily.parquet"
+        if vix_path.exists():
+            try:
+                df = pd.read_parquet(vix_path)
+                df["date"] = pd.to_datetime(df["date"])
+                row = df.sort_values("date").iloc[-1]
+                for col in ["vix_open", "vix_high", "vix_low", "vix_close"]:
+                    if col in df.columns:
+                        daily[col] = row[col]
+                    elif col.replace("vix_", "") in df.columns:
+                        daily[col] = row[col.replace("vix_", "")]
+            except Exception:
+                pass
 
         # VIX1D
         try:

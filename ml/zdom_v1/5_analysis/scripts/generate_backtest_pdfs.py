@@ -29,11 +29,12 @@ CURVE_SKIP_RATES = [0.20, 0.25, 0.30, 0.35, 0.40]  # default; overridden in main
 SLIP_LABELS = {
     0.00: ("S1", "Perfect Mid Fills"),
     0.05: ("S2", "$0.05 Exit Slip"),
-    0.10: ("S3", "$0.10 Exit Slip"),
+    0.10: ("S3", "$0.10 Slip/Side"),
     0.15: ("S4", "$0.15 Exit Slip"),
-    0.20: ("S5", "$0.20 Exit Slip"),
+    0.20: ("S5", "$0.20 Slip/Side"),
     0.25: ("S6", "$0.25 Exit Slip"),
-    0.30: ("S7", "Worst Case $0.30"),
+    0.30: ("S7", "$0.30 Slip/Side"),
+    0.40: ("S8", "$0.40 Slip/Side"),
 }
 
 COLORS = {
@@ -475,7 +476,10 @@ def main():
         print(f"\nGenerating {pdf_path.name}...")
 
         slip_summary = summary_df[summary_df["exit_slip"] == slip].copy()
-        slip_trades = trades_df[trades_df["exit_slip"] == slip].copy()
+        # Filter trades by sim_key prefix (handles bilateral slip where
+        # trade_log exit_slip is effective/doubled but summary uses per-side)
+        slip_key_prefix = f"_slip{slip:.2f}_"
+        slip_trades = trades_df[trades_df["sim_key"].str.contains(slip_key_prefix)].copy()
 
         with PdfPages(pdf_path) as pdf:
             # Page 1: Summary table

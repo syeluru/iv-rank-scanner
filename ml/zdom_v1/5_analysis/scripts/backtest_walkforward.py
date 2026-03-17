@@ -44,8 +44,8 @@ import pandas as pd
 warnings.filterwarnings("ignore")
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent.parent  # ml/zdom_v1/
-DATA_DIR = PROJECT_DIR / "data_join"
-MODELS_DIR = PROJECT_DIR / "models" / "v1"
+DATA_DIR = PROJECT_DIR / "3_data_join"
+MODELS_DIR = PROJECT_DIR / "models" / "v1_local_backup"
 OUTPUT_DIR = PROJECT_DIR / "output" / "backtest"
 MODELS_DIR.mkdir(parents=True, exist_ok=True)
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -67,6 +67,7 @@ FEES_PER_SHARE = 0.052  # $5.20 RT / 100 shares
 START_PORTFOLIO = 10_000
 
 EXIT_SLIPS = [round(x * 0.05, 2) for x in range(7)]  # 0.00, 0.05, ..., 0.30
+BILATERAL_SLIPS = [0.00, 0.10, 0.20, 0.30, 0.40]    # Per-side slip (entry + exit)
 SKIP_RATES_NO5D = [round(0.20 + i * 0.01, 2) for i in range(21)]  # 0.20 → 0.40
 SKIP_RATES_SHADOW = [round(0.10 + i * 0.01, 2) for i in range(31)]  # 0.10 → 0.40
 
@@ -1021,8 +1022,12 @@ def main():
                         help=f"Starting portfolio (default: ${START_PORTFOLIO:,})")
     parser.add_argument("--max-qty", type=int, default=0,
                         help="Max contracts per entry (0=unlimited, 1=flat, 10=capped)")
+    parser.add_argument("--bilateral-slip", action="store_true",
+                        help="Apply slippage to both entry and exit (default: exit only)")
     parser.add_argument("--data-split", choices=["holdout", "test"], default="holdout",
                         help="Which data split to simulate on (default: holdout)")
+    parser.add_argument("--deltas", nargs="*", type=int, default=None,
+                        help="Run only specific deltas (e.g. --deltas 10 30 45)")
     args = parser.parse_args()
 
     # Set mode-dependent defaults
@@ -1030,6 +1035,7 @@ def main():
     shadow_5d = args.shadow_5d
     max_qty = args.max_qty
     data_split = args.data_split
+    bilateral_slip = args.bilateral_slip
 
     if shadow_5d:
         STRATEGIES = STRATEGIES_ALL
@@ -1040,6 +1046,11 @@ def main():
         default_skip_rates = SKIP_RATES_NO5D
         mode_label = "NO 5-DELTA"
 
+    # Filter to specific deltas if requested
+    if args.deltas:
+        STRATEGIES = [f"IC_{d:02d}d_25w" for d in args.deltas]
+        mode_label += f" (deltas: {args.deltas})"
+
     # Build output directory name
     out_name = "backtest_shadow5d" if shadow_5d else "backtest"
     if data_split == "test":
@@ -1048,6 +1059,10 @@ def main():
         out_name += "_1ct"
     elif max_qty > 1:
         out_name += f"_{max_qty}cap"
+    if bilateral_slip:
+        out_name += "_bilateral"
+    if args.deltas:
+        out_name += "_d" + "_".join(str(d) for d in args.deltas)
     OUTPUT_DIR = PROJECT_DIR / "output" / out_name
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -1060,7 +1075,12 @@ def main():
         sizing_label = f"Capped at {max_qty} contracts/entry"
 
     skip_rates = args.skip_rates or default_skip_rates
-    exit_slips = args.slips or EXIT_SLIPS
+    if args.slips:
+        exit_slips = args.slips
+    elif bilateral_slip:
+        exit_slips = BILATERAL_SLIPS
+    else:
+        exit_slips = EXIT_SLIPS
     strategies = [args.strategy] if args.strategy else [1, 2]
 
     print(f"\n{'='*80}")
@@ -1071,7 +1091,8 @@ def main():
     print(f"  Sizing:      {sizing_label}")
     print(f"  Strategies:  {strategies}")
     print(f"  IC Deltas:   {STRATEGIES}")
-    print(f"  Slippage:    {exit_slips}")
+    slip_mode = "bilateral (entry + exit)" if bilateral_slip else "exit only"
+    print(f"  Slippage:    {exit_slips} ({slip_mode})")
     print(f"  Skip rates:  {len(skip_rates)} values ({min(skip_rates):.0%} → {max(skip_rates):.0%})")
     print(f"  Portfolio:   ${args.portfolio:,.2f}")
     print(f"  Tuning:      {'OFF' if args.no_tune else f'Optuna ({args.n_trials} trials)'}")
@@ -1171,18 +1192,24 @@ def main():
 
     for strat in strategies:
         for slip in exit_slips:
+            # Bilateral: slip applied to both entry and exit (total = 2x)
+            effective_slip = slip * 2 if bilateral_slip else slip
             for sr in skip_rates:
                 sim_count += 1
                 key = f"S{strat}_slip{slip:.2f}_skip{sr:.2f}"
 
                 eq, trades, summary = simulate(
-                    sim_scored, strat, slip, sr,
+                    sim_scored, strat, effective_slip, sr,
                     ev_lookup, cutoffs,
                     optimization="joint",
                     start_portfolio=args.portfolio,
                     shadow_5d=shadow_5d,
                     max_qty=max_qty,
                 )
+
+                # Store per-side slip in summary for display/CSV
+                summary["exit_slip"] = slip
+                summary["entry_slip"] = slip if bilateral_slip else 0.0
 
                 all_summaries.append(summary)
                 all_trade_logs[key] = trades
