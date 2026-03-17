@@ -1,8 +1,7 @@
 """
 ZDOM V1 Live Orchestrator — Paper Trading on Tradier Sandbox.
 
-Data collection starts at 9:30 ET (1-min bars via ThetaData for ORB + features).
-Scoring + execution loop runs from 10:00-15:00 ET.
+Runs the full scoring + execution loop from 10:00-15:00 ET.
 One trade at a time. 5-delta shadow filter. Tracks internal $10K portfolio.
 
 Usage:
@@ -17,7 +16,6 @@ import os
 import pickle
 import sys
 import time
-import urllib.request
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -30,16 +28,16 @@ from live_features import LiveFeatureBuilder
 # ── Paths ────────────────────────────────────────────────────────────────────
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent.parent
-MODELS_DIR = PROJECT_DIR / "models" / "v1"
+MODELS_DIR = PROJECT_DIR / "4_models" / "v1"
 DATA_DIR = PROJECT_DIR / "data"
-LOG_DIR = PROJECT_DIR / "execution" / "logs"
+LOG_DIR = PROJECT_DIR / "6_execution" / "logs"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 # ── Config ───────────────────────────────────────────────────────────────────
 
 TRADIER_BASE_URL = "https://sandbox.tradier.com/v1"
-TRADIER_TOKEN = os.environ.get("TRADIER_PAPER_TOKEN", "YOUR_TRADIER_TOKEN_HERE")
-TRADIER_ACCOUNT_ID = os.environ.get("TRADIER_ACCOUNT_ID", "YOUR_ACCOUNT_ID_HERE")
+TRADIER_TOKEN = os.environ.get("TRADIER_PAPER_TOKEN", "A1VyyktzcqhRHWqHYDGtp74DhlxT")
+TRADIER_ACCOUNT_ID = os.environ.get("TRADIER_ACCOUNT_ID", "VA38004009")
 
 PORTFOLIO_START = 10_000
 BUYING_POWER_PER_CONTRACT = 2500
@@ -52,116 +50,10 @@ TRADEABLE_STRATEGIES = [f"IC_{d:02d}d_25w" for d in range(10, 50, 5)]
 TP_LEVELS = [f"tp{p}" for p in range(10, 55, 5)]
 
 SL_MULT = 2.0
-DATA_COLLECTION_START_HOUR = 9
-DATA_COLLECTION_START_MIN = 30
 ENTRY_START_HOUR = 10
 ENTRY_START_MIN = 0
 CLOSE_HOUR = 15
 CLOSE_MIN = 0
-
-THETADATA_BASE_URL = "http://127.0.0.1:25503"
-
-# ── ThetaData API ───────────────────────────────────────────────────────────
-
-def _parse_thetadata_response(data):
-    """Parse ThetaData JSON response into a flat list of bar dicts.
-
-    ThetaData v3 can return either:
-      - {"response": [{...bar...}, ...]}
-      - {"response": [{"data": [{...bar...}, ...]}]}
-    This handles both formats.
-    """
-    response = data.get("response", data if isinstance(data, list) else [])
-    if response and isinstance(response[0], dict) and "data" in response[0]:
-        bars = []
-        for entry in response:
-            for dp in entry.get("data", []):
-                bars.append(dp)
-        return bars
-    return response
-
-
-def fetch_thetadata_bars(date_str, start_time=None, end_time=None):
-    """Fetch 1-min SPX bars from ThetaData for a given date.
-
-    Args:
-        date_str: Date in YYYY-MM-DD format.
-        start_time: Optional start time as "HH:MM:SS".
-        end_time: Optional end time as "HH:MM:SS".
-
-    Returns:
-        List of bar dicts with keys: datetime, open, high, low, close.
-        Returns empty list on failure.
-    """
-    try:
-        date_compact = date_str.replace("-", "")
-        params = {
-            "symbol": "SPX",
-            "start_date": date_compact,
-            "end_date": date_compact,
-            "interval": "1m",
-            "format": "json",
-        }
-        if start_time:
-            params["start_time"] = start_time
-        if end_time:
-            params["end_time"] = end_time
-
-        query = "&".join(f"{k}={v}" for k, v in params.items())
-        full_url = f"{THETADATA_BASE_URL}/v3/index/history/ohlc?{query}"
-
-        req = urllib.request.Request(full_url)
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read().decode())
-
-        response = _parse_thetadata_response(data)
-        if not response:
-            return []
-
-        bars = []
-        for bar_data in response:
-            ts = bar_data.get("timestamp") or bar_data.get("datetime")
-            bars.append({
-                "datetime": pd.Timestamp(ts) if ts else datetime.now(),
-                "open": float(bar_data.get("open", bar_data.get("Open", 0))),
-                "high": float(bar_data.get("high", bar_data.get("High", 0))),
-                "low": float(bar_data.get("low", bar_data.get("Low", 0))),
-                "close": float(bar_data.get("close", bar_data.get("Close", 0))),
-            })
-        return bars
-    except Exception as e:
-        print(f"  [warn] ThetaData fetch failed: {e}")
-        return []
-
-
-def fetch_thetadata_latest_bar(now):
-    """Fetch the T-1 completed 1-min SPX bar from ThetaData.
-
-    Uses the Universal T-1 rule: fetches the bar that just completed,
-    not the one currently in progress.
-
-    Args:
-        now: Current datetime.
-
-    Returns:
-        Bar dict or None on failure.
-    """
-    try:
-        # T-1: fetch the bar that ended 1 minute ago
-        bar_end = now.replace(second=0, microsecond=0)
-        bar_start = bar_end - timedelta(minutes=1)
-
-        date_str = now.strftime("%Y-%m-%d")
-        start_time = bar_start.strftime("%H:%M:%S")
-        end_time = bar_end.strftime("%H:%M:%S")
-
-        bars = fetch_thetadata_bars(date_str, start_time=start_time, end_time=end_time)
-        if bars:
-            return bars[-1]  # last completed bar
-        return None
-    except Exception:
-        return None
-
 
 # ── Tradier API ──────────────────────────────────────────────────────────────
 
@@ -244,13 +136,12 @@ def build_ic_from_chain(chain, target_delta, wing_width=25):
 
 
 def place_ic_order(ic, qty=1):
-    """Place a multileg IC order on Tradier."""
+    """Place a multileg IC order on Tradier. Uses market order for sandbox fills."""
     order_data = {
         "class": "multileg",
         "symbol": "SPX",
-        "type": "credit",
+        "type": "market",
         "duration": "day",
-        "price": ic["credit"],
         "option_symbol[0]": ic["sc"]["symbol"],
         "side[0]": "sell_to_open",
         "quantity[0]": qty,
@@ -293,15 +184,12 @@ def get_positions():
 
 
 def close_ic_order(ic_symbols, debit_price, qty=1):
-    """Place a closing order for an IC at debit + $0.10 tolerance."""
-    # We're willing to pay up to mid + $0.10 to get out
-    close_price = round(debit_price + EXIT_SLIP, 2)
+    """Place a closing order for an IC. Uses market order for sandbox fills."""
     order_data = {
         "class": "multileg",
         "symbol": "SPX",
-        "type": "debit",
+        "type": "market",
         "duration": "day",
-        "price": close_price,
         "option_symbol[0]": ic_symbols[0],
         "side[0]": "buy_to_close",
         "quantity[0]": qty,
@@ -420,104 +308,52 @@ def run(args):
     fb = LiveFeatureBuilder()
     fb.load_daily_features()
 
+    # Pre-compute skip rate cutoffs from training data
+    # These are per-(strategy, TP) percentile cutoffs from the model_table holdout
+    print(f"Computing {args.skip_rate:.0%} skip rate cutoffs...")
+    skip_cutoffs = {}
+    try:
+        mt = pd.read_parquet(DATA_DIR / "model_table_v1.parquet")
+        mt["date"] = pd.to_datetime(mt["date"])
+        dates = sorted(mt["date"].unique())
+        n = len(dates)
+        gap = 7
+        train_end = int(n * 0.70)
+        remaining = n - train_end - 2 * gap
+        test_days = remaining // 2
+        holdout_start = train_end + gap + test_days + gap
+        ho = mt[mt["date"].isin(set(dates[holdout_start:]))].copy()
+
+        for tp_num, info in models.items():
+            probs = info["model"].predict_proba(ho[info["features"]])[:, 1]
+            cutoff = np.percentile(probs, args.skip_rate * 100)
+            skip_cutoffs[tp_num] = cutoff
+            print(f"  TP{tp_num}: cutoff={cutoff:.4f}")
+        del mt, ho  # free memory
+    except Exception as e:
+        print(f"  [warn] Could not compute cutoffs: {e}. Using 0.5 default.")
+        for tp_num in models:
+            skip_cutoffs[tp_num] = 0.5
+
     portfolio = args.portfolio
     position_open = False
     open_position = None
     last_quote_time = None
-    thetadata_available = True  # assume available, set False on repeated failures
 
-    # ── Data Collection Phase (9:30 - 10:00) ────────────────────────────────
-    # Collect 1-min bars from 9:30 so the ORB and intraday features are
-    # populated before the scoring loop starts at 10:00.
-    data_collection_start = datetime.now().replace(
-        hour=DATA_COLLECTION_START_HOUR, minute=DATA_COLLECTION_START_MIN, second=0)
-    scoring_start = datetime.now().replace(
-        hour=ENTRY_START_HOUR, minute=ENTRY_START_MIN, second=0)
-    market_close_time = datetime.now().replace(
-        hour=CLOSE_HOUR, minute=CLOSE_MIN, second=0)
-
-    print(f"\nData collection starts at {DATA_COLLECTION_START_HOUR}:{DATA_COLLECTION_START_MIN:02d}")
-    print(f"Scoring starts at {ENTRY_START_HOUR}:{ENTRY_START_MIN:02d}\n")
-
-    # Wait until data collection start
-    now = datetime.now()
-    if now < data_collection_start:
-        wait = (data_collection_start - now).seconds
-        print(f"  Waiting {wait//60}m {wait%60}s until data collection start ({DATA_COLLECTION_START_HOUR}:{DATA_COLLECTION_START_MIN:02d})...")
-        while datetime.now() < data_collection_start:
-            remaining = (data_collection_start - datetime.now()).seconds
-            if remaining > 60:
-                time.sleep(60)
-            else:
-                time.sleep(1)
-
-    # If we're past data collection start, backfill any bars we missed
-    now = datetime.now()
-    if now >= data_collection_start and now <= market_close_time:
-        backfill_end = min(now, scoring_start)
-        today_str = now.strftime("%Y-%m-%d")
-        print(f"  [{now.strftime('%H:%M:%S')}] Backfilling bars from ThetaData (9:30 to {backfill_end.strftime('%H:%M')})...")
-
-        bars = fetch_thetadata_bars(
-            today_str,
-            start_time="09:30:00",
-            end_time=backfill_end.strftime("%H:%M:%S"),
-        )
-        if bars:
-            for bar in bars:
-                fb.add_bar(bar)
-            print(f"  [{now.strftime('%H:%M:%S')}] Backfilled {len(bars)} bars from ThetaData")
-        else:
-            print(f"  [{now.strftime('%H:%M:%S')}] No ThetaData bars available — will use Tradier quotes as fallback")
-            thetadata_available = False
-
-    # Live data collection loop: accumulate bars from 9:30 until scoring starts
-    now = datetime.now()
-    if now < scoring_start and now >= data_collection_start:
-        print(f"  [{now.strftime('%H:%M:%S')}] Collecting live bars until scoring starts at {ENTRY_START_HOUR}:{ENTRY_START_MIN:02d}...")
-
-        while datetime.now() < scoring_start:
-            now = datetime.now()
-            # Wait until the next minute boundary + a few seconds for the bar to complete
-            next_min = now.replace(second=0, microsecond=0) + timedelta(minutes=1)
-            sleep_secs = (next_min - now).total_seconds() + 3  # +3s for bar completion
-            if sleep_secs > 0:
-                time.sleep(sleep_secs)
-
-            now = datetime.now()
-            if now >= scoring_start:
-                break
-
-            bar = fetch_thetadata_latest_bar(now)
-            if bar:
-                fb.add_bar(bar)
-                print(f"  [{now.strftime('%H:%M:%S')}] Bar #{len(fb.bars):>3d} | "
-                      f"O={bar['open']:.2f} H={bar['high']:.2f} L={bar['low']:.2f} C={bar['close']:.2f}")
-            elif thetadata_available:
-                # ThetaData returned nothing — try a Tradier quote as fallback
-                spx_quote = get_spx_quote()
-                if spx_quote and spx_quote.get("last"):
-                    fb.add_bar_from_quote(spx_quote)
-                    print(f"  [{now.strftime('%H:%M:%S')}] Bar #{len(fb.bars):>3d} (Tradier fallback) | "
-                          f"last={spx_quote['last']:.2f}")
-
-        print(f"  [{datetime.now().strftime('%H:%M:%S')}] Data collection complete — {len(fb.bars)} bars accumulated")
-        if fb.orb_range:
-            print(f"  ORB: high={fb.orb_high:.2f} low={fb.orb_low:.2f} range={fb.orb_range:.2f}")
-
-    # ── Main Scoring Loop ────────────────────────────────────────────────────
-    print(f"\nStarting scoring loop...\n")
+    # Main scoring loop
+    print(f"\nWaiting for 10:00 ET to start scoring...\n")
 
     while True:
         now = datetime.now()
 
-        scoring_start = now.replace(hour=ENTRY_START_HOUR, minute=ENTRY_START_MIN, second=0)
+        # Check if within trading window
+        market_open = now.replace(hour=ENTRY_START_HOUR, minute=ENTRY_START_MIN, second=0)
         market_close = now.replace(hour=CLOSE_HOUR, minute=CLOSE_MIN, second=0)
 
-        if now < scoring_start:
-            wait = (scoring_start - now).seconds
+        if now < market_open:
+            wait = (market_open - now).seconds
             if wait > 60:
-                print(f"  [{now.strftime('%H:%M:%S')}] Scoring starts in {wait//60}m {wait%60}s")
+                print(f"  [{now.strftime('%H:%M:%S')}] Market opens in {wait//60}m {wait%60}s")
                 time.sleep(min(wait - 30, 60))
                 continue
             time.sleep(1)
@@ -615,17 +451,13 @@ def run(args):
         # No position open — score and potentially enter
         print(f"  [{now.strftime('%H:%M:%S')}] Scoring...", end="")
 
-        # Fetch T-1 completed bar from ThetaData (preferred) or Tradier quote (fallback)
-        bar = fetch_thetadata_latest_bar(now) if thetadata_available else None
-        if bar:
-            fb.add_bar(bar)
-        else:
-            spx_quote = get_spx_quote()
-            if not spx_quote or not spx_quote.get("last"):
-                print(" no SPX quote")
-                time.sleep(60)
-                continue
-            fb.add_bar_from_quote(spx_quote)
+        # Get live SPX quote and accumulate bar
+        spx_quote = get_spx_quote()
+        if not spx_quote or not spx_quote.get("last"):
+            print(" no SPX quote")
+            time.sleep(60)
+            continue
+        fb.add_bar_from_quote(spx_quote)
 
         chain = get_option_chain(today)
         if not chain:
@@ -655,6 +487,11 @@ def run(args):
                 except Exception:
                     prob = 0.5
 
+                # Apply skip rate threshold
+                cutoff = skip_cutoffs.get(tp_num, 0.5)
+                if prob < cutoff:
+                    continue
+
                 ev = prob * ic["credit"]
 
                 candidates.append({
@@ -668,7 +505,7 @@ def run(args):
                 })
 
         if not candidates:
-            print(" no candidates")
+            print(f" no candidates above {args.skip_rate:.0%} threshold")
             time.sleep(60)
             continue
 
@@ -687,8 +524,6 @@ def run(args):
             time.sleep(60)
             continue
 
-        # TODO: apply skip rate threshold (needs proper cutoffs from training)
-
         # Determine position size
         qty = max(1, int(portfolio // BUYING_POWER_PER_CONTRACT))
 
@@ -699,6 +534,38 @@ def run(args):
             order = place_ic_order(best["ic"], qty=qty)
             order_id = order.get("id", "N/A")
             print(f"    Order placed: {order_id}")
+
+            # Wait up to 60 seconds for fill
+            filled = False
+            for wait in range(12):  # check every 5 sec for 60 sec
+                time.sleep(5)
+                status = get_order_status(order_id)
+                order_status = status.get("status", "unknown")
+                if order_status == "filled":
+                    fill_price = status.get("avg_fill_price", best["credit"])
+                    # Sandbox returns negative for credit orders — take absolute value
+                    fill_price = abs(fill_price)
+                    print(f"    FILLED at ${fill_price:.2f}")
+                    best["credit"] = fill_price  # use actual fill price
+                    filled = True
+                    break
+                elif order_status in ("rejected", "canceled", "expired"):
+                    print(f"    ORDER {order_status.upper()} — skipping")
+                    break
+                else:
+                    print(f"    Waiting for fill... ({(wait+1)*5}s) status={order_status}")
+
+            if not filled:
+                # Cancel unfilled order and move on
+                print(f"    Not filled after 60s — canceling")
+                try:
+                    requests.delete(
+                        f"{TRADIER_BASE_URL}/accounts/{TRADIER_ACCOUNT_ID}/orders/{order_id}",
+                        headers=tradier_headers())
+                except:
+                    pass
+                time.sleep(60)
+                continue
         else:
             order_id = "DRY_RUN"
             print(f"    [DRY RUN] Would place order")
