@@ -33,9 +33,9 @@ import pandas as pd
 
 warnings.filterwarnings("ignore")
 
-PROJECT_DIR = Path(__file__).resolve().parent.parent
+PROJECT_DIR = Path(__file__).resolve().parent.parent.parent
 DATA_DIR = PROJECT_DIR / "data"
-MODELS_DIR = PROJECT_DIR / "models" / "v1"
+MODELS_DIR = PROJECT_DIR / "4_models" / "v1.1"
 MODELS_DIR.mkdir(parents=True, exist_ok=True)
 
 # All 9 TP targets
@@ -297,7 +297,7 @@ def main():
         (df["is_nfp_day"] == 1) |                      # Non-Farm Payrolls
         (df["is_gdp_day"] == 1) |                      # GDP release
         (df["is_mag7_earnings_day"] == 1) |            # MAG7 earnings
-        (df["vix_close"] > 35) |                       # Extreme vol
+        (df.get("vix_close", df.get("vix_intraday_prior_min_close", pd.Series(dtype=float))).fillna(0) > 35) |  # Extreme vol
         (df["gap_pct"].abs() > 1.5)                    # Huge overnight gap
     ).fillna(False)
 
