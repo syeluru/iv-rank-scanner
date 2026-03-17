@@ -52,3 +52,18 @@ Once all 291 features are confirmed, this audit becomes the spec for:
 2. Rebuilding model table
 3. Retraining models
 4. Updating live_features.py for production
+
+
+## How to Merge (IMPORTANT)
+**Do NOT edit `zdom_feature_audit_final_v2.csv` directly.**
+
+- **Matto** is editing `/tmp/zdom_feature_audit_final_v2.csv` locally (top down). TARS pushes updates to git periodically.
+- **Sai** should create a SEPARATE file: `zdom_feature_audit_sai.csv` (bottom up). Start from the unconfirmed rows at the bottom.
+- When both are done, TARS will merge: Matto's confirmed rows from the top + Sai's confirmed rows from the bottom + resolve any overlap in the middle.
+
+**Sai's workflow:**
+1. Download `zdom_feature_audit_final_v2.csv` as reference (read-only)
+2. Create `zdom_feature_audit_sai.csv` — copy the unconfirmed rows from the bottom
+3. Work bottom-up, filling in all columns per the instructions above
+4. Push `zdom_feature_audit_sai.csv` to `5_analysis/results/` on git
+5. Do NOT overwrite `zdom_feature_audit_final_v2.csv` — that's Matto's working copy
