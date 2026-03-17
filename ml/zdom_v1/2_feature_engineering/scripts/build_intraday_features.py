@@ -47,7 +47,7 @@ import numpy as np
 import pandas as pd
 from pathlib import Path
 
-PROJECT_DIR = Path(__file__).resolve().parent.parent
+PROJECT_DIR = Path(__file__).resolve().parent.parent.parent
 DATA_DIR = PROJECT_DIR / "data"
 
 ENTRY_START = "10:00"
@@ -90,7 +90,7 @@ def compute_iv_rank(iv_surface_df):
 
 def process_day(day_bars, date, daily_rv, daily_smas, atr_14d, iv_info):
     """Compute all intraday features for one trading day."""
-    day_bars = day_bars.sort_values("datetime").copy()
+    day_bars = day_bars.sort_values("datetime").reset_index(drop=True).copy()
     day_bars["log_ret"] = np.log(day_bars["close"] / day_bars["close"].shift(1))
 
     # VWAP proxy (using typical price * volume approximation — we don't have volume,
@@ -138,6 +138,20 @@ def process_day(day_bars, date, daily_rv, daily_smas, atr_14d, iv_info):
     day_bars["kc_upper"] = day_bars["bb_mid"] + 1.5 * atr_20
     day_bars["kc_lower"] = day_bars["bb_mid"] - 1.5 * atr_20
 
+    # ── T-1 SHIFT: All rolling features use prior bar's value ──
+    # At scoring time T, the current bar hasn't closed. We only have T-1.
+    # Shift all pre-computed rolling features by 1 bar so each row sees
+    # the value from the prior completed bar.
+    shift_cols = ["cum_typical", "ma5", "ma15", "ma30",
+                  "rvol_5m", "rvol_10m", "rvol_15m", "rvol_30m",
+                  "garman_klass_rv_30m",
+                  "running_high", "running_low", "running_range",
+                  "bb_mid", "bb_upper", "bb_lower",
+                  "kc_upper", "kc_lower"]
+    for col in shift_cols:
+        if col in day_bars.columns:
+            day_bars[col] = day_bars[col].shift(1)
+
     # Filter to entry window
     start_ts = pd.Timestamp(f"{date} {ENTRY_START}")
     end_ts = pd.Timestamp(f"{date} {ENTRY_END}")
@@ -151,16 +165,23 @@ def process_day(day_bars, date, daily_rv, daily_smas, atr_14d, iv_info):
 
     for _, bar in window.iterrows():
         ts = bar["datetime"]
-        price = bar["close"]
+
+        # Use T-1 close as "current price" — matches production where
+        # the current bar hasn't closed yet at scoring time.
+        idx = day_bars.index[day_bars["datetime"] == ts]
+        if len(idx) > 0 and idx[0] > 0:
+            price = day_bars.loc[idx[0] - 1, "close"]  # T-1 close
+        else:
+            price = bar["open"]  # fallback for first bar
 
         # Momentum
         feats = {"datetime": ts, "date": date}
         for w in [5, 10, 15, 30]:
-            idx = day_bars.index[day_bars["datetime"] == ts]
             if len(idx) > 0:
                 i = idx[0]
-                if i >= w and i - w >= 0:
-                    prev_price = day_bars.loc[i - w, "close"]
+                # T-1 close vs T-(w+1) close
+                if i >= w + 1 and i - w - 1 >= 0:
+                    prev_price = day_bars.loc[i - w - 1, "close"]
                     feats[f"spx_ret_{w}m"] = (price - prev_price) / prev_price * 100 if prev_price > 0 else np.nan
                 else:
                     feats[f"spx_ret_{w}m"] = np.nan
