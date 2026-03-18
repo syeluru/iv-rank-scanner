@@ -471,6 +471,58 @@ Layered entry is the default: open one wing first, wait for confirmation, add se
 
 **10:00am – 3:00pm ET only.** No entries before 10am (chaotic open) or after 3pm (gamma decay acceleration). Hard rule.
 
+## V2 Data Efficacy Recommendations
+
+V2 is an entry-timing model, so its edge should come from better minute selection, not from overreacting to noisy per-contract Greeks. The goal is to feed V2 signals that describe intraday market structure in a stable way.
+
+- Use Greeks primarily as **aggregated structural signals**, not raw strike-level noise
+  - Prefer `net_gex`, `net_gex_normalized`, `zero_gamma_level`, wall distances, `net_vanna_exposure`, `net_charm_exposure`, IV skew, and smile/term-structure features
+  - Avoid leaning too heavily on single-contract gamma/vanna/charm values in the live model
+- Treat open interest as **slow-moving context**
+  - We already have daily OI in `spxw_0dte_oi.parquet` and use it in options, GEX, and vanna/charm feature builders
+  - Daily OI is useful for weighting exposure, identifying walls, concentration, and max-pain-style structure
+  - Daily OI should not be treated as fresh intraday flow unless we confirm ThetaData supports time-stamped historical/live OI snapshots
+- For V2, require **data quality filters** before computing live Greek features
+  - Drop rows with invalid IV, zero/locked quotes, missing OI, absurd Greeks, or stale timestamps
+  - Reduce influence of far OTM wings and illiquid strikes unless they have meaningful OI and tradable quotes
+- Prefer **normalized / distance-based features** over raw magnitude
+  - Distances to call wall / put wall / zero-gamma are usually more stable than absolute levels
+  - Normalized GEX/vanna/charm are safer than raw exposure totals across different spot regimes
+- Add **short persistence / smoothing** to live intraday features
+  - For example: require a signal to persist for 3-5 minutes, or use rolling medians/means before scoring
+  - This helps avoid reacting to a bad chain snapshot or a one-minute quote glitch
+- Use **quote-based confirmation** with positioning signals
+  - If a wall or exposure signal is strong but the relevant strikes have poor liquidity or unstable spreads, reduce confidence
+  - ATM and near-ATM spreads should be used as a sanity check on whether the chain is trustworthy enough for live timing decisions
+- Winsorize / clip extreme second-order Greek values
+  - 0DTE gamma and charm can explode near expiry, especially late in the day
+  - Cap extreme values before model ingestion so V2 does not overfit to a handful of pathological observations
+- Frame V2 as a **regime classifier** before an exact forecaster
+  - More robust questions: "Is this a stable short-premium minute?" / "Are dealers dampening or amplifying moves?"
+  - Less robust question: "What is the exact next-minute exposure number?"
+
+### Open Interest Investigation
+
+Current repo integration confirms daily historical OI via ThetaData's `/v3/option/history/open_interest` endpoint. This gives us end-of-day OI by strike/right and is already useful for structural features.
+
+Before using OI as a live V2 timing input, investigate whether ThetaData provides either:
+
+- live intraday OI snapshots
+- time-stamped historical OI updates within the day
+- delayed-but-updating OI fields in another endpoint that can be joined to the live chain
+
+If ThetaData does **not** provide intraday historical/live OI, then V2 should:
+
+- keep using daily OI only as a structural weight
+- avoid treating OI as a fast signal
+- rely on live quotes, IV surface, and aggregated Greeks for intraday timing
+
+Implementation note:
+
+- Add a small ThetaData capability audit task before finalizing V2 live features
+- Record which endpoints expose OI, refresh cadence, timestamp semantics, and whether values are truly intraday or just prior-close snapshots
+- Do not promote live OI into the V2 feature set until this is verified empirically
+
 ## Model Architecture
 
 5 parallel XGBoost models at different lookback windows:

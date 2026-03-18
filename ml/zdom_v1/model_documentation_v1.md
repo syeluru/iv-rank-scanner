@@ -629,6 +629,65 @@ V1 uses gain-based importance only. For V2, we should evaluate more rigorous met
 - Intraday greeks/positioning: live GEX/DEX recalculated each minute with rolling MAs (5m, 15m, 30m). The daily GEX snapshot is stale by afternoon — live positioning data would capture real-time dealer hedging flows.
 - Intraday IV features: live ATM IV, skew shifts, IV momentum throughout the day. IV changes intraday as market moves — capturing these dynamics could improve entry timing.
 
+**V2 data efficacy / model-strength guidance:**
+- Use Greeks primarily as aggregated structural signals, not raw strike-level noise. Prefer normalized GEX, zero-gamma, wall distances, vanna/charm aggregates, and IV surface features over single-contract values.
+- Treat open interest as slow-moving context unless proven otherwise. We already have daily OI in `spxw_0dte_oi.parquet`, and it is useful for GEX weighting, wall detection, OI concentration, and max-pain-style structure. It should not be treated as a fast intraday signal without confirming the data source supports time-stamped live/historical intraday OI.
+- Build strict live data-quality filters before calculating intraday Greek features. Drop invalid IV, missing OI, stale timestamps, zero/locked quotes, and clearly absurd Greek values.
+- Prefer normalized and distance-based features over raw magnitude. Distances to call wall, put wall, and zero-gamma are usually more stable across spot regimes than the absolute levels themselves.
+- Add short persistence / smoothing to live positioning inputs. For example, require a signal shift to persist for 3-5 minutes or use rolling medians/means before scoring to reduce one-minute chain noise.
+- Use quote-based confirmation alongside positioning. If an exposure signal looks strong but the relevant strikes have unstable spreads or poor liquidity, confidence in the live signal should be reduced.
+- Winsorize or clip extreme second-order Greek values. 0DTE gamma and charm can explode late in the day and create outlier-driven overfitting if left unconstrained.
+- Frame V2 as a regime-aware entry-timing model first, not a point-estimate forecaster. The more robust question is "is this minute structurally stable for short premium?" rather than "what is the exact next-minute exposure value?"
+
+**Open interest follow-up with ThetaData:**
+- Current integration confirms daily historical OI through ThetaData's `/v3/option/history/open_interest` endpoint. That is sufficient for daily structural features, but not automatically sufficient for live V2 timing.
+- Before adding OI as a live V2 feature, audit whether ThetaData provides:
+  - live intraday OI snapshots
+  - historical intraday OI updates with timestamps
+  - another endpoint exposing refreshed OI fields that can be joined to the live chain
+- If ThetaData does not provide true intraday OI, keep OI as a structural weight only and rely on live quotes, IV surface, and aggregated Greeks for intraday timing.
+- Action item: perform a ThetaData capability audit and document endpoint coverage, refresh cadence, timestamp semantics, and whether OI values are true intraday observations or prior-close snapshots.
+
+**Best-practice institutional positioning data plan for V2:**
+- After reviewing exchange/vendor docs, the working assumption for US listed options should be: **official open interest is a daily-cleared statistic, not a true intraday-updating field**. Many vendors expose OI in live APIs, but the documented timing semantics generally point to prior-close / start-of-day values, not live recomputation.
+- That means the strongest institutional approach is not "find magical live OI." It is to combine:
+  - daily OI for structural weights
+  - live quotes, Greeks, and IV surface for fast state estimation
+  - intraday open/close flow products to proxy positioning change through the session
+- For V2, the recommended hierarchy is:
+  1. **Must-have core:** ThetaData live quotes + intraday Greeks + IV surface + daily OI
+  2. **Best upgrade:** Cboe intraday Open-Close / sentiment-style flow data to observe whether flow is opening vs closing and who is trading
+  3. **Institutional upgrade:** OptionMetrics intraday signed volume or similar directional flow dataset for inventory/hedging inference
+  4. **Optional internal layer:** estimated live OI / dealer positioning change inferred from intraday volume and open-close classification
+- Why this is the best realistic stack:
+  - Daily OI anchors the structural book: walls, concentration, max pain, GEX weighting
+  - Live Greeks and IV surface describe the current chain state
+  - Intraday open/close flow is the closest observable proxy to "what positioning is being added or removed right now"
+  - Estimated live positioning can be layered on top, but should be treated as a model output, not a raw market data truth
+- Recommended V2 implementation path:
+  - **Phase 1:** keep daily OI as structural context only; do not block V2 waiting for live OI
+  - **Phase 2:** add intraday quote/Greek persistence filters, IV momentum, and live aggregated GEX/vanna/charm
+  - **Phase 3:** integrate an exchange-grade intraday flow dataset (preferred: Cboe Open-Close family)
+  - **Phase 4:** test an estimated live OI / live dealer positioning model using intraday volume, open/close classification, and prior-day OI as the state prior
+- Hard rule for research discipline:
+  - Do not label any feature as "intraday OI" unless the vendor documentation explicitly confirms true intraday OI updates.
+  - If we build a live OI-style metric ourselves, name it as an estimate: `estimated_intraday_oi_change`, `estimated_live_positioning`, etc.
+
+**Recommended vendor priority for V2:**
+- **Primary market-state feed:** ThetaData
+  - Best fit for our current stack because it already gives us intraday Greeks, IV, quotes, and term structure
+- **Best positioning-change upgrade:** Cboe DataShop intraday Open-Close / sentiment datasets
+  - Best direct view into opening vs closing flow and participant behavior during the session
+- **Best research-grade enrichment:** OptionMetrics intraday signed volume
+  - Strongest institutional-grade add-on for directional flow and market-maker inventory inference
+- **Avoid spending time chasing "live OI" from retail-style chain vendors**
+  - For most of them, OI is simply the latest daily value carried in a real-time response payload
+
+**Practical conclusion for V2:**
+- The best quants are not waiting for official intraday OI because it generally does not exist as a standard live field for US options.
+- They solve the problem by combining prior-day OI, live chain state, and intraday flow classification.
+- That is the architecture V2 should follow.
+
 **Cross-timeframe ratio features:**
 A new systematic feature category that captures how the current moment compares to recent history, and how recent history compares to the longer trend. V1 has a few ad-hoc versions of this (e.g., `intraday_ma15_vs_sma_7d`, `rvol_intraday_vs_5d`), but V2 will build this out as a full category across all major signals.
 
