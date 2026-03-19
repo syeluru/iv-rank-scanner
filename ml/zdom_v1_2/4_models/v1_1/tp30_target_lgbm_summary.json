@@ -1,0 +1,32 @@
+{
+  "key": "tp30_target_lgbm",
+  "target": "tp30_target",
+  "model_type": "lgbm",
+  "test_auc": 0.6781261837927363,
+  "holdout_auc": 0.6982980142282751,
+  "baseline_wr": 0.7422,
+  "baseline_ev": 0.0417,
+  "n_features": 261,
+  "params": {
+    "scale_pos_weight": "0.3396752212089365",
+    "n_estimators": "544",
+    "max_depth": "5",
+    "learning_rate": "0.04622696198696104",
+    "num_leaves": "30",
+    "subsample": "0.897942835939211",
+    "colsample_bytree": "0.6495004018484215",
+    "min_child_weight": "8",
+    "reg_alpha": "0.6966301836469537",
+    "reg_lambda": "1.2356528532533804"
+  },
+  "trained_at": "2026-03-17T04:49:51.661628",
+  "split_info": {
+    "train_days": 526,
+    "test_days": 106,
+    "holdout_days": 106,
+    "gap_days": 7,
+    "train_range": "2023-02-27 -> 2025-04-03",
+    "test_range": "2025-04-15 -> 2025-09-16",
+    "holdout_range": "2025-09-26 -> 2026-02-27"
+  }
+}
