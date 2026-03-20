@@ -1,525 +1,979 @@
-# ZDOM V2: Dynamic Position Management System
+# ZDOM V2.1: Institutional-Grade 0DTE Exit and Position Management
 
 ## Vision
 
-V1/V1.2 optimized **entry** — 284 features, 9 ML models, hard blockers, diversified multi-IC positioning. But once a position is open, monitoring is purely mechanical P&L watching (fixed SL at 2x credit, SLTP ratchet at 30%, 30-second polling). Nothing reacts to *why* the market is moving or *whether conditions have changed*.
+V1/V1.2 optimized **entry selection**. Once a position is open, however, the live stack still behaves mostly like a debit-threshold monitor: fixed stop-loss logic, static SLTP ratchets, and account-level combined stops. That is a solid baseline, but it is not how a serious 0DTE risk engine should behave.
 
-V2 adds **adaptive exit intelligence** — real-time regime detection, dynamic TP/SL adjustment, and an ML exit advisor that scores "should I stay or should I go" every monitoring cycle.
+V2.1 upgrades exit management from a static threshold system into a **state-aware decision engine** that:
 
----
+1. Estimates the **current market, vol, liquidity, and position state** every monitoring cycle.
+2. Predicts **continuation value**, **short-horizon tail risk**, and **expected exit cost**.
+3. Chooses among a richer set of actions than just hold vs. exit.
+4. Falls back to hard risk rules whenever model confidence is weak or the regime is unfamiliar.
+5. Treats **execution quality** as part of risk management, not an afterthought.
 
-## Research Foundation
-
-### Why Exit > Entry (Evidence Summary)
-
-The claim that exit management dominates entry optimization is supported by 300,000+ trades across independent studies:
-
-| Study | Trades | Key Finding |
-|-------|--------|-------------|
-| **ProjectFinance (2007-2017)** | 71,417 SPY iron condors | Same entries + 16 different exit combos → outcome variance dominated by exit rules, not entry |
-| **ThetaProfits + Sandvand replication** | 9,100 + 1,344 | 38% win rate but 2.4x winner/loser ratio → 84.5% annual. Entry is mechanical (hourly 10-15d ICs). All edge from per-side SL = total premium |
-| **Option Alpha** | 230,000 0DTE trades | Same IC, same triggers: 50% allocation = -67%, 30% allocation = +6.86%. Exit/sizing param flipped sign of returns |
-| **Tastytrade (2005-2017)** | SPY 1-SD strangles | 50% TP management → $2.04/day vs hold-to-expiration → $1.18/day. 73% more per day from exit rule alone |
-| **Van Tharp / Basso** | Random entries | Coin-flip entries + disciplined exits = 7% CAGR. Random entry system was profitable |
-| **Brinson, Hood & Beebower (1986)** | Portfolio study | 93.6% of return variation explained by allocation (how much, when to cut), not selection (what to enter) |
-
-### Why 0DTE Specifically Needs Adaptive Exits
-
-**Gamma regime changes intraday** — documented by SpotGamma and academic papers:
-
-- **Positive dealer gamma** → price reversals (safe for ICs, prices snap back)
-- **Negative dealer gamma** → price momentum (dangerous, moves accelerate against you)
-- Regime can flip multiple times per session (SpotGamma documented 3 regime changes in a single day)
-- Impact: up to 3.3pp of annualized volatility difference between regimes (Adams, Fontaine, Ornthanalai 2024)
-- **Dim, Eraker, Vilkov (2023):** Positive MM gamma strengthens reversals; negative gamma strengthens momentum
-
-Your entry at 10:15 AM cannot predict the gamma regime at 2:30 PM. Only real-time monitoring can.
-
-**The gamma crunch problem:** Iron condors have net negative gamma. As expiration approaches, gamma increases exponentially for ATM options. A 0DTE ATM option can swing from 0.50 to 0.80 delta on a small move. Losses accelerate non-linearly as price approaches your short strike — traditional percentage-based stops trigger too late.
-
-**Caveat:** Option Alpha's stop-loss backtest found removing stop-losses increased total returns by 50-87% for short premium — but drawdowns were 2-3x worse. The theoretical "no stops" return is unrealizable for most accounts (a -27% drawdown typically leads to behavioral blowup). Stops make the strategy survivable, which is a form of edge.
+This is the design goal for an internal, institutional-quality 0DTE management stack. It is realistic, measurable, and buildable with the data and infrastructure we can assemble.
 
 ---
 
-## Architecture
+## Ground Truth
 
-### System Overview
+### What The Current Live System Does
 
-```
-┌──────────────────────────────────────────────────────────┐
-│                    V2 MONITORING LOOP                     │
-│                  (replaces static P&L watch)              │
-│                                                          │
-│  Every 1 min while position open:                        │
-│                                                          │
-│  1. FEATURE STREAM (Phase 1)                             │
-│     ├── Gamma/Dealer signals                             │
-│     ├── Regime features (HMM, CUSUM, ATR)                │
-│     ├── VIX intraday features                            │
-│     └── Position-aware features                          │
-│                                                          │
-│  2. EXIT ADVISOR (Phase 2)                               │
-│     ├── Score: P(should_exit_now)                        │
-│     ├── Score: P(adverse_move_5min)                      │
-│     └── Output: hold_confidence [0,1]                    │
-│                                                          │
-│  3. DYNAMIC TP/SL (Phase 3)                              │
-│     ├── ATR-adaptive stop loss                           │
-│     ├── Time-decay TP progression                        │
-│     ├── Delta-based emergency exit                       │
-│     └── Regime-weighted adjustments                      │
-│                                                          │
-│  4. ACTION                                               │
-│     ├── hold_confidence > 0.6 → HOLD (existing logic)   │
-│     ├── hold_confidence 0.3-0.6 → TIGHTEN (Phase 3)     │
-│     └── hold_confidence < 0.3 → EXIT NOW                 │
-└──────────────────────────────────────────────────────────┘
-```
+The current orchestrator monitors open iron condors primarily by:
 
----
+- Current debit-to-close from fresh option chain quotes
+- Fixed stop-loss thresholds
+- Static SLTP profit-lock tiers
+- Account-level combined stop-loss
 
-## Phase 1: Real-Time Feature Stream
+This is implemented in the existing live code:
 
-### Goal
-Build an intraday feature pipeline that runs **during the trade**, not just at entry. Every 1 minute while a position is open, compute ~20 features describing the current market regime and position state.
+- `scripts/orchestrator/position_manager.py`
+- `execution/order_manager/ic_order_builder.py`
 
-### Feature Spec
+That means the real bottleneck is not just "more ML." The bottleneck is the full decision stack:
 
-#### 1A. Gamma / Dealer Signals (4 features)
+- better state estimation
+- better labels
+- better validation
+- better execution modeling
+- better live fail-safes
 
-| Feature | Source | Logic |
-|---------|--------|-------|
-| `net_gex_sign` | Option chain OI + greeks | +1 if net dealer gamma positive (pinning/safe), -1 if negative (amplifying/danger). Compute from aggregate OI × gamma across strikes |
-| `dist_to_gamma_flip` | Option chain OI + greeks | SPX price distance to the strike where dealer gamma crosses zero, in ATR units. Crossing this level = regime change |
-| `short_strike_delta` | Option chain greeks | Current delta of your short call and short put. Entry delta ~0.10; if it rises to 0.20+ it's an early warning before P&L shows deterioration |
-| `short_strike_gamma` | Option chain greeks | Current gamma of short strikes. Exponentially increases as price approaches, quantifies acceleration risk |
+### Design Principle
 
-**Why these matter:** Delta leads P&L. A 10-delta strike becoming 20-delta is a red flag *before* the debit price reflects it. GEX sign tells you whether the market's natural tendency is to revert (safe) or trend (dangerous). These are the earliest possible warning signals.
+For 0DTE, **the best exit system is not the fanciest model**. It is the one that survives contact with:
 
-**Data source:** You already fetch the full 0DTE option chain every monitoring cycle from Schwab/Tradier. Gamma and delta are available per strike. Net GEX requires aggregating `OI × gamma × 100 × spot_price` across all strikes (calls positive, puts negative for dealer perspective).
+- spread widening
+- delayed chain refreshes
+- quote flicker
+- regime shifts
+- model uncertainty
+- tail intraday moves in the final 60-90 minutes
 
-#### 1B. Regime Detection Features (6 features)
-
-| Feature | Source | Logic |
-|---------|--------|-------|
-| `rolling_atr_ratio` | SPX 1-min bars | 5-min rolling ATR / session ATR. >1.5 = vol expansion, <0.7 = compression. Detects when volatility is spiking or dying |
-| `hmm_state_prob_highvol` | HMM model output | P(high-vol regime) from 3-state HMM. Retrain daily on prior 20 days of 1-min bars. Use `hmmlearn` GaussianHMM |
-| `hmm_state_prob_trending` | HMM model output | P(trending regime). When high, mean-reversion assumptions break down |
-| `cusum_score` | SPX 1-min returns | CUSUM statistic on returns. Detects structural breaks (sudden shift in mean return) without lag. Threshold = 2σ of session returns |
-| `vix_vix1d_spread_change` | VIX + VIX1D bars | Change in VIX-VIX1D spread since position entry. Widening = stress increasing. Narrowing = calming |
-| `vix_intraday_range_pct` | VIX 1-min bars | (VIX high - VIX low) / VIX open since market open. High = volatile session |
-
-**HMM implementation detail:**
-```python
-from hmmlearn import hmm
-
-# Train daily before market open
-model = hmm.GaussianHMM(n_components=3, covariance_type="diag", n_iter=100)
-# Features: [1-min return, 5-min rolling vol, volume_ratio]
-# Fit on last 20 trading days of 1-min bars
-model.fit(X_train)
-
-# During trade: get current state probabilities
-state_probs = model.predict_proba(X_current)
-# Map states to regimes by emission means (lowest vol = calm, highest = crisis)
-```
-
-**CUSUM implementation detail:**
-```python
-def cusum_score(returns, threshold_sigma=2.0):
-    """Cumulative sum change-point detection."""
-    mu = returns.mean()
-    sigma = returns.std()
-    threshold = threshold_sigma * sigma
-    s_pos, s_neg = 0.0, 0.0
-    for r in returns:
-        s_pos = max(0, s_pos + (r - mu) - threshold / 2)
-        s_neg = max(0, s_neg - (r - mu) - threshold / 2)
-    return max(s_pos, s_neg) / sigma  # normalized score
-```
-
-#### 1C. Position-Aware Features (6 features)
-
-| Feature | Source | Logic |
-|---------|--------|-------|
-| `minutes_to_close` | Clock | Minutes until 3:00 PM ET forced close. Theta acceleration is non-linear — last 2 hours are qualitatively different |
-| `pnl_pct_of_max` | Position state | Current unrealized P&L as % of max possible profit (full credit). Range: -∞ to 1.0 |
-| `dist_to_short_call_atr` | SPX price + ATR | (Short call strike - SPX price) / rolling ATR. How many "vol units" of cushion you have on the call side |
-| `dist_to_short_put_atr` | SPX price + ATR | (SPX price - Short put strike) / rolling ATR. Cushion on put side |
-| `sltp_floor_pct` | SLTP state | Current SLTP locked floor as % of credit. 0 if SLTP not yet activated. Captures "how much profit is already secured" |
-| `time_in_trade_minutes` | Position state | Minutes since fill. Combined with PnL, tells you if theta is working as expected |
-
-#### 1D. Cross-Asset Intraday (3 features)
-
-| Feature | Source | Logic |
-|---------|--------|-------|
-| `spx_vwap_offset_pct` | SPX 1-min bars | (SPX price - VWAP) / VWAP × 100. Far from VWAP = extended, likely to revert (good for IC) |
-| `tick_cumulative` | NYSE tick (if available) | Cumulative NYSE TICK. Extreme readings (+1000/-1000) signal exhaustion |
-| `put_call_ratio_change` | Option chain | Change in 0DTE put/call volume ratio since entry. Rising = fear increasing |
-
-### Data Pipeline
-
-```
-┌─────────────────────┐     ┌──────────────────┐     ┌─────────────────┐
-│ ThetaData / Schwab  │────▶│ Feature Builder   │────▶│ Feature Vector  │
-│ - SPX 1-min OHLCV   │     │ (extends v1_2     │     │ ~19 features    │
-│ - VIX 1-min         │     │  live_features.py) │     │ every 1 minute  │
-│ - 0DTE option chain │     │                    │     │                 │
-│ - VIX1D (if avail)  │     │ + HMM model state  │     │                 │
-└─────────────────────┘     └──────────────────┘     └─────────────────┘
-```
-
-Extends the existing `ml/zdom_v1_2/6_execution/scripts/live_features.py` pattern — same data sources, just computed every minute during the trade instead of only at entry.
+If a proposed feature or model cannot be computed reliably and quickly in live trading, it does not belong in the critical path.
 
 ---
 
-## Phase 2: ML Exit Advisor
+## What Needs To Change
 
-### Goal
-Train a classification model that predicts whether to hold or exit an open 0DTE iron condor, scored every monitoring cycle.
+### The Key Weaknesses In The Original V2 Plan
 
-### Target Definition
+The original V2 plan was directionally right, but incomplete in five important ways:
 
-**Primary target: `should_exit_now`** (binary)
+1. **Target design was too naive.**
+   A binary `should_exit_now` label based on realized final P&L is not a clean counterfactual. It teaches the model from one realized path under one historical policy.
 
-For every minute of every historical IC trade trajectory:
-- Compute `pnl_if_close_now = (credit - current_debit) × qty × 100 - fees`
-- Compute `pnl_if_hold = actual_final_pnl` (what actually happened if you held to natural exit)
-- Label = 1 if `pnl_if_close_now > pnl_if_hold` (closing now is better than holding)
-- Label = 0 if holding produces better outcome
+2. **The action space was too small.**
+   "Hold / tighten / exit" is not enough. A serious 0DTE manager should be able to distinguish:
+   - hold
+   - reduce risk
+   - cut threatened side
+   - flatten entire condor
+   - switch to emergency execution mode
 
-This creates a **counterfactual target** — at each minute, did the trader benefit from holding or would they have been better off exiting?
+3. **Execution was under-modeled.**
+   In 0DTE, the difference between quote value and fill value is often the difference between a tolerable exit and a disastrous one.
 
-**Secondary target: `adverse_move_5min`** (binary)
+4. **Validation was too weak.**
+   Ordinary holdout testing is not enough for a highly adaptive intraday strategy. We need purged / embargoed temporal validation and shadow deployment before capital promotion.
 
-- Label = 1 if the position loses >15% of remaining credit in the next 5 minutes
-- Label = 0 otherwise
-- This is a **danger detection** model — fires before damage occurs
-
-**Why these targets:**
-- `should_exit_now` directly optimizes the exit decision
-- `adverse_move_5min` provides early warning that the primary model can use, and works independently as a "get out now" signal
-
-### Training Data Construction
-
-You already have the building blocks:
-
-1. **Historical IC trajectories** from your target builder (`build_target_v1.py`):
-   - Entry time, strikes, credit, quantity
-   - Minute-by-minute debit prices from ThetaData
-   - Final exit reason (TP, SL, close_win, close_loss)
-
-2. **For each trajectory, at each minute**, reconstruct:
-   - All Phase 1 features (from historical 1-min SPX/VIX bars + option chain snapshots)
-   - Position-aware features (current debit, P&L, time remaining)
-   - The counterfactual label (close now vs. hold)
-
-3. **Expected dataset size:**
-   - ~500 trading days × ~4 entries/day × ~180 minutes/trade = ~360,000 labeled rows
-   - Each row has ~19 Phase 1 features + position features
-   - Plenty for tree-based models
-
-### Training Pipeline
-
-```python
-# Pseudocode for training data construction
-
-for each historical trade in backtest:
-    entry_time, strikes, credit, qty = trade.entry_info
-    trajectory = get_minute_by_minute_debit(trade)  # already built in target builder
-
-    for minute_idx, (timestamp, debit) in enumerate(trajectory):
-        # Phase 1 features at this timestamp
-        features = build_realtime_features(timestamp, strikes, debit, credit, ...)
-
-        # Counterfactual label
-        pnl_close_now = (credit - debit) * qty * 100 - fees
-        pnl_hold = trade.final_pnl
-        label_exit = 1 if pnl_close_now > pnl_hold else 0
-
-        # Adverse move label
-        if minute_idx + 5 < len(trajectory):
-            future_debit = trajectory[minute_idx + 5].debit
-            credit_remaining = credit - debit
-            loss_pct = (future_debit - debit) / max(credit_remaining, 0.01)
-            label_adverse = 1 if loss_pct > 0.15 else 0
-
-        dataset.append({**features, 'should_exit': label_exit, 'adverse_5min': label_adverse})
-```
-
-### Model Architecture
-
-**Algorithm:** LightGBM (same stack as v1_2, proven on your data)
-
-**Why not LSTM/RL:**
-- LightGBM handles tabular features well and you have ~360K rows — plenty
-- RL (PPO/DQN) needs enormous trajectory count for stable policies, massive hyperparameter tuning, reward shaping
-- LSTM adds complexity for marginal gain on tabular data
-- Start simple. If LightGBM ceiling is hit, then consider sequence models
-
-**Two models:**
-1. `exit_advisor_lgbm_v2.pkl` — predicts P(should_exit_now)
-2. `adverse_detector_lgbm_v2.pkl` — predicts P(adverse_move_5min)
-
-**Validation:**
-- Walk-forward split matching v1_2 (train on 2024 and prior, test on holdout)
-- Metrics: AUC, precision@recall=0.5, calibration curve
-- **Critical metric:** Expected P&L improvement — simulate using model's exit signals vs. baseline (current static exits) on holdout period
-
-### Integration with Monitoring Loop
-
-```python
-# In the monitoring loop (currently every 30s, change to every 60s for feature computation)
-
-features = build_v2_realtime_features(...)  # Phase 1
-
-# Score both models
-p_exit = exit_advisor.predict_proba(features)[1]
-p_adverse = adverse_detector.predict_proba(features)[1]
-
-# Combine into hold_confidence
-hold_confidence = 1.0 - max(p_exit, p_adverse * 1.5)  # adverse gets 1.5x weight (safety bias)
-
-# Action thresholds (tuned on holdout)
-if hold_confidence > 0.6:
-    # Continue with existing monitoring logic (SLTP, fixed SL)
-    pass
-elif hold_confidence > 0.3:
-    # Tighten: apply Phase 3 dynamic SL/TP adjustments
-    apply_dynamic_adjustments(...)
-else:
-    # Exit immediately
-    close_position(reason="v2_exit_advisor")
-```
+5. **Dealer gamma inference was too central.**
+   Approximate GEX from open interest is useful as a weak feature. It is not reliable enough to be the sole regime spine or a dominant hard override.
 
 ---
 
-## Phase 3: Dynamic TP/SL Adjustment
+## System Architecture
 
-### Goal
-Replace fixed TP/SL thresholds with regime-adaptive ones that tighten in danger and relax in safety.
+### Core Idea
 
-### 3A. ATR-Adaptive Stop Loss
+V2.1 should be built as a **6-layer stack**.
 
-Current: Fixed SL at 2× credit (or portfolio-based cap).
+### Layer 1: Live State Estimation
 
-New: SL multiplier varies with current volatility regime.
+Estimate four state buckets every monitoring cycle:
 
-```python
-def dynamic_sl_debit(credit, rolling_atr, session_atr, hmm_state_probs):
-    """Regime-adaptive stop loss."""
-    atr_ratio = rolling_atr / session_atr
+1. **Market state**
+   - price trend
+   - realized volatility burst
+   - distance from VWAP
+   - structural break / acceleration
 
-    # Base multiplier from HMM regime
-    regime_mults = {
-        'low_vol': 2.5,    # wider — let theta work in calm markets
-        'neutral': 2.0,    # baseline (same as current)
-        'high_vol': 1.5,   # tighter — cut losses faster in volatile regime
-    }
-    # Weighted by regime probabilities (soft, not hard switch)
-    base_mult = sum(regime_mults[r] * p for r, p in zip(regime_mults, hmm_state_probs))
+2. **Volatility state**
+   - realized vol regime
+   - IV term / intraday stress
+   - short-strike gamma acceleration
 
-    # ATR adjustment — if current vol is 2x session average, tighten further
-    atr_adj = max(0.8, min(1.2, 1.0 / atr_ratio))  # clamp to [0.8, 1.2]
+3. **Liquidity state**
+   - spread width
+   - quote instability
+   - closeable size at best quotes
+   - expected fill slippage
 
-    sl_mult = base_mult * atr_adj
-    return credit * sl_mult
-```
+4. **Position state**
+   - debit-to-close
+   - P&L
+   - minutes since entry
+   - minutes to forced close
+   - per-side threat level
+   - portfolio overlap / concentration
 
-**Effect:**
-- Calm market (HMM low-vol, ATR ratio 0.5): SL at 2.5× credit → wide, avoids noise exits
-- Normal market: SL at 2.0× credit → same as current
-- Volatile market (HMM high-vol, ATR ratio 2.0): SL at 1.2× credit → tight, preserves capital
+### Layer 2: Hard Risk Rules
 
-### 3B. Time-Decay TP Progression
+These fire regardless of ML.
 
-Current: Fixed 25% TP target throughout the trade.
+- short-strike delta breach
+- short-strike gamma acceleration breach
+- distance-to-short collapse
+- severe spread dislocation
+- portfolio daily loss limit
+- account combined loss limit
+- forced close time
 
-New: TP target tightens as theta accelerates in the afternoon.
+Hard rules are the first line of defense and remain active even if models fail.
 
-```python
-def dynamic_tp_pct(base_tp_pct, minutes_to_close):
-    """Progressive TP tightening as expiration approaches."""
-    if minutes_to_close > 180:  # before noon
-        return base_tp_pct  # full target (e.g., 25%)
-    elif minutes_to_close > 60:  # noon to 2 PM
-        # Linear tightening: 25% → 15%
-        progress = (180 - minutes_to_close) / 120
-        return base_tp_pct - (base_tp_pct - 0.15) * progress
-    else:  # final hour
-        # Aggressive tightening: 15% → 5%
-        progress = (60 - minutes_to_close) / 60
-        return 0.15 - 0.10 * progress
-```
+### Layer 3: Forecasting Models
 
-**Rationale from research:** The final hour has extreme gamma acceleration. A 0DTE ATM option can swing from 0.50 to 0.80 delta on a small move. CBOE's Schwartz: *"You could be up $150 five minutes before close and one small move puts you down $400-500."* Taking 5-10% profit at 2:50 PM is better than risking a gamma spike for the full 25%.
+Three models, not one:
 
-### 3C. Delta-Based Emergency Exit
+1. **Continuation-value model**
+   Predict expected terminal P&L if we hold for the next decision horizon.
 
-This is the single highest-impact change. No ML needed — purely rule-based.
+2. **Tail-risk / hazard model**
+   Predict probability of severe adverse move, stop breach, or strike-touch over short horizons.
 
-```python
-def check_delta_emergency(short_call_delta, short_put_delta, threshold=0.25):
-    """Exit when short strike delta exceeds danger threshold.
+3. **Exit-cost model**
+   Predict expected slippage / fill penalty conditional on current liquidity state and urgency.
 
-    Delta leads P&L for short options. A 10-delta strike becoming 25-delta
-    means the probability of your strike being breached has increased 2.5x
-    since entry — and the P&L impact accelerates from here (negative gamma).
-    """
-    if abs(short_call_delta) > threshold or abs(short_put_delta) > threshold:
-        return True, "delta_emergency"
-    return False, None
-```
+### Layer 4: Policy Engine
 
-**Why this matters:** Your current monitoring checks *debit price* (lagging indicator). Delta is a *leading indicator* — it tells you the market has moved significantly toward your short strike before the full P&L impact materializes. This fires 1-3 minutes earlier than a P&L-based stop, which for 0DTE can mean the difference between a -1.5× and -2.5× loss.
+Choose actions under constraints:
 
-### 3D. Regime-Weighted SLTP Ratchet
+- maximize expected value
+- minimize tail risk
+- penalize bad execution states
+- obey kill switches and capital constraints
 
-Current: SLTP activates at 30% profit and ratchets every 5%.
+### Layer 5: Execution Engine
 
-New: Activation and ratchet step adapt to regime.
+Handle how we exit:
 
-```python
-def dynamic_sltp_params(hmm_state_probs):
-    """Regime-adaptive SLTP parameters."""
-    # High-vol regime: activate earlier, ratchet tighter (protect gains aggressively)
-    # Low-vol regime: activate later, ratchet wider (let winners run)
-    regime_params = {
-        'low_vol':  {'activate_pct': 0.40, 'ratchet_step': 0.08, 'floor_offset': 0.10},
-        'neutral':  {'activate_pct': 0.30, 'ratchet_step': 0.05, 'floor_offset': 0.05},
-        'high_vol': {'activate_pct': 0.20, 'ratchet_step': 0.03, 'floor_offset': 0.03},
-    }
-    # Weighted blend
-    params = {}
-    for key in ['activate_pct', 'ratchet_step', 'floor_offset']:
-        params[key] = sum(
-            regime_params[r][key] * p
-            for r, p in zip(regime_params, hmm_state_probs)
-        )
-    return params
-```
+- patient profit-taking ladder
+- moderate urgency marketable-limit ladder
+- emergency flatten mode
+- cancel/replace sequencing
+- legged or net exit only where policy allows
+
+### Layer 6: Monitoring, Drift, and Governance
+
+- calibration tracking
+- feature drift
+- regime drift
+- live-vs-shadow comparison
+- automatic fallback to simpler rules when uncertainty rises
 
 ---
 
-## Phase 4: GEX-Aware Position Management (Stretch Goal)
+## Action Space
 
-### Approximate GEX from Existing Data
+V2.1 should manage each iron condor as:
 
-You already fetch the full 0DTE option chain. Approximate net GEX:
+- one **portfolio object**
+- plus two **risk units**: put spread side and call spread side
+
+### Allowed Actions
+
+1. **HOLD**
+   Keep current risk posture.
+
+2. **TIGHTEN**
+   Move to tighter SLTP / tighter stop / higher urgency execution if exit triggers.
+
+3. **REDUCE**
+   Close part of size if multiple contracts are open.
+
+4. **SIDE-CUT**
+   Exit or reduce the threatened side if supported by execution logic and margin rules.
+
+5. **FULL EXIT**
+   Close the entire condor.
+
+6. **EMERGENCY EXIT**
+   Immediate urgency escalation with aggressive execution assumptions.
+
+If side-cutting is too operationally risky at first, we should still design the research framework to support it later.
+
+---
+
+## Live Data Requirements
+
+The system must distinguish between:
+
+- **critical-path live data**: required for real-time decisions
+- **research-grade historical data**: required for training, replay, and validation
+
+### Critical-Path Live Data
+
+#### 1. SPX / SPY 1-Minute Underlying Bars
+
+**Needed for**
+
+- realized vol
+- ATR / range expansion
+- VWAP offset
+- trend / momentum features
+- break detection
+- time-bucket context
+
+**Possible live sources**
+
+- Tradier underlying quote / timesales if available
+- Schwab quote endpoints
+- Polygon / ThetaData if already licensed
+- Internal 1-minute bar builder from streaming quotes
+
+**Live computation**
+
+- maintain rolling windows in memory
+- update on each new minute
+- no historical reload required intraday beyond warm start
+
+#### 2. Full 0DTE SPX/SPXW Option Chain With Quotes + Greeks
+
+**Needed for**
+
+- debit-to-close
+- short-strike delta
+- short-strike gamma
+- per-side spread width
+- quote stability
+- closeable size
+- approximate intraday skew / shape
+
+**Possible live sources**
+
+- Schwab option chain
+- Tradier option chain
+- ThetaData if available
+
+**Must have fields**
+
+- bid / ask
+- bid size / ask size if possible
+- delta
+- gamma
+- IV
+- symbol / strike / expiration / type
+
+#### 3. Open Interest
+
+**Needed for**
+
+- approximate OI-weighted surface context
+- rough GEX / flip-distance estimation
+
+**Reality**
+
+OI is usually stale intraday. It is still useful as a slow-moving contextual feature, but should not be treated as precise live positioning.
+
+**Possible sources**
+
+- historical daily OI from data vendor
+- chain endpoint if broker includes OI
+- Cboe historical datasets for research
+
+#### 4. VIX / VIX1D / Vol Context
+
+**Needed for**
+
+- intraday stress regime
+- vol spread changes
+- end-of-day gamma/tail urgency scaling
+
+**Possible live sources**
+
+- broker quote endpoints if supported
+- vendor feed
+- daily fallback if live VIX1D is unavailable
+
+#### 5. Order / Fill Telemetry
+
+**Needed for**
+
+- build slippage model
+- calibrate exit-cost expectations
+- compare quote mid vs. executed fill
+
+**Source**
+
+- your own broker order history and local logs
+
+This is one of the most important datasets in the entire system.
+
+### Research-Grade Historical Data
+
+#### Minimum acceptable historical set
+
+- 1-minute SPX or SPY bars
+- 1-minute VIX and VIX1D if possible
+- 1-minute SPXW option quotes with Greeks
+- daily open interest
+- your own historical fills and order outcomes
+
+#### Best-in-class research add-ons
+
+- Cboe DataShop option quote intervals with Greeks and OI
+- Cboe Open-Close / capacity summaries for capacity-aware context
+- trade-by-trade or higher-resolution quote data if budget later allows
+
+### Data Strategy Recommendation
+
+Use a **three-tier data plan**:
+
+1. **Immediate**
+   Broker chain + underlying bars + your own execution logs
+
+2. **Research upgrade**
+   Add Cboe or vendor historical minute option quotes with Greeks and OI for proper replay
+
+3. **Institutional upgrade**
+   Add richer microstructure or trade-capacity datasets only if V2.1 proves edge and scaling justifies cost
+
+---
+
+## Feature Framework
+
+All critical-path features must be computable from live rolling state in memory. No expensive intraday recomputation from scratch.
+
+### Feature Group A: Position Threat Features
+
+These are the highest-priority live features.
+
+| Feature | Description | Live Computation |
+|--------|-------------|------------------|
+| `short_call_delta_abs` | absolute delta of short call | from live chain |
+| `short_put_delta_abs` | absolute delta of short put | from live chain |
+| `short_call_gamma` | short call gamma | from live chain |
+| `short_put_gamma` | short put gamma | from live chain |
+| `call_distance_pts` | short call strike minus spot | strike - spot |
+| `put_distance_pts` | spot minus short put strike | spot - strike |
+| `call_distance_atr` | call cushion in ATR units | `call_distance_pts / rolling_atr` |
+| `put_distance_atr` | put cushion in ATR units | `put_distance_pts / rolling_atr` |
+| `threatened_side` | call / put / neither | side with lower normalized cushion |
+| `delta_velocity` | change in short-strike delta over last N minutes | rolling diff |
+| `gamma_velocity` | change in short-strike gamma over last N minutes | rolling diff |
+
+**Why it matters**
+
+These features measure whether a side is becoming dangerous before the full debit expansion shows up.
+
+### Feature Group B: Price / Vol State Features
+
+| Feature | Description | Live Computation |
+|--------|-------------|------------------|
+| `ret_1m` | 1-minute return | from bar cache |
+| `ret_3m` | 3-minute return | rolling |
+| `ret_5m` | 5-minute return | rolling |
+| `rv_5m` | realized vol over 5 minutes | rolling std of returns |
+| `rv_15m` | realized vol over 15 minutes | rolling std |
+| `rv_burst_ratio` | short RV / longer RV | `rv_5m / rv_30m` |
+| `rolling_atr_5m` | intraday ATR | rolling high-low range |
+| `session_atr_like` | session average range proxy | running average |
+| `atr_ratio` | current ATR vs session ATR | `rolling_atr_5m / session_atr_like` |
+| `vwap_offset_pct` | distance from VWAP | `(spot - vwap)/vwap` |
+| `range_exhaustion` | current session range vs baseline | current range / trailing reference |
+| `break_score` | structural break / acceleration score | CUSUM or simplified burst metric |
+
+### Feature Group C: Liquidity / Execution Features
+
+These are missing from the original V2 and are mandatory.
+
+| Feature | Description | Live Computation |
+|--------|-------------|------------------|
+| `net_close_width` | net spread width to close condor | close ask - close bid approximation |
+| `net_close_mid` | approximate net close mid | from leg mids |
+| `net_close_ask` | executable net close ask proxy | shorts at ask, longs at bid |
+| `width_pct_mid` | width normalized by mid | `width / max(mid, eps)` |
+| `short_leg_width_max` | max width of any short leg | max per-side width |
+| `quote_refresh_gap_sec` | seconds since last quote update | local clock delta |
+| `size_imbalance_proxy` | bid/ask size imbalance if available | from sizes |
+| `estimated_slippage` | expected fill penalty | model or heuristic |
+
+**Why it matters**
+
+A great risk signal with bad exit liquidity is not a great signal. It changes the optimal action.
+
+### Feature Group D: Time State Features
+
+| Feature | Description | Live Computation |
+|--------|-------------|------------------|
+| `minutes_since_entry` | age of trade | clock |
+| `minutes_to_close` | time until forced flatten | clock |
+| `final_hour_flag` | last 60 minutes | clock |
+| `final_30m_flag` | last 30 minutes | clock |
+| `time_bucket` | early / midday / late | categorical |
+
+### Feature Group E: Portfolio Features
+
+| Feature | Description | Live Computation |
+|--------|-------------|------------------|
+| `account_open_positions` | number of open ICs | live account state |
+| `same_side_overlap_score` | clustered tail exposure across positions | compare threatened sides + strike proximity |
+| `combined_unrealized_pct` | account unrealized P&L vs portfolio value | live |
+| `daily_loss_remaining` | room until kill switch | live |
+| `gamma_concentration_score` | exposure concentration proxy | sum of threatened-side gamma across positions |
+
+### Feature Group F: Context Features
+
+Use these as weak context, not hard truth.
+
+| Feature | Description | Live Computation |
+|--------|-------------|------------------|
+| `approx_net_gex_sign` | sign of rough OI-weighted gamma exposure | daily OI + live gamma |
+| `dist_to_gex_flip_proxy` | spot distance to estimated gamma-flip level | chain aggregation |
+| `vix_level` | live or delayed VIX level | quote feed |
+| `vix1d_spread` | VIX minus VIX1D or equivalent stress spread | quote feed |
+| `iv_skew_proxy` | difference between put/call wing IVs | live chain |
+
+### What Not To Put In The Critical Path
+
+- full-blown HMM retraining intraday
+- expensive OI-heavy recalculation every few seconds
+- features requiring unavailable trade-capacity data
+- anything that turns one monitoring cycle into a latency risk
+
+If HMMs are used at all, they should be pre-trained offline and served as a lightweight inference component, not retrained intraday.
+
+---
+
+## Live Computation Design
+
+### Monitoring Frequency
+
+Use **variable-frequency monitoring**, not fixed-frequency monitoring.
+
+#### Normal mode
+
+- every 30-60 seconds
+
+#### Elevated-risk mode
+
+Switch to every 10-15 seconds when any of the following occurs:
+
+- short-strike delta above warning threshold
+- delta velocity spike
+- ATR burst ratio above threshold
+- liquidity width deteriorates sharply
+- final 45-60 minutes of session
+
+#### Emergency mode
+
+Immediate re-check loop while executing emergency exit until position is confirmed closed or replaced.
+
+### In-Memory Rolling State
+
+Maintain:
+
+- bar cache for the current session
+- per-position quote cache
+- per-position feature cache
+- rolling statistics objects
+- last-known execution state
+
+No feature should require a cold scan of historical files during live management.
+
+### Practical Calculation Notes
+
+#### Debit-to-close
+
+Keep the current executable approximation:
+
+- buy shorts at ask
+- sell longs at bid
+
+But also track:
+
+- mid-based estimate
+- width
+- realized fill slippage versus both
+
+#### ATR proxy
+
+For live use, a robust intraday proxy is sufficient:
 
 ```python
-def compute_net_gex(chain, spot_price):
-    """Approximate net gamma exposure from option chain.
-
-    Assumes dealers are short calls and long puts (standard assumption).
-    Positive GEX = dealers long gamma = price stabilizing.
-    Negative GEX = dealers short gamma = price destabilizing.
-    """
-    net_gex = 0.0
-    for strike in chain:
-        # Calls: dealers short → negative gamma for dealers when call OI is high
-        # But standard GEX convention: call OI creates positive GEX (dealers hedge by buying dips)
-        call_gex = strike.call_oi * strike.call_gamma * 100 * spot_price
-        put_gex = -strike.put_oi * strike.put_gamma * 100 * spot_price  # puts flip sign
-        net_gex += call_gex + put_gex
-    return net_gex
+rolling_atr = mean(high_low_range over last 5-10 bars)
+session_atr_like = running_mean(high_low_range since open)
+atr_ratio = rolling_atr / max(session_atr_like, eps)
 ```
 
-### GEX-Based Regime Override
+#### Delta / gamma velocity
 
 ```python
-def gex_regime_adjustment(net_gex, net_gex_history):
-    """Override HMM regime when GEX signals clear danger."""
-    gex_percentile = percentile_rank(net_gex, net_gex_history)
-
-    if gex_percentile < 10:  # bottom 10% = extremely negative GEX
-        return 'force_high_vol'  # override to tightest stops
-    elif gex_percentile > 90:  # top 10% = strongly positive GEX
-        return 'force_low_vol'   # override to widest stops (pinning likely)
-    return None  # no override, use HMM
+delta_velocity = short_delta_now - short_delta_3m_ago
+gamma_velocity = short_gamma_now - short_gamma_3m_ago
 ```
 
-### Gamma Flip Level as Support/Resistance
+#### Threatened side
 
 ```python
-def find_gamma_flip(chain, spot_price):
-    """Find the strike where cumulative GEX changes sign.
-
-    Price crossing this level = regime change from stabilizing to destabilizing.
-    """
-    cumulative = 0.0
-    for strike in sorted(chain, key=lambda s: s.strike):
-        call_gex = strike.call_oi * strike.call_gamma * 100 * spot_price
-        put_gex = -strike.put_oi * strike.put_gamma * 100 * spot_price
-        prev_cumulative = cumulative
-        cumulative += call_gex + put_gex
-        if prev_cumulative * cumulative < 0:  # sign change
-            return strike.strike
-    return None
+call_threat = call_distance_atr / max(short_call_delta_abs, eps)
+put_threat  = put_distance_atr  / max(short_put_delta_abs, eps)
+threatened_side = "call" if call_threat < put_threat else "put"
 ```
 
-Use as: if SPX crosses the gamma flip level while your IC is open, immediately tighten all stops by 30%.
+This is simple, interpretable, and live-computable.
+
+---
+
+## Hard Risk Rules
+
+These should ship before any model.
+
+### Rule 1: Delta Emergency Exit
+
+Trigger emergency logic when:
+
+- short call delta exceeds threshold, or
+- short put delta exceeds threshold
+
+Two-stage approach:
+
+- warning threshold: `0.18-0.22`
+- emergency threshold: `0.25-0.30`
+
+Thresholds must be tuned by replay, not guessed.
+
+### Rule 2: Gamma Acceleration Exit
+
+Trigger when:
+
+- short-side gamma crosses a danger threshold, or
+- gamma velocity spikes while cushion is collapsing
+
+This catches the non-linear acceleration phase that pure debit logic often sees too late.
+
+### Rule 3: Cushion Collapse
+
+Trigger when:
+
+- distance to short strike in ATR units drops below threshold
+
+This is often easier to stabilize than raw gamma.
+
+### Rule 4: Liquidity Protection
+
+If spread width or quote instability becomes extreme:
+
+- switch to higher urgency
+- reduce confidence in model value estimates
+- do not wait for delicate profit targets
+
+### Rule 5: Time-Based Gamma Clamp
+
+From the final 45-60 minutes:
+
+- tighten all profit-taking logic
+- lower tolerance for side threat
+- increase monitoring frequency
+
+### Rule 6: Portfolio Kill Switches
+
+- daily realized loss cap
+- account combined loss cap
+- max number of emergency exits per day
+- regime-dislocation circuit breaker
+
+---
+
+## Modeling Framework
+
+### Model A: Continuation-Value Model
+
+**Purpose**
+
+Estimate expected terminal P&L if we continue holding from the current state, under the current policy horizon.
+
+**Target**
+
+Regression target:
+
+- terminal P&L if hold from time `t` until:
+  - next forced decision point,
+  - stop/TP trigger,
+  - forced close,
+  - or chosen policy horizon
+
+This is better than a single binary label because it preserves magnitude.
+
+**Candidate algorithms**
+
+- LightGBM regressor
+- XGBoost regressor
+
+Start simple.
+
+### Model B: Tail-Risk / Hazard Model
+
+**Purpose**
+
+Estimate short-horizon probabilities such as:
+
+- severe adverse move in next 1/3/5 minutes
+- stop breach in next N minutes
+- strike-touch probability in next N minutes
+
+**Targets**
+
+- binary hazard labels over multiple horizons
+
+This should become the safety-biased model.
+
+### Model C: Exit-Cost Model
+
+**Purpose**
+
+Estimate expected slippage and fill cost if we try to exit now with a given urgency.
+
+**Target**
+
+- actual fill debit minus quote-mid
+- actual fill debit minus executable proxy
+
+Model separately by:
+
+- profit-taking exits
+- normal-risk exits
+- emergency exits
+
+### Why This Stack Is Better Than A Single Classifier
+
+A single `should_exit_now` classifier mixes:
+
+- value estimation
+- risk estimation
+- execution estimation
+
+Those are different problems and should not be forced into one number if we can separate them cleanly.
+
+---
+
+## Policy Engine
+
+### Decision Score
+
+At each cycle:
+
+1. Estimate continuation value
+2. Estimate tail risk
+3. Estimate exit cost
+4. Estimate uncertainty / out-of-distribution risk
+5. Choose action under hard constraints
+
+### Example Policy Logic
+
+```python
+if hard_risk_rule_triggered:
+    return EMERGENCY_EXIT
+
+if uncertainty_high:
+    return SIMPLE_RULE_FALLBACK
+
+net_hold_value = continuation_value
+net_exit_value = current_pnl - expected_exit_cost
+
+if tail_risk_prob > tail_risk_limit:
+    if exit_liquidity_ok:
+        return FULL_EXIT
+    return EMERGENCY_EXIT
+
+if net_exit_value > net_hold_value + policy_buffer:
+    return FULL_EXIT
+
+if threatened_side and threat_rising:
+    return TIGHTEN
+
+return HOLD
+```
+
+### Uncertainty Handling
+
+Do not trust model outputs equally in all states.
+
+Add:
+
+- calibration tracking
+- out-of-distribution distance checks
+- conformal or adaptive error-band logic if feasible
+
+When uncertainty is high:
+
+- reduce model authority
+- increase hard-rule authority
+- simplify to conservative logic
+
+---
+
+## Execution Engine
+
+This is a first-class part of V2.1.
+
+### Exit Modes
+
+#### 1. Harvest Mode
+
+For favorable exits:
+
+- use patient limit pricing
+- small number of reprices
+- low urgency
+
+#### 2. Defensive Mode
+
+For normal stop / elevated risk:
+
+- marketable-limit
+- tighter cancel/replace cadence
+- cap waiting time
+
+#### 3. Emergency Mode
+
+For tail events:
+
+- aggressive marketable-limit or market logic depending broker support and risk rules
+- immediate recheck until flat
+
+### Data To Log On Every Exit
+
+- timestamp
+- quoted net mid
+- quoted executable proxy
+- order price
+- fill price
+- time-to-fill
+- quote width
+- urgency mode
+- reason for exit
+
+This data becomes the training set for the exit-cost model.
+
+---
+
+## Validation Framework
+
+### Required Validation Standards
+
+1. **Temporal walk-forward**
+   Standard forward-only testing.
+
+2. **Purged / embargoed validation**
+   Remove leakage from overlapping labels and neighboring observations.
+
+3. **Multiple-path robustness**
+   Use combinatorial-style temporal splits where feasible to reduce path luck.
+
+4. **Execution-aware replay**
+   Evaluate with realistic slippage / width assumptions, not idealized mid fills.
+
+5. **Shadow live deployment**
+   Run the new engine in paper/shadow mode alongside current production before promotion.
+
+### Metrics That Matter
+
+Primary:
+
+- max drawdown
+- worst trade loss
+- CVaR / left-tail metrics
+- realized slippage
+- Sharpe / Sortino after execution assumptions
+- percentage of days hitting kill switches
+
+Secondary:
+
+- raw return
+- win rate
+- AUC
+- precision / recall
+
+### Promotion Ladder
+
+#### Stage 1: Research greenlight
+
+- replay beats baseline on tail risk and maintains acceptable return
+
+#### Stage 2: Shadow greenlight
+
+- live shadow decisions improve simulated outcomes vs current live policy
+
+#### Stage 3: Limited capital rollout
+
+- one account, low size, hard fallback enabled
+
+#### Stage 4: General rollout
+
+- only after stable calibration and execution behavior
 
 ---
 
 ## Implementation Roadmap
 
-### Priority Order (highest impact first)
+### Phase 0: Instrument The Current Live System
 
-| Priority | Component | Effort | Impact | Dependencies |
-|----------|-----------|--------|--------|-------------|
-| **P0** | Delta-based emergency exit (3C) | 1 day | Very High | None — can ship today |
-| **P1** | Phase 1 feature stream | 1 week | High | Extends existing live_features.py |
-| **P2** | HMM regime detection | 3 days | High | Phase 1 (for training data) |
-| **P3** | ATR-adaptive SL (3A) | 2 days | Medium-High | Phase 1 (rolling ATR) + P2 (HMM state) |
-| **P4** | Time-decay TP (3B) | 1 day | Medium | None |
-| **P5** | Phase 2 training data construction | 1 week | High | Phase 1 (need features for each trajectory minute) |
-| **P6** | Phase 2 model training + validation | 3 days | High | P5 |
-| **P7** | Phase 2 integration with bot | 2 days | High | P6 + P3 |
-| **P8** | Dynamic SLTP ratchet (3D) | 1 day | Medium | P2 (HMM state) |
-| **P9** | Phase 4 GEX computation | 3 days | Medium | Existing chain data |
-| **P10** | Phase 4 GEX integration | 2 days | Medium | P9 + P3 |
+**Goal**
 
-### Quick Wins (ship before ML is ready)
+Create the telemetry foundation for V2.1.
 
-1. **Delta monitoring** (P0): Add `short_strike_delta` check to existing monitoring loop. Exit when delta > 0.25. Zero ML, zero new data, massive risk reduction.
+**Build**
 
-2. **Time-decay TP** (P4): Replace fixed 25% TP with the time-aware progression. Pure math, no model needed.
+- log every monitor cycle per position
+- log per-leg and net quote widths
+- log delta/gamma of shorts each cycle
+- log exit reason and fill outcome
+- log quote-to-fill slippage
 
-3. **Rolling ATR ratio** (subset of P1): Compute 5-min ATR / session ATR during monitoring. Log it. Use it to inform manual decisions before full automation.
+**Impact**
 
-### What NOT to Build (Yet)
+This makes future modeling credible.
 
-- **RL/PPO agent:** Massive complexity, needs 10x more trajectory data for stable policies, reward shaping is an open research problem. LightGBM classification gets 80% of the benefit at 20% of the cost. Revisit only if Phase 2 model hits a ceiling.
+### Phase 1: Ship Hard Rules First
 
-- **Order flow / Level 2 data:** You don't have this data source and it's expensive ($500+/month for quality feeds). GEX + VIX + ATR regime detection covers overlapping ground from data you already have.
+**Goal**
 
-- **Full GEX from SpotGamma API:** Starts at $100/month. Your own approximate GEX from option chain OI is sufficient for regime detection. Consider SpotGamma only if your approximation proves too noisy.
+Capture the highest-value improvements without ML dependency.
 
-- **LSTM sequence model:** Your features are tabular and cross-sectional per minute. LightGBM handles this natively. LSTM would require windowed input, more engineering, and is typically marginal over gradient boosting on structured data. Only consider if you want to capture multi-minute temporal patterns that single-row features miss.
+**Build**
+
+- warning + emergency delta thresholds
+- gamma acceleration guard
+- cushion-collapse rule
+- variable-frequency monitoring
+- final-hour gamma clamp
+- stricter kill switches
+
+**Expected result**
+
+Lower tail losses and better emergency responsiveness.
+
+### Phase 2: Build Historical Replay Engine
+
+**Goal**
+
+Reconstruct per-minute position state and simulate decisions honestly.
+
+**Build**
+
+- position trajectory builder
+- per-minute live-equivalent feature builder
+- replay engine with action simulation
+- execution assumption layer
+
+### Phase 3: Train The Three Core Models
+
+**Build**
+
+- continuation-value model
+- hazard model
+- exit-cost model
+
+**Requirement**
+
+All trained and validated on purged temporal splits.
+
+### Phase 4: Policy Engine Integration
+
+**Build**
+
+- decision scorer
+- uncertainty gate
+- fallback logic
+- risk constraint interface
+
+### Phase 5: Shadow Deployment
+
+**Build**
+
+- live scoring without trading
+- compare current production decisions vs V2.1 recommendations
+- analyze disagreements and missed saves
+
+### Phase 6: Controlled Production Rollout
+
+**Build**
+
+- feature flags
+- per-account rollout control
+- automatic fallback
+- live calibration dashboards / summaries
 
 ---
 
-## Success Metrics
+## Concrete Data-and-Feature Build Plan
 
-### Backtest Metrics (compare V2 exits vs V1.2 exits on same entries)
+### What We Can Compute Live Immediately
 
-| Metric | V1.2 Baseline | V2 Target |
-|--------|--------------|-----------|
-| Max drawdown | Measure current | Reduce by 30%+ |
-| Sharpe ratio | Measure current | Improve by 0.3+ |
-| Worst single trade loss | Measure current | Reduce by 40%+ |
-| Win rate | Measure current | Maintain ±2% |
-| Total return | Measure current | Maintain ±5% (accept slightly lower return for much lower risk) |
+From current broker chain + underlying quotes:
 
-The key insight from research: V2 should primarily **reduce tail risk and drawdowns**, not increase total return. The ThetaProfits and Option Alpha data show that risk management is what makes a strategy *survivable* — and survivability IS the edge over long horizons.
+- debit-to-close
+- short-strike delta/gamma
+- per-side cushion
+- spread width proxies
+- VWAP offset
+- rolling realized vol / ATR proxies
+- time-based features
+- account-level concentration features
 
-### Live Monitoring Metrics
+### What Needs Historical Vendor Data To Become Strong
 
-- Count of delta emergency exits (should be rare, ~2-5% of trades)
-- Distribution of dynamic SL multipliers (should cluster 1.5-2.5, not always 2.0)
-- SLTP activation rate by regime (should activate earlier in high-vol)
-- Exit advisor score distribution (calibration — does P=0.7 mean 70% of those trades benefit from exit?)
+- robust replay at scale
+- accurate minute-level option width history
+- OI-based context features
+- more stable exit-cost modeling
+- better regime research across many market conditions
+
+### Preferred Data Acquisition Order
+
+1. **Use current broker live chain and your own live logs now**
+2. **Backfill with existing ThetaData / local historical option datasets already in repo**
+3. **Add Cboe or equivalent minute quote datasets if replay quality is not sufficient**
+4. **Only later consider premium microstructure datasets**
+
+---
+
+## What Not To Build Yet
+
+- full RL / PPO policy learning
+- sequence models before tree models have clearly failed
+- dealer-position hard overrides from rough OI inference
+- expensive order-flow feeds before basic exit telemetry is fully exploited
+
+The next real edge here is far more likely to come from:
+
+- better live threat measurement
+- better execution
+- better validation discipline
+
+than from exotic model architecture.
+
+---
+
+## Success Criteria
+
+V2.1 is a success if, versus the current live-exit baseline, it delivers:
+
+1. materially lower worst-trade loss
+2. materially lower drawdown
+3. lower tail-risk concentration in the final hour
+4. stable live execution quality
+5. acceptable return retention after realistic slippage
+
+Target directionally:
+
+- reduce worst-trade loss by 25-40%
+- reduce max drawdown by 20-35%
+- reduce emergency late-session blowups meaningfully
+- maintain similar trade frequency
+- preserve enough total return to justify complexity
 
 ---
 
@@ -527,52 +981,639 @@ The key insight from research: V2 should primarily **reduce tail risk and drawdo
 
 ```
 ml/zdom_v2/
-├── PLAN.md                          # This document
+├── PLAN.md
 ├── 1_data_collection/
 │   └── scripts/
-│       ├── build_trajectory_features.py   # Reconstruct per-minute features for historical trades
-│       └── build_hmm_training_data.py     # Daily 1-min bar data for HMM training
+│       ├── build_position_trajectories.py
+│       ├── build_exit_replay_dataset.py
+│       └── merge_execution_logs.py
 ├── 2_feature_engineering/
 │   └── scripts/
-│       ├── realtime_features.py           # Phase 1 feature builder (used live + for training)
-│       ├── hmm_regime.py                  # HMM regime detector (train + predict)
-│       ├── cusum.py                       # CUSUM change-point detection
-│       └── gex.py                         # GEX computation from option chain
+│       ├── realtime_exit_features.py
+│       ├── liquidity_features.py
+│       ├── position_threat_features.py
+│       └── regime_context_features.py
 ├── 3_models/
-│   ├── exit_advisor_lgbm_v2.pkl           # P(should_exit_now)
-│   ├── adverse_detector_lgbm_v2.pkl       # P(adverse_move_5min)
-│   └── hmm_regime_v2.pkl                  # 3-state HMM
+│   ├── continuation_value_lgbm_v2.pkl
+│   ├── hazard_1m_lgbm_v2.pkl
+│   ├── hazard_5m_lgbm_v2.pkl
+│   └── exit_cost_lgbm_v2.pkl
 ├── 4_training/
 │   └── scripts/
-│       ├── train_exit_advisor.py          # Train + validate exit advisor
-│       ├── train_adverse_detector.py      # Train + validate adverse detector
-│       └── evaluate_v2_vs_v1_2.py         # Head-to-head backtest comparison
+│       ├── train_continuation_value.py
+│       ├── train_hazard_models.py
+│       ├── train_exit_cost_model.py
+│       └── evaluate_policy_v2.py
 ├── 5_execution/
 │   └── scripts/
-│       ├── v2_monitor.py                  # V2 monitoring loop (replaces static monitoring)
-│       ├── dynamic_sl.py                  # ATR-adaptive SL + delta emergency
-│       ├── dynamic_tp.py                  # Time-decay TP progression
-│       └── dynamic_sltp.py               # Regime-adaptive SLTP ratchet
+│       ├── v2_monitor.py
+│       ├── hard_risk_rules.py
+│       ├── policy_engine.py
+│       ├── execution_modes.py
+│       └── uncertainty_gate.py
 └── 6_analysis/
     └── scripts/
-        ├── backtest_v2_exits.py           # Simulate V2 exit logic on historical trajectories
-        └── compare_v1_2_vs_v2.py          # Generate comparison report
+        ├── replay_v2_policy.py
+        ├── compare_v1_2_vs_v2_1.py
+        └── shadow_decision_audit.py
 ```
 
 ---
 
-## Key Research References
+## Repo-Specific Implementation Checklist
 
-| Source | Relevance |
-|--------|-----------|
-| ProjectFinance: 71,417 Iron Condors (2007-2017) | Same entries, 16 exit combos → exit rules dominate outcome variance |
-| ThetaProfits + Sandvand: 9,100+ trades | 38% WR + smart exits = 84.5% annual |
-| Option Alpha: 230,000 0DTE trades | Sizing alone flipped returns from -67% to +7% |
-| Tastytrade: Managing Winners (2005-2017) | 50% TP management → 73% more $/day than hold-to-expiration |
-| Adams, Fontaine, Ornthanalai (2024) | Dealer gamma impact up to 3.3pp annualized vol |
-| Dim, Eraker, Vilkov (2023) | Positive MM gamma → reversals, negative → momentum |
-| SpotGamma: Anatomy of 0DTE Market | Documented intraday gamma regime shifts |
-| Cont, Kukanov, Stoikov (2014) | OFI linearly predicts short-horizon price changes |
-| Van Tharp / Basso: Random Entry Study | Random entries + disciplined exits = profitable |
-| CBOE: Henry Schwartz Deep Dive | "Set-and-forget" vs "10-cent bid" exit technique |
-| Option Alpha: Stop-Loss Strategies | Stops reduce returns 50-87% but drawdowns 2-3x. Survivability IS edge |
+This checklist assumes:
+
+- `v1_2` remains the **entry model** for now
+- exit management is the only major strategy upgrade in scope
+- Tradier is the only live broker target for V2.1
+- Schwab support can be added later after the Tradier path is stable
+
+### Current Code Paths In Scope
+
+The main code paths for the first implementation pass are:
+
+- `scripts/zdom_bot_tradier.py`
+- `scripts/zero_dte_bot.py`
+- `scripts/orchestrator/position_manager.py`
+- `scripts/orchestrator/execution_router.py`
+- `scripts/orchestrator/orchestrator.py`
+- `execution/broker_api/tradier_client.py`
+- `execution/order_manager/ic_order_builder.py`
+
+### Phase 0: Lock Scope And Control Path
+
+#### Objectives
+
+- freeze entry behavior around the current `v1_2` flow
+- standardize Tradier as the only supported execution engine for V2.1 rollout
+- choose one live exit-control path so implementation does not fragment
+
+#### Tasks
+
+1. Freeze the entry engine:
+   - no changes to `v1_2` model selection
+   - no changes to entry thresholds
+   - no changes to scan cadence unless required by exit integration
+
+2. Standardize Tradier-only assumptions in:
+   - config defaults
+   - rollout docs
+   - feature flags
+
+3. Pick the primary live control path.
+   Recommendation:
+   - build exit V2.1 on the orchestrator path rather than the legacy monolithic bot
+   - use `PositionManager` + `ExecutionRouter` as the core management loop
+
+4. Define the initial supported action set for production:
+   - `HOLD`
+   - `TIGHTEN`
+   - `FULL_EXIT`
+   - `EMERGENCY_EXIT`
+
+5. Explicitly defer to later phases:
+   - partial reduction
+   - side-cutting / broken-condor management
+   - Schwab parity
+
+#### Exit Criteria
+
+- one execution path is selected and documented
+- no ambiguity remains about entry vs. exit ownership
+
+### Phase 1: Telemetry Foundation
+
+Telemetry means the bot's structured "flight recorder" data: what it saw, what it decided, and what actually happened.
+
+#### Objectives
+
+- capture all live state needed for research, debugging, and slippage modeling
+- make future model training evidence-based
+
+#### Tasks
+
+1. Add per-monitor-cycle structured telemetry for each open position.
+
+2. Log at minimum:
+   - timestamp
+   - account name
+   - position id / label
+   - underlying spot
+   - net close mid proxy
+   - executable close proxy
+   - net width
+   - short call delta
+   - short put delta
+   - short call gamma
+   - short put gamma
+   - time since entry
+   - time to forced close
+   - unrealized P&L
+   - active hard-rule flags
+   - chosen monitoring mode
+
+3. Add per-order telemetry for every close attempt.
+
+4. Log at minimum:
+   - quote snapshot at order submit
+   - urgency mode
+   - submitted order price
+   - fill price
+   - time to fill
+   - replace count
+   - final slippage versus mid
+   - final slippage versus executable proxy
+   - exit reason
+
+5. Persist telemetry in structured format:
+   - JSONL or CSV
+   - one directory such as `logs/v2_exit/`
+   - daily roll files
+
+6. Add a daily merge / normalization script so telemetry can be joined with order outcomes.
+
+#### Files To Create Or Edit
+
+- `scripts/orchestrator/position_manager.py`
+- `scripts/orchestrator/execution_router.py`
+- `ml/zdom_v2/1_data_collection/scripts/merge_execution_logs.py`
+
+#### Exit Criteria
+
+- every monitor cycle produces structured telemetry
+- every close attempt produces structured execution telemetry
+- daily outputs are easy to replay and analyze
+
+### Phase 2: Tradier Live Data Layer
+
+#### Objectives
+
+- build a clean Tradier-first market-state adapter
+- support low-latency live feature computation without heavy file reads
+
+#### Tasks
+
+1. Confirm and document Tradier live fields available from:
+   - underlying quote or timesales endpoints
+   - option chain endpoints
+   - order status / fill endpoints
+
+2. Verify support for:
+   - bid / ask
+   - bid / ask size if available
+   - delta
+   - gamma
+   - IV
+   - timestamps
+
+3. Build a live data adapter that exposes:
+   - current underlying state
+   - current full 0DTE option chain
+   - latest per-leg Greeks
+   - latest quote freshness metadata
+
+4. Maintain in-memory rolling state for:
+   - 1-minute bars
+   - current chain snapshot
+   - per-position quote snapshots
+   - rolling return / vol windows
+
+5. Add stale-data guards:
+   - if chain is stale, suppress model authority
+   - if underlying data is stale, force conservative fallback logic
+
+#### Files To Create Or Edit
+
+- `execution/broker_api/tradier_client.py`
+- `scripts/orchestrator/broker_manager.py`
+- `ml/zdom_v2/2_feature_engineering/scripts/realtime_exit_features.py`
+
+#### Exit Criteria
+
+- live Tradier data can support all critical-path features
+- stale data can be detected automatically
+
+### Phase 3: Live Feature Engine
+
+#### Objectives
+
+- compute the first high-value feature set directly from Tradier live data
+- share as much code as possible between live scoring and historical replay
+
+#### Tasks
+
+1. Build a single feature-builder module for V2.1 exits.
+
+2. Implement the first production feature set:
+   - short call / put absolute delta
+   - short call / put gamma
+   - call / put distance in points
+   - call / put distance in ATR units
+   - threatened side
+   - delta velocity
+   - gamma velocity
+   - 1m / 3m / 5m returns
+   - 5m / 15m realized vol
+   - ATR ratio
+   - VWAP offset
+   - session range exhaustion
+   - net close mid
+   - net close executable proxy
+   - width percent of mid
+   - quote refresh gap
+   - minutes since entry
+   - minutes to close
+   - account open-position count
+   - combined unrealized percent
+
+3. Add weak-context features only after core stability:
+   - approximate GEX sign
+   - GEX flip proxy
+   - VIX / VIX1D context
+   - IV skew proxy
+
+4. Add unit tests for:
+   - feature correctness
+   - missing data handling
+   - stale data handling
+
+#### Files To Create Or Edit
+
+- `ml/zdom_v2/2_feature_engineering/scripts/realtime_exit_features.py`
+- `ml/zdom_v2/2_feature_engineering/scripts/position_threat_features.py`
+- `ml/zdom_v2/2_feature_engineering/scripts/liquidity_features.py`
+- `tests/`
+
+#### Exit Criteria
+
+- live feature builder works on Tradier data
+- same logic can be reused by replay later
+
+### Phase 4: Hard Risk Rules
+
+#### Objectives
+
+- ship the highest-value risk improvements before ML
+- reduce tail losses immediately
+
+#### Tasks
+
+1. Implement delta-based warning and emergency thresholds.
+
+2. Implement gamma-acceleration guard.
+
+3. Implement cushion-collapse rule based on distance-to-short in ATR units.
+
+4. Implement liquidity-protection rule:
+   - if width or quote instability becomes extreme, shift to defensive or emergency logic
+
+5. Implement final-hour gamma clamp:
+   - tighter profit-taking
+   - lower tolerance for threat
+   - faster monitoring cadence
+
+6. Implement stricter kill switches:
+   - daily realized loss cap
+   - combined account stop
+   - max emergency exits per day
+   - regime-dislocation fallback if data quality degrades
+
+7. Add feature flags for all rules.
+
+#### Files To Create Or Edit
+
+- `scripts/orchestrator/position_manager.py`
+- `ml/zdom_v2/5_execution/scripts/hard_risk_rules.py`
+
+#### Exit Criteria
+
+- hard rules can run in paper mode with no model dependency
+- emergency exits fire deterministically under known thresholds
+
+### Phase 5: Variable-Frequency Monitoring
+
+#### Objectives
+
+- stop treating all market states as equally urgent
+
+#### Tasks
+
+1. Implement monitoring modes:
+   - normal: every 30-60 seconds
+   - elevated: every 10-15 seconds
+   - emergency: immediate re-check until flat or stabilized
+
+2. Promote a position to elevated monitoring when:
+   - delta warning threshold is breached
+   - delta velocity spikes
+   - ATR burst ratio spikes
+   - width deteriorates sharply
+   - final 45-60 minutes begin
+
+3. Add state transitions and throttling so monitoring remains rate-limit aware under Tradier.
+
+#### Files To Create Or Edit
+
+- `scripts/orchestrator/orchestrator.py`
+- `scripts/orchestrator/position_manager.py`
+
+#### Exit Criteria
+
+- the bot can shift monitoring frequency based on risk state
+- Tradier rate limits are not violated
+
+### Phase 6: Exit Execution Modes
+
+#### Objectives
+
+- make exit execution an explicit part of the risk engine
+
+#### Tasks
+
+1. Add explicit Tradier close modes:
+   - `HARVEST`
+   - `DEFENSIVE`
+   - `EMERGENCY`
+
+2. For each mode, define:
+   - initial price logic
+   - max wait time
+   - cancel / replace cadence
+   - escalation sequence
+
+3. Add handling for:
+   - working close orders
+   - partial fills
+   - repeated replace attempts
+   - forced escalation under worsening threat
+
+4. Centralize executable close pricing assumptions so there is one shared calculation path.
+
+#### Files To Create Or Edit
+
+- `scripts/orchestrator/execution_router.py`
+- `execution/order_manager/ic_order_builder.py`
+- `ml/zdom_v2/5_execution/scripts/execution_modes.py`
+
+#### Exit Criteria
+
+- exits run through explicit Tradier urgency modes
+- fill-quality telemetry is captured automatically
+
+### Phase 7: Historical Replay Engine
+
+#### Objectives
+
+- build an honest offline environment for evaluating exit policies
+
+#### Tasks
+
+1. Build per-minute position trajectory reconstruction.
+
+2. Reconstruct from historical data:
+   - underlying bars
+   - option quotes
+   - Greeks
+   - open interest where available
+   - your own order/fill telemetry
+
+3. Reuse the live feature engine inside replay wherever possible.
+
+4. Support multiple execution assumptions:
+   - optimistic
+   - executable proxy
+   - stressed
+
+5. Support side-by-side evaluation:
+   - current baseline exits
+   - hard-rule-only exits
+   - later V2.1 policy exits
+
+#### Files To Create Or Edit
+
+- `ml/zdom_v2/1_data_collection/scripts/build_position_trajectories.py`
+- `ml/zdom_v2/1_data_collection/scripts/build_exit_replay_dataset.py`
+- `ml/zdom_v2/6_analysis/scripts/replay_v2_policy.py`
+
+#### Exit Criteria
+
+- one command can replay historical positions with live-equivalent features
+
+### Phase 8: Model Training
+
+#### Objectives
+
+- train the three-model exit stack on replayable data
+
+#### Tasks
+
+1. Train a continuation-value regression model.
+
+2. Train short-horizon hazard models:
+   - 1-minute
+   - 3-minute
+   - 5-minute
+
+3. Train an exit-cost model using live Tradier telemetry.
+
+4. Use purged / embargoed temporal validation.
+
+5. Evaluate:
+   - calibration
+   - tail-risk capture
+   - policy value added
+   - stability across temporal folds
+
+6. Reject models that improve return only by increasing left-tail risk.
+
+#### Files To Create Or Edit
+
+- `ml/zdom_v2/4_training/scripts/train_continuation_value.py`
+- `ml/zdom_v2/4_training/scripts/train_hazard_models.py`
+- `ml/zdom_v2/4_training/scripts/train_exit_cost_model.py`
+- `ml/zdom_v2/4_training/scripts/evaluate_policy_v2.py`
+
+#### Exit Criteria
+
+- models beat baseline on replay under realistic execution assumptions
+
+### Phase 9: Policy Engine
+
+#### Objectives
+
+- combine rules, model outputs, and execution costs into a single action decision
+
+#### Tasks
+
+1. Build a policy engine that consumes:
+   - hard-rule signals
+   - continuation value
+   - hazard probability
+   - expected exit cost
+   - uncertainty state
+
+2. Implement initial production policy:
+   - hard risk hit -> `EMERGENCY_EXIT`
+   - high uncertainty -> conservative fallback
+   - tail risk above limit -> `FULL_EXIT`
+   - exit value sufficiently better than hold value -> `FULL_EXIT`
+   - rising threat but not urgent -> `TIGHTEN`
+   - else -> `HOLD`
+
+3. Keep thresholds and buffers externally configurable.
+
+#### Files To Create Or Edit
+
+- `ml/zdom_v2/5_execution/scripts/policy_engine.py`
+- `ml/zdom_v2/5_execution/scripts/uncertainty_gate.py`
+- `scripts/orchestrator/position_manager.py`
+
+#### Exit Criteria
+
+- one policy interface determines the action each monitoring cycle
+
+### Phase 10: Shadow Mode
+
+#### Objectives
+
+- validate V2.1 decisions live before capital deployment
+
+#### Tasks
+
+1. Run V2.1 scoring live in shadow alongside the current Tradier production exit logic.
+
+2. Log all disagreements between:
+   - baseline live decision
+   - V2.1 recommended decision
+
+3. Review each day:
+   - missed saves
+   - premature exits
+   - slippage assumption accuracy
+   - uncertainty fallback frequency
+   - stale-data incidents
+
+#### Files To Create Or Edit
+
+- `ml/zdom_v2/6_analysis/scripts/shadow_decision_audit.py`
+- `scripts/orchestrator/position_manager.py`
+
+#### Exit Criteria
+
+- enough live shadow evidence exists to judge whether V2.1 is promotable
+
+### Phase 11: Controlled Tradier Rollout
+
+#### Objectives
+
+- deploy safely with bounded capital risk
+
+#### Tasks
+
+1. Roll out in order:
+   - Tradier paper
+   - one small live Tradier account
+   - broader Tradier deployment only after stable results
+
+2. Keep permanent safety fallbacks:
+   - hard rules always active
+   - fallback to baseline exits if data is stale
+   - fallback if models fail to load
+   - fallback if uncertainty is too high
+   - fallback if repeated execution failures occur
+
+3. Add daily post-trade audit summaries.
+
+#### Files To Create Or Edit
+
+- `scripts/zdom_bot_tradier.py`
+- `scripts/orchestrator/config.py`
+- `scripts/orchestrator/orchestrator.py`
+
+#### Exit Criteria
+
+- V2.1 can be toggled on per Tradier account with automatic fallback
+
+### Phase 12: Operations And Governance
+
+#### Objectives
+
+- keep the system observable, reviewable, and reversible
+
+#### Tasks
+
+1. Add daily reports covering:
+   - exit reasons
+   - emergency exit count
+   - average slippage by exit mode
+   - worst trade
+   - calibration drift
+   - stale-data incidents
+
+2. Add weekly model-health review.
+
+3. Version every live:
+   - model artifact
+   - policy config
+   - hard-rule config
+
+4. Maintain same-day rollback capability.
+
+#### Exit Criteria
+
+- the system can be monitored and rolled back safely
+
+### Recommended First Build Order
+
+The recommended execution order is:
+
+1. telemetry foundation
+2. Tradier live data layer
+3. live feature engine
+4. hard risk rules
+5. variable-frequency monitoring
+6. exit execution modes
+7. historical replay engine
+8. model training
+9. policy engine
+10. shadow mode
+11. controlled Tradier rollout
+12. operating cadence and governance
+
+### Earliest Practical Milestone
+
+The first meaningful production milestone is:
+
+- structured telemetry
+- live feature engine
+- delta / gamma / cushion hard rules
+- variable-frequency monitoring
+- explicit Tradier emergency exit mode
+
+That milestone should deliver immediate practical value even before any ML exit model is deployed.
+
+---
+
+## References And Design Inputs
+
+These are guiding references, not claims of direct replication.
+
+- Cboe research on 0DTE market impact and volatility
+- Cboe 2025 options-industry state materials
+- Almeida, Freire, Hizmeri on 0DTE asset-pricing characteristics
+- Cartea and Wang on alpha-aware market making and adverse selection
+- de Prado-style purged / embargoed validation and CPCV concepts
+- adaptive conformal inference literature for uncertainty-aware online prediction
+
+### Practical Interpretation Of The Research
+
+The most important takeaway is not "dealer gamma explains everything."
+
+It is:
+
+- short-dated gamma can matter, especially in tails
+- average effects are not the same as tail effects
+- live execution and uncertainty management matter as much as raw predictive power
+
+That is the design philosophy of V2.1.
