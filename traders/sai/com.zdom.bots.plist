@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.zdom.bots</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/saiyeluru/Documents/Projects/iv-rank-scanner/traders/sai/launch_all_bots.sh</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/saiyeluru/Documents/Projects/iv-rank-scanner</string>
+
+    <!--
+        Schedule: weekdays at 9:15 AM ET (14:15 UTC)
+        Launches 15 min before default ZDOM entry window (10:00 AM ET)
+        to allow pre-flight, model loading, and staleness checks.
+
+        Note: During EDT (Mar-Nov) this fires at 10:15 AM ET.
+        Adjust to 13:15 UTC during EDT if precision matters.
+    -->
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict>
+            <key>Weekday</key> <integer>1</integer>
+            <key>Hour</key>    <integer>14</integer>
+            <key>Minute</key>  <integer>15</integer>
+        </dict>
+        <dict>
+            <key>Weekday</key> <integer>2</integer>
+            <key>Hour</key>    <integer>14</integer>
+            <key>Minute</key>  <integer>15</integer>
+        </dict>
+        <dict>
+            <key>Weekday</key> <integer>3</integer>
+            <key>Hour</key>    <integer>14</integer>
+            <key>Minute</key>  <integer>15</integer>
+        </dict>
+        <dict>
+            <key>Weekday</key> <integer>4</integer>
+            <key>Hour</key>    <integer>14</integer>
+            <key>Minute</key>  <integer>15</integer>
+        </dict>
+        <dict>
+            <key>Weekday</key> <integer>5</integer>
+            <key>Hour</key>    <integer>14</integer>
+            <key>Minute</key>  <integer>15</integer>
+        </dict>
+    </array>
+
+    <key>StandardOutPath</key>
+    <string>/Users/saiyeluru/logs/zdom_bots/launcher.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/saiyeluru/logs/zdom_bots/launcher.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/saiyeluru/Documents/Projects/iv-rank-scanner/venv/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+</dict>
+</plist>

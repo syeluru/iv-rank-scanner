@@ -305,6 +305,7 @@ class ZeroDTEBot:
             self._zdom_predictor = ZdomV1Predictor(
                 models_dir=settings.BOT_ZDOM_MODELS_DIR,
                 data_dir=settings.BOT_ZDOM_DATA_DIR,
+                model_suffix=getattr(settings, 'BOT_ZDOM_MODEL_SUFFIX', ''),
             )
         return self._zdom_predictor
 
@@ -353,7 +354,7 @@ class ZeroDTEBot:
             return initial
 
         # Last resort: config setting
-        logger.warning(f"  Could not read liquidationValue from Schwab, "
+        logger.warning(f"  Could not read liquidationValue from broker, "
                        f"falling back to BOT_PORTFOLIO_VALUE=${settings.BOT_PORTFOLIO_VALUE:,.0f}")
         return settings.BOT_PORTFOLIO_VALUE
 
@@ -890,7 +891,7 @@ class ZeroDTEBot:
         """
         Merged pre-flight check for both entry and monitoring paths.
 
-        Checks: weekday, ThetaData, Schwab connection + portfolio value, ML models.
+        Checks: weekday, ThetaData, broker connection + portfolio value, ML models.
         Does NOT gate on existing/missing positions (unified flow handles that).
         """
         logger.info("--- Pre-flight Check ---")
@@ -899,6 +900,7 @@ class ZeroDTEBot:
         self._kill_stale_processes()
 
         now = self._now_et()
+        broker_name = settings.BROKER.upper()
 
         # Check trading day (weekday)
         if now.weekday() >= 5:
@@ -914,13 +916,18 @@ class ZeroDTEBot:
         else:
             logger.info("  ThetaData: skipped (--skip-ml)")
 
-        # Check Schwab credentials configured
-        if not settings.validate_schwab_credentials():
-            logger.error("Schwab credentials not configured in .env")
-            return False
-        logger.info("  Schwab credentials: configured - OK")
+        # Check broker credentials configured
+        if settings.BROKER.lower() == "tradier":
+            if not settings.validate_tradier_credentials():
+                logger.error("Tradier credentials not configured in .env")
+                return False
+        else:
+            if not settings.validate_schwab_credentials():
+                logger.error("Schwab credentials not configured in .env")
+                return False
+        logger.info(f"  {broker_name} credentials: configured - OK")
 
-        # Check Schwab connection + extract live portfolio value
+        # Check broker connection + extract live portfolio value
         try:
             account = await self.schwab_client.get_account()
             bp = (
@@ -929,8 +936,8 @@ class ZeroDTEBot:
                 .get('buyingPower', 0.0)
             )
             self.portfolio_value = self._extract_portfolio_value(account)
-            logger.info(f"  Schwab connection: OK (buying power: ${bp:,.2f})")
-            logger.info(f"  Portfolio value: ${self.portfolio_value:,.2f} (live from Schwab)")
+            logger.info(f"  {broker_name} connection: OK (buying power: ${bp:,.2f})")
+            logger.info(f"  Portfolio value: ${self.portfolio_value:,.2f} (live from {broker_name})")
 
             if bp < 5000:
                 logger.error(f"Insufficient buying power: ${bp:,.2f}")
@@ -939,10 +946,10 @@ class ZeroDTEBot:
             err_str = str(e)
             if ('refresh_token' in err_str or 'unsupported_token_type' in err_str) \
                     and hasattr(self.schwab_client, 're_authenticate'):
-                logger.warning(f"  Schwab token expired — launching re-authentication...")
+                logger.warning(f"  {broker_name} token expired — launching re-authentication...")
                 play_sound("/System/Library/Sounds/Sosumi.aiff")
                 send_notification("0DTE Bot — Token Expired",
-                                  "Schwab refresh token expired. Browser opening for re-auth.")
+                                  f"{broker_name} refresh token expired. Browser opening for re-auth.")
                 if self.schwab_client.re_authenticate():
                     # Retry after re-auth
                     try:
@@ -953,16 +960,16 @@ class ZeroDTEBot:
                             .get('buyingPower', 0.0)
                         )
                         self.portfolio_value = self._extract_portfolio_value(account)
-                        logger.info(f"  Schwab connection: OK after re-auth (buying power: ${bp:,.2f})")
-                        logger.info(f"  Portfolio value: ${self.portfolio_value:,.2f} (live from Schwab)")
+                        logger.info(f"  {broker_name} connection: OK after re-auth (buying power: ${bp:,.2f})")
+                        logger.info(f"  Portfolio value: ${self.portfolio_value:,.2f} (live from {broker_name})")
                     except Exception as e2:
-                        logger.error(f"  Schwab connection failed after re-auth: {e2}")
+                        logger.error(f"  {broker_name} connection failed after re-auth: {e2}")
                         return False
                 else:
                     logger.error("  Re-authentication failed. Aborting.")
                     return False
             else:
-                logger.error(f"  Schwab connection failed: {e}")
+                logger.error(f"  {broker_name} connection failed: {e}")
                 return False
 
         # ZDOM V1 models (primary when enabled)
@@ -1182,12 +1189,15 @@ class ZeroDTEBot:
                 self._zdom_blocker_checked = True
                 logger.info(f"  Hard blockers: CLEAR")
 
-            # 2. Fetch latest 1-min SPX bar
+            # 2. Fetch latest 1-min SPX + VIX bars
             spx_bar = self._fetch_spx_latest_bar()
             if spx_bar:
                 self.zdom_predictor.add_bar(spx_bar)
             else:
                 logger.debug(f"  {progress} {slot_time} — no SPX bar available")
+            vix_bar = self._fetch_vix_latest_bar()
+            if vix_bar:
+                self.zdom_predictor.add_vix_bar(vix_bar)
 
             # 3. Fetch 0DTE chain
             chain = await self._fetch_0dte_chain()
@@ -1377,6 +1387,52 @@ class ZeroDTEBot:
             }
         except Exception as e:
             logger.debug(f"  Failed to fetch SPX 1-min bar: {e}")
+            return None
+
+    def _fetch_vix_latest_bar(self) -> Optional[dict]:
+        """Fetch the latest 1-min VIX bar from ThetaData for ZDOM feature builder."""
+        try:
+            now = self._now_et()
+            url = "http://127.0.0.1:25503/v3/index/history/ohlc"
+            start_time = (now - timedelta(minutes=2)).strftime("%H:%M:%S")
+            end_time = now.strftime("%H:%M:%S")
+            params = {
+                "symbol": "VIX",
+                "start_date": date.today().strftime("%Y%m%d"),
+                "end_date": date.today().strftime("%Y%m%d"),
+                "interval": "1m",
+                "start_time": start_time,
+                "end_time": end_time,
+                "format": "json",
+            }
+            query = "&".join(f"{k}={v}" for k, v in params.items())
+            full_url = f"{url}?{query}"
+
+            req = urllib.request.Request(full_url)
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                data = json.loads(resp.read().decode())
+
+            response = data.get("response", data if isinstance(data, list) else [])
+            if response and isinstance(response[0], dict) and "data" in response[0]:
+                bars = []
+                for entry in response:
+                    for dp in entry.get("data", []):
+                        bars.append(dp)
+                response = bars
+
+            if not response:
+                return None
+
+            bar_data = response[-1]
+            return {
+                "datetime": now,
+                "open": float(bar_data.get("open", bar_data.get("Open", 0))),
+                "high": float(bar_data.get("high", bar_data.get("High", 0))),
+                "low": float(bar_data.get("low", bar_data.get("Low", 0))),
+                "close": float(bar_data.get("close", bar_data.get("Close", 0))),
+            }
+        except Exception as e:
+            logger.debug(f"  Failed to fetch VIX 1-min bar: {e}")
             return None
 
     async def _unified_entry_scan(self) -> Optional[TrackedIronCondor]:
@@ -1883,10 +1939,13 @@ class ZeroDTEBot:
             if not ic.is_closed and ic.zdom_strategy
         }
 
-        # Fetch latest SPX bar for features
+        # Fetch latest SPX + VIX bars for features
         spx_bar = self._fetch_spx_latest_bar()
         if spx_bar:
             self.zdom_predictor.add_bar(spx_bar)
+        vix_bar = self._fetch_vix_latest_bar()
+        if vix_bar:
+            self.zdom_predictor.add_vix_bar(vix_bar)
 
         # Build ICs for all 9 strategies
         chain_ics = []
@@ -2101,31 +2160,62 @@ class ZeroDTEBot:
         """
         Kill stale processes that could block this bot instance.
 
-        1. Other zero_dte_bot.py Python processes (not self)
+        1. Other zero_dte_bot.py processes for the SAME account (not self, not sibling bots)
         2. Processes holding DuckDB file locks in data_store/
         3. Stale ThetaData Terminal processes (will be restarted by _ensure_thetadata_running)
         """
         my_pid = os.getpid()
 
-        # --- 1. Kill other bot instances ---
+        # --- 1. Kill other bot instances for the SAME account ---
+        # Build account identifier to match only same-account bots
+        if settings.BROKER.lower() == "schwab":
+            acct_id = settings.SCHWAB_ACCOUNT_ID
+        else:
+            acct_id = settings.TRADIER_ACCOUNT_ID
         try:
             result = subprocess.run(
-                ["pgrep", "-f", "zero_dte_bot.py"],
+                ["pgrep", "-af", "zero_dte_bot.py"],
                 capture_output=True, text=True, timeout=5,
             )
             if result.stdout.strip():
-                pids = [int(p) for p in result.stdout.strip().split('\n') if p.strip()]
-                stale_pids = [p for p in pids if p != my_pid]
-                for pid in stale_pids:
-                    logger.warning(f"  Killing stale bot instance PID {pid}")
-                    try:
-                        os.kill(pid, 9)
-                    except ProcessLookupError:
-                        pass
-                if stale_pids:
-                    import time as _t
-                    _t.sleep(1)
-                    logger.info(f"  Killed {len(stale_pids)} stale bot instance(s)")
+                for line in result.stdout.strip().split('\n'):
+                    if not line.strip():
+                        continue
+                    parts = line.split(None, 1)
+                    if len(parts) < 2:
+                        continue
+                    pid = int(parts[0])
+                    cmdline = parts[1]
+                    if pid == my_pid:
+                        continue
+                    # Only kill if same account: check env-file contains our account ID
+                    # or if no env-file and we're using default .env (legacy single-bot mode)
+                    env_file_in_cmd = None
+                    if "--env-file" in cmdline:
+                        idx = cmdline.index("--env-file")
+                        env_parts = cmdline[idx:].split()
+                        if len(env_parts) >= 2:
+                            env_file_in_cmd = env_parts[1]
+                    # Determine if this other process serves the same account
+                    same_account = False
+                    if env_file_in_cmd and hasattr(settings, '_env_file_path'):
+                        # Both use env-files: only match if same file
+                        same_account = (env_file_in_cmd == str(getattr(settings, '_env_file_path', '')))
+                    elif not env_file_in_cmd and not hasattr(settings, '_env_file_path'):
+                        # Both use default .env: same account
+                        same_account = True
+                    # else: one uses env-file, other doesn't — different accounts, leave alone
+
+                    if same_account:
+                        logger.warning(f"  Killing stale bot instance PID {pid} (same account: {acct_id})")
+                        try:
+                            os.kill(pid, 9)
+                        except ProcessLookupError:
+                            pass
+                    else:
+                        logger.info(f"  Skipping sibling bot PID {pid} (different account)")
+                import time as _t
+                _t.sleep(1)
         except Exception as e:
             logger.debug(f"  Bot process cleanup skipped: {e}")
 
@@ -2266,8 +2356,8 @@ class ZeroDTEBot:
         logger.info("--- Attempting Entry ---")
 
         if self.already_traded_today:
-            # S2 diversified: allow multiple entries when max_positions > 1
-            if settings.BOT_ZDOM_ENABLED and settings.BOT_ZDOM_MAX_POSITIONS > 1:
+            # S2 diversified: allow multiple entries (0=unlimited, >1=capped)
+            if settings.BOT_ZDOM_ENABLED and settings.BOT_ZDOM_MAX_POSITIONS != 1:
                 pass  # allow re-entry
             else:
                 logger.warning("Already traded today. One-and-done.")
@@ -4690,6 +4780,10 @@ def main():
                         help='Max S2 positions to open (e.g. --max-positions 4)')
     parser.add_argument('--env-file', type=str, default=None,
                         help='Path to alternate .env file (e.g. .env.account2) for multi-account support')
+    parser.add_argument('--broker', type=str, default=None, choices=['schwab', 'tradier'],
+                        help='Override broker (default: from .env BROKER setting)')
+    parser.add_argument('--confirm-live', action='store_true',
+                        help='Skip interactive YES confirmation for live mode (for automated launchers)')
 
     args = parser.parse_args()
 
@@ -4706,23 +4800,32 @@ def main():
         # Re-import so our local `settings` ref points to the new object
         globals()['settings'] = new_settings
         # Propagate new settings to all modules that cached the import
-        import execution.broker_api.schwab_client as schwab_mod
-        import execution.broker_api.auth_manager as auth_mgr_mod
         import execution.order_manager.ic_order_builder as ic_mod
-        schwab_mod.settings = new_settings
-        auth_mgr_mod.settings = new_settings
         ic_mod.settings = new_settings
-        # Reinitialize auth_manager with new credentials/token path
-        from execution.broker_api.auth_manager import AuthManager
-        new_auth = AuthManager(
-            api_key=new_settings.SCHWAB_API_KEY,
-            app_secret=new_settings.SCHWAB_API_SECRET,
-            token_path=new_settings.SCHWAB_TOKEN_PATH,
-        )
-        auth_mgr_mod.auth_manager = new_auth
-        print(f"Loaded settings from {env_path} (account: {new_settings.SCHWAB_ACCOUNT_ID})")
+        # Broker-specific propagation
+        if new_settings.BROKER.lower() == "schwab":
+            import execution.broker_api.schwab_client as schwab_mod
+            import execution.broker_api.auth_manager as auth_mgr_mod
+            schwab_mod.settings = new_settings
+            auth_mgr_mod.settings = new_settings
+            from execution.broker_api.auth_manager import AuthManager
+            new_auth = AuthManager(
+                api_key=new_settings.SCHWAB_API_KEY,
+                app_secret=new_settings.SCHWAB_API_SECRET,
+                token_path=new_settings.SCHWAB_TOKEN_PATH,
+            )
+            auth_mgr_mod.auth_manager = new_auth
+        else:
+            import execution.broker_api.tradier_client as tradier_mod
+            tradier_mod.settings = new_settings
+        broker_name = new_settings.BROKER.upper()
+        acct_id = (new_settings.SCHWAB_ACCOUNT_ID if new_settings.BROKER.lower() == "schwab"
+                    else new_settings.TRADIER_ACCOUNT_ID)
+        print(f"Loaded settings from {env_path} (broker: {broker_name}, account: {acct_id})")
 
     # Apply CLI overrides to settings
+    if args.broker is not None:
+        settings.BROKER = args.broker
     if args.qty is not None:
         settings.BOT_ZDOM_QTY_PER_POSITION = args.qty
     if args.max_positions is not None:
@@ -4738,26 +4841,46 @@ def main():
             print(f"Invalid --strikes format: {args.strikes}. Use 'PUT,CALL' e.g. '6750,6920'")
             return
 
+    # Resolve broker and account info for display
+    broker_name = settings.BROKER.upper()
+    if settings.BROKER.lower() == "tradier":
+        acct_id = settings.TRADIER_ACCOUNT_ID
+        sandbox_mode = settings.TRADIER_SANDBOX
+        if args.paper:
+            settings.TRADIER_SANDBOX = True
+            sandbox_mode = True
+    else:
+        acct_id = settings.SCHWAB_ACCOUNT_ID
+        sandbox_mode = False
+
     # Safety confirmation for live mode (default)
     if not args.paper:
-        confirm = input(
-            "\n*** PERSISTENT LIVE TRADING MODE ***\n"
-            "This bot will run 24/7: trade, sleep overnight, wake for next day.\n"
-            "It will place REAL orders with REAL money.\n"
-            f"Symbol: {settings.BOT_SYMBOL}\n"
-            f"Max contracts: {settings.BOT_MAX_CONTRACTS}\n"
-            f"Daily limits: +{settings.BOT_DAILY_GAIN_LIMIT_PCT:.0%} gain / "
-            f"-{settings.BOT_DAILY_LOSS_LIMIT_PCT:.0%} loss\n"
-            f"Portfolio value: live from Schwab (fallback: ${settings.BOT_PORTFOLIO_VALUE:,.0f})\n"
-            "\nType 'YES' to confirm: "
-        )
-        if confirm != 'YES':
-            print("Aborted.")
-            return
+        if args.confirm_live:
+            print(
+                f"\n*** PERSISTENT LIVE TRADING MODE ({broker_name}) ***\n"
+                f"Broker: {broker_name} | Account: {acct_id}\n"
+                f"Auto-confirmed via --confirm-live flag.\n"
+            )
+        else:
+            confirm = input(
+                f"\n*** PERSISTENT LIVE TRADING MODE ({broker_name}) ***\n"
+                "This bot will run 24/7: trade, sleep overnight, wake for next day.\n"
+                "It will place REAL orders with REAL money.\n"
+                f"Broker: {broker_name} | Account: {acct_id}\n"
+                f"Symbol: {settings.BOT_SYMBOL}\n"
+                f"Max contracts: {settings.BOT_MAX_CONTRACTS}\n"
+                f"Daily limits: +{settings.BOT_DAILY_GAIN_LIMIT_PCT:.0%} gain / "
+                f"-{settings.BOT_DAILY_LOSS_LIMIT_PCT:.0%} loss\n"
+                f"Portfolio value: live from broker (fallback: ${settings.BOT_PORTFOLIO_VALUE:,.0f})\n"
+                "\nType 'YES' to confirm: "
+            )
+            if confirm != 'YES':
+                print("Aborted.")
+                return
 
     # Configure logging (rotation handles multi-day persistence)
     logger.remove()
-    acct_suffix = f"_{settings.SCHWAB_ACCOUNT_ID}" if args.env_file else ""
+    acct_suffix = f"_{acct_id}" if (args.env_file or args.broker) else ""
     logger.add(sys.stderr, level="INFO", format="{time:HH:mm:ss} | {level:<7} | {message}")
     log_path = Path("logs") / f"zero_dte_bot{acct_suffix}.log"
     log_path.parent.mkdir(exist_ok=True)

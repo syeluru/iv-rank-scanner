@@ -38,8 +38,12 @@ ENV/
 *.swo
 *~
 
-# Environment variables
+# Environment variables (root-level — legacy)
 .env
+.env.*
+
+# Trader env files (credentials — NEVER commit these)
+traders/*/.env*
 
 # Schwab API tokens
 .schwab_token.json
