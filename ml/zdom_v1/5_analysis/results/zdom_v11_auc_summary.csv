@@ -1,0 +1,19 @@
+Model,Target,Algorithm,Test AUC,Holdout AUC,Baseline WR,Baseline EV
+tp10_target_lgbm,tp10_target,LGBM,0.7054,0.7191,0.8795,0.0267
+tp10_target_xgb,tp10_target,XGB,0.7186,0.7293,0.8795,0.0267
+tp15_target_lgbm,tp15_target,LGBM,0.7064,0.7161,0.8376,0.0298
+tp15_target_xgb,tp15_target,XGB,0.71,0.7192,0.8376,0.0298
+tp20_target_lgbm,tp20_target,LGBM,0.6991,0.7151,0.8011,0.0289
+tp20_target_xgb,tp20_target,XGB,0.6838,0.7065,0.8011,0.0289
+tp25_target_lgbm,tp25_target,LGBM,0.6739,0.6781,0.7698,0.033
+tp25_target_xgb,tp25_target,XGB,0.6945,0.7128,0.7698,0.033
+tp30_target_lgbm,tp30_target,LGBM,0.6781,0.6983,0.7422,0.0417
+tp30_target_xgb,tp30_target,XGB,0.6987,0.7039,0.7422,0.0417
+tp35_target_lgbm,tp35_target,LGBM,0.6857,0.6991,0.7189,0.0426
+tp35_target_xgb,tp35_target,XGB,0.6798,0.6798,0.7189,0.0426
+tp40_target_lgbm,tp40_target,LGBM,0.6775,0.6971,0.6987,0.0442
+tp40_target_xgb,tp40_target,XGB,0.618,0.6443,0.6987,0.0442
+tp45_target_lgbm,tp45_target,LGBM,0.6899,0.7056,0.6817,0.0436
+tp45_target_xgb,tp45_target,XGB,0.6593,0.6923,0.6817,0.0436
+tp50_target_lgbm,tp50_target,LGBM,0.6911,0.6873,0.6679,0.0419
+tp50_target_xgb,tp50_target,XGB,0.6756,0.671,0.6679,0.0419

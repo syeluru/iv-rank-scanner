@@ -1,0 +1,18 @@
+{
+  "target": "tp10_target",
+  "feature_count": 285,
+  "split_info": {
+    "train_days": 371,
+    "test_days": 178,
+    "holdout_days": 179,
+    "gap_days": 7,
+    "train_range": "2023-03-13 -> 2024-09-04",
+    "test_range": "2024-09-16 -> 2025-06-02",
+    "holdout_range": "2025-06-12 -> 2026-02-27"
+  },
+  "rows": {
+    "train": 823004,
+    "test": 427097,
+    "holdout": 416512
+  }
+}

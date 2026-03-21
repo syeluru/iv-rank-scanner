@@ -1,7 +1,113 @@
+# Archived ML data (pushed to syeluru/iv-rank-scanner-ml-archive)
+ml/archive/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+venv_*/
+env/
+ENV/
+.venv
+.venv/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Environment variables (root-level — legacy)
 .env
 .env.*
-data/
-__pycache__/
-*.pyc
-models/
-theta_terminal/
+
+# Trader env files (credentials — NEVER commit these)
+traders/*/.env*
+
+# Schwab API tokens
+.schwab_token.json
+*_token.json
+
+# Database files
+data_store/*.duckdb
+data_store/*.duckdb.wal
+
+# Logs
+logs/
+*.log
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# MacOS
+.DS_Store
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Temporary files
+*.tmp
+*.temp
+tmp/
+temp/
+
+# Backups
+*.bak
+*.backup
+*.backup_*
+
+# Scan output files
+iv_rank_scan_*.csv
+iv_rank_scan_*.json
+
+# Archive directories
+_archive*/
+
+# ML model artifacts and training data
+*.joblib
+ml/artifacts/
+ml/training_data/
+
+# DuckDB (any location)
+*.duckdb
+*.duckdb.wal
+
+# Cloud sync conflicts
+*.sync-conflict-*
+
+# Working copies (macOS duplicates)
+* [0-9].py
+* [0-9].json
+
+# Backtest cache/results
+backtest_results/
+
+# Claude Code
+.claude/
+
+# Tasks
+tasks/

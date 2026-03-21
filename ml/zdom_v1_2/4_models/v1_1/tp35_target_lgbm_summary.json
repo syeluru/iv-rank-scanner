@@ -1,0 +1,32 @@
+{
+  "key": "tp35_target_lgbm",
+  "target": "tp35_target",
+  "model_type": "lgbm",
+  "test_auc": 0.6856682134171526,
+  "holdout_auc": 0.6990688547929329,
+  "baseline_wr": 0.7189,
+  "baseline_ev": 0.0426,
+  "n_features": 261,
+  "params": {
+    "scale_pos_weight": "0.3835222612126329",
+    "n_estimators": "464",
+    "max_depth": "6",
+    "learning_rate": "0.02328751102621668",
+    "num_leaves": "109",
+    "subsample": "0.8304301562115632",
+    "colsample_bytree": "0.572701018151254",
+    "min_child_weight": "26",
+    "reg_alpha": "1.3205534756492994",
+    "reg_lambda": "1.3137698923091763"
+  },
+  "trained_at": "2026-03-17T05:28:02.079230",
+  "split_info": {
+    "train_days": 526,
+    "test_days": 106,
+    "holdout_days": 106,
+    "gap_days": 7,
+    "train_range": "2023-02-27 -> 2025-04-03",
+    "test_range": "2025-04-15 -> 2025-09-16",
+    "holdout_range": "2025-09-26 -> 2026-02-27"
+  }
+}

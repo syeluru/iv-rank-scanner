@@ -1,0 +1,288 @@
+Feature,Calculation,Source,Status,Fix,Check
+credit,IC credit at entry (mid price),Live chain at entry,SAFE,None,Good
+entry_hour,Hour of entry (10-14),Entry time,SAFE,None,Good
+entry_minute,Minute of entry (0-59),Entry time,SAFE,None,Good
+minutes_since_open,Minutes since 9:30 open,Entry time,SAFE,None,Good
+time_sin,Sine encoding of time-of-day,Entry time,SAFE,None,Good
+time_cos,Cosine encoding of time-of-day,Entry time,SAFE,None,Good
+strat_IC_05d_25w,One-hot encoding of IC strategy,Entry time,SAFE,None,Good
+strat_IC_10d_25w,One-hot encoding of IC strategy,Entry time,SAFE,None,Good
+strat_IC_15d_25w,One-hot encoding of IC strategy,Entry time,SAFE,None,Good
+strat_IC_20d_25w,One-hot encoding of IC strategy,Entry time,SAFE,None,Good
+strat_IC_25d_25w,One-hot encoding of IC strategy,Entry time,SAFE,None,Good
+strat_IC_30d_25w,One-hot encoding of IC strategy,Entry time,SAFE,None,Good
+strat_IC_35d_25w,One-hot encoding of IC strategy,Entry time,SAFE,None,Good
+strat_IC_40d_25w,One-hot encoding of IC strategy,Entry time,SAFE,None,Good
+strat_IC_45d_25w,One-hot encoding of IC strategy,Entry time,SAFE,None,Good
+vix_open,VIX opening value,vix_daily,SAFE,None - known at 9:30,"Instead of pulling from yahoo, use the VIX data we have from theta data. This needs to be the open at that minute of the trade in question"
+vix_high,VIX high,vix_daily,LEAK,Shift 1 day,"This is high of the entire intraday up to current trade. For example if trade is at 10:00, it would pull the highest value from 9:30-9:59"
+vix_low,VIX low,vix_daily,LEAK,Shift 1 day,"This is low of the entire intraday up to current trade. For example if trade is at 10:00, it would pull the lowest value from 9:30-9:59"
+vix_close,VIX closing value,vix_daily,LEAK,Shift 1 day - use prior VIX close,"This is close of the previous one minute with respect to the current trade minute. For example if trade is at 10:00, it would pull the close from 9:59"
+vix_intraday_5min,,,,,Fill this out but take sure to use the current trade minute open in your calc since we will have that at time of trade scoring
+vix_intraday_15min,,,,,Fill this out but take sure to use the current trade minute open in your calc since we will have that at time of trade scoring
+vix_intraday_30min,,,,,Fill this out but take sure to use the current trade minute open in your calc since we will have that at time of trade scoring
+is_cpi_day,Economic event flag/countdown,econ_calendar,SAFE,None - known in advance,Confirm being pulled at 4:30 prior day and check at 9:00 am current day
+is_gdp_day,Economic event flag/countdown,econ_calendar,SAFE,None - known in advance,Confirm being pulled at 4:30 prior day and check at 9:00 am current day
+is_nfp_day,Economic event flag/countdown,econ_calendar,SAFE,None - known in advance,Confirm being pulled at 4:30 prior day and check at 9:00 am current day
+is_ppi_day,Economic event flag/countdown,econ_calendar,SAFE,None - known in advance,Confirm being pulled at 4:30 prior day and check at 9:00 am current day
+mag7_earnings_count,Economic event flag/countdown,econ_calendar,SAFE,None - known in advance,Confirm being pulled at 4:30 prior day and check at 9:00 am current day
+is_mag7_earnings_day,Economic event flag/countdown,econ_calendar,SAFE,None - known in advance,Confirm being pulled at 4:30 prior day and check at 9:00 am current day
+is_earnings_aapl,Economic event flag/countdown,econ_calendar,SAFE,None - known in advance,Confirm being pulled at 4:30 prior day and check at 9:00 am current day
+is_earnings_amzn,Economic event flag/countdown,econ_calendar,SAFE,None - known in advance,Confirm being pulled at 4:30 prior day and check at 9:00 am current day
+is_earnings_googl,Economic event flag/countdown,econ_calendar,SAFE,None - known in advance,Confirm being pulled at 4:30 prior day and check at 9:00 am current day
+is_earnings_meta,Economic event flag/countdown,econ_calendar,SAFE,None - known in advance,Confirm being pulled at 4:30 prior day and check at 9:00 am current day
+is_earnings_msft,Economic event flag/countdown,econ_calendar,SAFE,None - known in advance,Confirm being pulled at 4:30 prior day and check at 9:00 am current day
+is_earnings_nvda,Economic event flag/countdown,econ_calendar,SAFE,None - known in advance,Confirm being pulled at 4:30 prior day and check at 9:00 am current day
+is_earnings_tsla,Economic event flag/countdown,econ_calendar,SAFE,None - known in advance,Confirm being pulled at 4:30 prior day and check at 9:00 am current day
+days_to_next_cpi,Economic event flag/countdown,econ_calendar,SAFE,None - known in advance,Confirm being pulled at 4:30 prior day and check at 9:00 am current day. These will be calculated with respect to the current day right? Even with execution?
+days_to_next_ppi,Economic event flag/countdown,econ_calendar,SAFE,None - known in advance,Confirm being pulled at 4:30 prior day and check at 9:00 am current day. These will be calculated with respect to the current day right? Even with execution?
+days_to_next_nfp,Economic event flag/countdown,econ_calendar,SAFE,None - known in advance,Confirm being pulled at 4:30 prior day and check at 9:00 am current day. These will be calculated with respect to the current day right? Even with execution?
+days_to_next_gdp,Economic event flag/countdown,econ_calendar,SAFE,None - known in advance,Confirm being pulled at 4:30 prior day and check at 9:00 am current day. These will be calculated with respect to the current day right? Even with execution?
+days_to_next_fomc,Economic event flag/countdown,econ_calendar,SAFE,None - known in advance,Confirm being pulled at 4:30 prior day and check at 9:00 am current day. These will be calculated with respect to the current day right? Even with execution?
+days_to_next_any_econ,Economic event flag/countdown,econ_calendar,SAFE,None - known in advance,Confirm being pulled at 4:30 prior day and check at 9:00 am current day. These will be calculated with respect to the current day right? Even with execution?
+gap_pct,(today open - prior close) / prior close,spx_daily,SAFE,None - known at 9:30,Confirm being pulled at 4:30 prior day and check at 9:00 am current day
+intraday_range_pct,(today high - today low) / open,spx_daily,LEAK,Shift 1 day (use prior day range),Agree. Change so it says daily in feature name
+open_to_close_pct,(close - open) / open for prior day,spx_daily,LEAK,Shift 1 day,Agree. Change so it says daily in feature name
+close_vs_sma_5,(close - SMA_5) / SMA_5 pct,spx_features_daily,LEAK,Shift 1 day - use prior close in SMA,Agree. Change so it says daily in feature name
+close_vs_sma_10,(close - SMA_10) / SMA_10 pct,spx_features_daily,LEAK,Shift 1 day - use prior close in SMA,Agree. Change so it says daily in feature name
+close_vs_sma_20,(close - SMA_20) / SMA_20 pct,spx_features_daily,LEAK,Shift 1 day - use prior close in SMA,Agree. Change so it says daily in feature name
+close_vs_sma_50,(close - SMA_50) / SMA_50 pct,spx_features_daily,LEAK,Shift 1 day - use prior close in SMA,Agree. Change so it says daily in feature name
+close_vs_sma_100,(close - SMA_100) / SMA_100 pct,spx_features_daily,LEAK,Shift 1 day - use prior close in SMA,Agree. Change so it says daily in feature name
+close_vs_sma_200,(close - SMA_200) / SMA_200 pct,spx_features_daily,LEAK,Shift 1 day - use prior close in SMA,Agree. Change so it says daily in feature name
+close_vs_ema_5,(close - EMA_5) / EMA_5 pct,spx_features_daily,LEAK,Shift 1 day,Agree. Change so it says daily in feature name
+close_vs_ema_20,(close - EMA_20) / EMA_20 pct,spx_features_daily,LEAK,Shift 1 day,Agree. Change so it says daily in feature name
+rsi_14,14-day RSI,spx_features_daily,LEAK,Shift 1 day - compute on prior close,Agree. Change so it says daily in feature name
+macd_hist,MACD histogram,spx_features_daily,LEAK,Shift 1 day,Agree. Change so it says daily in feature name
+bb_bandwidth,Bollinger Band width or percentile,spx_features_daily,LEAK,Shift 1 day,Agree. Change so it says daily in feature name
+bb_pct_b,Position within Bollinger Bands,spx_features_daily,LEAK,Shift 1 day,Agree. Change so it says daily in feature name
+bb_bandwidth_pctile,Bollinger Band width or percentile,spx_features_daily,LEAK,Shift 1 day,Agree. Change so it says daily in feature name
+yz_hv_5d,Yang-Zhang HV 5d window,spx_features_daily,LEAK,Shift 1 day - exclude today OHLC,Agree. Change so it says daily in feature name
+yz_hv_10d,Yang-Zhang HV 10d window,spx_features_daily,LEAK,Shift 1 day - exclude today OHLC,Agree. Change so it says daily in feature name
+yz_hv_20d,Yang-Zhang HV 20d window,spx_features_daily,LEAK,Shift 1 day - exclude today OHLC,Agree. Change so it says daily in feature name
+yz_hv_30d,Yang-Zhang HV 30d window,spx_features_daily,LEAK,Shift 1 day - exclude today OHLC,Agree. Change so it says daily in feature name
+hv_iv_ratio_5d,5d HV / VIX close,spx_features_daily,LEAK,Shift 1 day - both HV and VIX use today,Agree. Change so it says daily in feature name
+hv_iv_ratio_10d,10d HV / VIX close,spx_features_daily,LEAK,Shift 1 day - both HV and VIX use today,Agree. Change so it says daily in feature name
+hv_iv_ratio_20d,20d HV / VIX close,spx_features_daily,LEAK,Shift 1 day - both HV and VIX use today,Agree. Change so it says daily in feature name
+hv_iv_ratio_30d,30d HV / VIX close,spx_features_daily,LEAK,Shift 1 day - both HV and VIX use today,Agree. Change so it says daily in feature name
+vix_vs_sma_10,VIX vs SMA,vix_daily,LEAK,Shift 1 day - uses VIX close,Agree. Change so it says daily in feature name
+vix_vs_sma_20,VIX vs SMA,vix_daily,LEAK,Shift 1 day - uses VIX close,Agree. Change so it says daily in feature name
+atr_pct,14-day ATR as pct of close,spx_features_daily,LEAK,Shift 1 day,Agree. Change so it says daily in feature name
+efficiency_ratio,10-day |net move| / sum |daily moves|,spx_features_daily,LEAK,Shift 1 day,Agree. Change so it says daily in feature name
+choppiness_14,14-day choppiness index,spx_features_daily,LEAK,Shift 1 day,Agree. Change so it says daily in feature name
+day_of_week,Calendar/seasonal flag,presidential_cycles,SAFE,None - static,Agree
+month,Calendar/seasonal flag,presidential_cycles,SAFE,None - static,Agree
+is_monday,Calendar/seasonal flag,presidential_cycles,SAFE,None - static,Agree
+is_friday,Calendar/seasonal flag,presidential_cycles,SAFE,None - static,Agree
+is_month_end,Calendar/seasonal flag,presidential_cycles,SAFE,None - static,Agree
+is_quarter_end,Calendar/seasonal flag,presidential_cycles,SAFE,None - static,Agree
+spx_open,SPX opening price,spx_daily,SAFE,None - known at 9:30,This should be intraday. Is this intraday or daily? We prefer intraday
+atm_strike,ATM strike (open rounded to $5),spx_daily,SAFE,None - derived from open,Is this not the same thing as spx_open?
+total_call_volume,Same-day total option volume,options_features (EOD),LEAK,Shift 1 day - use prior day volume,Agree. Change so it says daily in feature name
+total_put_volume,Same-day total option volume,options_features (EOD),LEAK,Shift 1 day - use prior day volume,Agree. Change so it says daily in feature name
+pc_volume_ratio,Same-day total option volume,options_features (EOD),LEAK,Shift 1 day - use prior day volume,Agree. Change so it says daily in feature name
+total_call_oi,Open interest (set after prior close),options_features (EOD),SAFE,None - OI is prior day,Agree. Change so it says prior day in feature name
+total_put_oi,Open interest (set after prior close),options_features (EOD),SAFE,None - OI is prior day,Agree. Change so it says prior day in feature name
+pc_oi_ratio,Open interest (set after prior close),options_features (EOD),SAFE,None - OI is prior day,Agree. Change so it says prior day in feature name
+oi_concentration,Open interest (set after prior close),options_features (EOD),SAFE,None - OI is prior day,Agree. Change so it says prior day in feature name
+max_pain_strike,Strike minimizing option holder payout,options_features (OI),SAFE,None - from OI,Can you check if this is current or prior? If prior update name to prior day
+max_pain_distance_pts,SPX open vs max pain,options_features,SAFE,None - uses today open + prior OI,Can you check if this is current or prior? If prior update name to prior day
+max_pain_distance_pct,SPX open vs max pain,options_features,SAFE,None - uses today open + prior OI,Can you check if this is current or prior? If prior update name to prior day
+atm_call_open,ATM option opening price,options_features (EOD open),SAFE,None - today opening prices known at 9:30,Should be using intraday data. Change feature name to intraday
+atm_put_open,ATM option opening price,options_features (EOD open),SAFE,None - today opening prices known at 9:30,Should be using intraday data. Change feature name to intraday
+atm_call_close,ATM option closing price,options_features (EOD close),LEAK,Shift 1 day or use open instead,Should be using intraday data. Change feature name to intraday
+atm_put_close,ATM option closing price,options_features (EOD close),LEAK,Shift 1 day or use open instead,Should be using intraday data. Change feature name to intraday
+atm_straddle_open,ATM option opening price,options_features (EOD open),SAFE,None - today opening prices known at 9:30,Should be using intraday data. Change feature name to intraday
+ic_credit_100,Approx IC credit at standard width,options_features (EOD),SAFE,None - uses open prices,Should be using intraday data. Change feature name to intraday
+ic_credit_150,Approx IC credit at standard width,options_features (EOD),SAFE,None - uses open prices,Should be using intraday data. Change feature name to intraday
+ic_credit_50,Approx IC credit at standard width,options_features (EOD),SAFE,None - uses open prices,Should be using intraday data. Change feature name to intraday
+net_gex,Dealer gamma from prior EOD greeks,gex_regime_features,SAFE,None - computed from prior day greeks,Is this even pulling data from theta data? If not then just leave out for V2
+gex_imbalance,Dealer gamma from prior EOD greeks,gex_regime_features,SAFE,None - computed from prior day greeks,Is this even pulling data from theta data? If not then just leave out for V2
+zero_gamma_level,Dealer gamma from prior EOD greeks,gex_regime_features,SAFE,None - computed from prior day greeks,Is this even pulling data from theta data? If not then just leave out for V2
+call_wall,Dealer gamma from prior EOD greeks,gex_regime_features,SAFE,None - computed from prior day greeks,Is this even pulling data from theta data? If not then just leave out for V2
+put_wall,Dealer gamma from prior EOD greeks,gex_regime_features,SAFE,None - computed from prior day greeks,Is this even pulling data from theta data? If not then just leave out for V2
+call_wall_distance,Dealer gamma from prior EOD greeks,gex_regime_features,SAFE,None - computed from prior day greeks,Is this even pulling data from theta data? If not then just leave out for V2
+put_wall_distance,Dealer gamma from prior EOD greeks,gex_regime_features,SAFE,None - computed from prior day greeks,Is this even pulling data from theta data? If not then just leave out for V2
+ts_0dte_atm_mid,Term structure mid price,options_features,SAFE,None,We are sure this is not needing a shift?
+ts_7dte_atm_mid,Term structure mid price,options_features,SAFE,None,We are sure this is not needing a shift?
+ts_30dte_atm_mid,Term structure mid price,options_features,SAFE,None,We are sure this is not needing a shift?
+ts_slope_0_30,Term structure price slope,options_features,SAFE,None - from term structure mid,We are sure this is not needing a shift?
+ts_slope_0_7,Term structure price slope,options_features,SAFE,None - from term structure mid,We are sure this is not needing a shift?
+atm_iv,ATM implied vol from 10am greeks,iv_surface_features (10am snapshot),SAFE,None - 10am snapshot = available at scoring,Are you deriving IV from greeks? If so use the direct IV from our theta data pull. This should be carried out throughout the day and looking at the current minutes value when pulled from thetadata. Name of this should change as well so it says intraday
+iv_25d_call,IV surface feature from 10am snapshot,iv_surface_features,SAFE,None - 10am snapshot,Are you deriving IV from greeks? If so use the direct IV from our theta data pull. This should be carried out throughout the day and looking at the current minutes value when pulled from thetadata. Name of this should change as well so it says intraday
+iv_25d_put,IV surface feature from 10am snapshot,iv_surface_features,SAFE,None - 10am snapshot,Are you deriving IV from greeks? If so use the direct IV from our theta data pull. This should be carried out throughout the day and looking at the current minutes value when pulled from thetadata. Name of this should change as well so it says intraday
+skew_25d,Skew from 10am snapshot,iv_surface_features,SAFE,None - 10am snapshot,Are you deriving IV from greeks? If so use the direct IV from our theta data pull. This should be carried out throughout the day and looking at the current minutes value when pulled from thetadata. Name of this should change as well so it says intraday
+iv_10d_call,IV surface feature from 10am snapshot,iv_surface_features,SAFE,None - 10am snapshot,Are you deriving IV from greeks? If so use the direct IV from our theta data pull. This should be carried out throughout the day and looking at the current minutes value when pulled from thetadata. Name of this should change as well so it says intraday
+iv_10d_put,IV surface feature from 10am snapshot,iv_surface_features,SAFE,None - 10am snapshot,Are you deriving IV from greeks? If so use the direct IV from our theta data pull. This should be carried out throughout the day and looking at the current minutes value when pulled from thetadata. Name of this should change as well so it says intraday
+skew_10d,Skew from 10am snapshot,iv_surface_features,SAFE,None - 10am snapshot,Are you deriving IV from greeks? If so use the direct IV from our theta data pull. This should be carried out throughout the day and looking at the current minutes value when pulled from thetadata. Name of this should change as well so it says intraday
+iv_smile_curve,IV surface feature from 10am snapshot,iv_surface_features,SAFE,None - 10am snapshot,Are you deriving IV from greeks? If so use the direct IV from our theta data pull. This should be carried out throughout the day and looking at the current minutes value when pulled from thetadata. Name of this should change as well so it says intraday
+ts_iv_7dte,Term structure mid price,options_features,SAFE,None,This should not include current day
+ts_iv_14dte,Term structure mid price,options_features,SAFE,None,This should not include current day
+iv_ts_slope_0_7,IV surface feature from 10am snapshot,iv_surface_features,SAFE,None - 10am snapshot,This should not include current day
+iv_ts_slope_0_14,IV surface feature from 10am snapshot,iv_surface_features,SAFE,None - 10am snapshot,This should not include current day
+ts_slope_7_14,Term structure price slope,options_features,SAFE,None - from term structure mid,This should be 7 days prior to the current trading day
+ts_inverted_7_14,Term structure mid price,options_features,SAFE,None,This should be 7 days prior to the current trading day
+atm_iv_5d_mean,Rolling ATM IV stat,iv_surface_features,SAFE,None - rolling on prior 10am snapshots,How are you calculating the mean here? Is this using previous days or is this intraday? Be clear in the feature name what it’s doing
+atm_iv_5d_std,Rolling ATM IV stat,iv_surface_features,SAFE,None - rolling on prior 10am snapshots,How are you calculating the std here? Is this using previous days or is this intraday? Be clear in the feature name what it’s doing
+atm_iv_21d_mean,Rolling ATM IV stat,iv_surface_features,SAFE,None - rolling on prior 10am snapshots,How are you calculating the mean here? Is this using previous days or is this intraday? Be clear in the feature name what it’s doing
+atm_iv_21d_std,Rolling ATM IV stat,iv_surface_features,SAFE,None - rolling on prior 10am snapshots,How are you calculating the std here? Is this using previous days or is this intraday? Be clear in the feature name what it’s doing
+atm_iv_zscore_21d,Rolling ATM IV stat,iv_surface_features,SAFE,None - rolling on prior 10am snapshots,How are you calculating the score here? Is this using previous days or is this intraday? Be clear in the feature name what it’s doing
+skew_25d_5d_mean,Skew from 10am snapshot,iv_surface_features,SAFE,None - 10am snapshot,25d_5d is confusing. It should be 25d_5day_mean. Use the past 5 days with respect to the current trading day. So not including the current day in the calculation
+skew_25d_5d_std,Skew from 10am snapshot,iv_surface_features,SAFE,None - 10am snapshot,Refer to skew_25d_5d_mean for changes. Should apply here as well
+skew_25d_21d_mean,Skew from 10am snapshot,iv_surface_features,SAFE,None - 10am snapshot,Refer to skew_25d_5d_mean for changes. Should apply here as well
+skew_25d_21d_std,Skew from 10am snapshot,iv_surface_features,SAFE,None - 10am snapshot,Refer to skew_25d_5d_mean for changes. Should apply here as well
+skew_25d_zscore_21d,Skew from 10am snapshot,iv_surface_features,SAFE,None - 10am snapshot,Refer to skew_25d_5d_mean for changes. Should apply here as well
+regime_state,HMM vol regime from VIX,regime_features,LEAK,Shift 1 day - HMM uses today VIX close,Agree. Change name so it refers to temporal description
+regime_prob_highvol,HMM vol regime from VIX,regime_features,LEAK,Shift 1 day - HMM uses today VIX close,Agree. Change name so it refers to temporal description
+regime_duration,HMM vol regime from VIX,regime_features,LEAK,Shift 1 day - HMM uses today VIX close,Agree. Change name so it refers to temporal description
+regime_switch,HMM vol regime from VIX,regime_features,LEAK,Shift 1 day - HMM uses today VIX close,Agree. Change name so it refers to temporal description
+gex_regime_prob_pos,HMM GEX regime,gex_regime_features,SAFE,None - fitted on prior data,Is this even pulling data from theta data? If not then just leave out for V2
+gex_regime_prob_trans,HMM GEX regime,gex_regime_features,SAFE,None - fitted on prior data,Is this even pulling data from theta data? If not then just leave out for V2
+gex_regime_prob_neg,HMM GEX regime,gex_regime_features,SAFE,None - fitted on prior data,Is this even pulling data from theta data? If not then just leave out for V2
+gex_regime_duration,HMM GEX regime,gex_regime_features,SAFE,None - fitted on prior data,Is this even pulling data from theta data? If not then just leave out for V2
+gex_regime_switch,HMM GEX regime,gex_regime_features,SAFE,None - fitted on prior data,Is this even pulling data from theta data? If not then just leave out for V2
+net_vanna_exposure,Vanna/charm from prior EOD greeks,vanna_charm_features,SAFE,None - prior day,Is this even pulling data from theta data? If not then just leave out for V2
+net_vanna_normalized,Vanna/charm from prior EOD greeks,vanna_charm_features,SAFE,None - prior day,Is this even pulling data from theta data? If not then just leave out for V2
+vanna_imbalance,Vanna/charm from prior EOD greeks,vanna_charm_features,SAFE,None - prior day,Is this even pulling data from theta data? If not then just leave out for V2
+net_charm_exposure,Vanna/charm from prior EOD greeks,vanna_charm_features,SAFE,None - prior day,Is this even pulling data from theta data? If not then just leave out for V2
+net_charm_normalized,Vanna/charm from prior EOD greeks,vanna_charm_features,SAFE,None - prior day,Is this even pulling data from theta data? If not then just leave out for V2
+charm_imbalance,Vanna/charm from prior EOD greeks,vanna_charm_features,SAFE,None - prior day,Is this even pulling data from theta data? If not then just leave out for V2
+vanna_charm_ratio,Vanna/charm from prior EOD greeks,vanna_charm_features,SAFE,None - prior day,Is this even pulling data from theta data? If not then just leave out for V2
+first_15m_return_pct,First 15-30 min price action,momentum_features,SAFE,"None - from 9:30-10:00 bars, known by 10am",This is good but include a 5 min return as well.
+first_30m_return_pct,First 15-30 min price action,momentum_features,SAFE,"None - from 9:30-10:00 bars, known by 10am",Agree
+first_30m_range_pct,First 15-30 min price action,momentum_features,SAFE,"None - from 9:30-10:00 bars, known by 10am",Agree
+first_30m_direction,First 15-30 min price action,momentum_features,SAFE,"None - from 9:30-10:00 bars, known by 10am",Agree
+open_drive_strength,First 15-30 min price action,momentum_features,SAFE,"None - from 9:30-10:00 bars, known by 10am",Agree
+prev_close_gap_reversal,First 15-30 min price action,momentum_features,SAFE,"None - from 9:30-10:00 bars, known by 10am",Agree
+vix1d_close,VIX1D closing value,vix1d_daily,LEAK,Shift 1 day,Agree
+vix1d_vs_sma_5,VIX1D derived feature,vix1d_daily,LEAK,Shift 1 day - uses VIX1D close,Agree
+vix1d_vs_sma_20,VIX1D derived feature,vix1d_daily,LEAK,Shift 1 day - uses VIX1D close,Agree
+vix1d_zscore_21d,VIX1D derived feature,vix1d_daily,LEAK,Shift 1 day - uses VIX1D close,Agree
+credit_stress,Macro/rates indicator,macro_regime (FRED),SAFE,None - FRED data lagged 1+ days,Agree. Just make sure we are using the correct value based on the assumed FRED lagged amount
+credit_stress_chg_20d,Macro/rates indicator,macro_regime (FRED),SAFE,None - FRED data lagged 1+ days,Agree. Just make sure we are using the correct value based on the assumed FRED lagged amount
+dxy_broad,Cross-asset price/trend,macro_regime (FRED/yfinance),SAFE,None - FRED data is always lagged 1+ days,Agree. Just make sure we are using the correct value based on the assumed FRED lagged amount
+dxy_chg_20d,Cross-asset price/trend,macro_regime (FRED/yfinance),SAFE,None - FRED data is always lagged 1+ days,Agree. Just make sure we are using the correct value based on the assumed FRED lagged amount
+dxy_chg_5d,Cross-asset price/trend,macro_regime (FRED/yfinance),SAFE,None - FRED data is always lagged 1+ days,Agree. Just make sure we are using the correct value based on the assumed FRED lagged amount
+dxy_ma20,Cross-asset price/trend,macro_regime (FRED/yfinance),SAFE,None - FRED data is always lagged 1+ days,Agree. Just make sure we are using the correct value based on the assumed FRED lagged amount
+dxy_trend,Cross-asset price/trend,macro_regime (FRED/yfinance),SAFE,None - FRED data is always lagged 1+ days,Agree. Just make sure we are using the correct value based on the assumed FRED lagged amount
+fed_funds_chg_21d,Macro/rates indicator,macro_regime (FRED),SAFE,None - FRED data lagged 1+ days,Agree. Just make sure we are using the correct value based on the assumed FRED lagged amount
+fed_funds_rate,Macro/rates indicator,macro_regime (FRED),SAFE,None - FRED data lagged 1+ days,Agree. Just make sure we are using the correct value based on the assumed FRED lagged amount
+fed_policy_direction,UNKNOWN - needs manual review,UNKNOWN,CHECK,Review source code,Let’s review this
+gold_chg_20d,Cross-asset price/trend,macro_regime (FRED/yfinance),SAFE,None - FRED data is always lagged 1+ days,Agree. Make sure to delay everything by 2 days because of the FRED data reliance on other sources
+gold_chg_5d,Cross-asset price/trend,macro_regime (FRED/yfinance),SAFE,None - FRED data is always lagged 1+ days,Agree. Make sure to delay everything by 2 days because of the FRED data reliance on other sources
+gold_fix_am,Cross-asset price/trend,macro_regime (FRED/yfinance),SAFE,None - FRED data is always lagged 1+ days,Agree. Make sure to delay everything by 2 days because of the FRED data reliance on other sources
+gold_ma20,Cross-asset price/trend,macro_regime (FRED/yfinance),SAFE,None - FRED data is always lagged 1+ days,Agree. Make sure to delay everything by 2 days because of the FRED data reliance on other sources
+gold_trend,Cross-asset price/trend,macro_regime (FRED/yfinance),SAFE,None - FRED data is always lagged 1+ days,Agree. Make sure to delay everything by 2 days because of the FRED data reliance on other sources
+hy_spread,Macro/rates indicator,macro_regime (FRED),SAFE,None - FRED data lagged 1+ days,Agree. Make sure to delay everything by 2 days because of the FRED data reliance on other sources
+ig_spread,Macro/rates indicator,macro_regime (FRED),SAFE,None - FRED data lagged 1+ days,Agree. Make sure to delay everything by 2 days because of the FRED data reliance on other sources
+oil_chg_20d,Cross-asset price/trend,macro_regime (FRED/yfinance),SAFE,None - FRED data is always lagged 1+ days,Agree. Make sure to delay everything by 2 days because of the FRED data reliance on other sources
+oil_chg_5d,Cross-asset price/trend,macro_regime (FRED/yfinance),SAFE,None - FRED data is always lagged 1+ days,Agree. Make sure to delay everything by 2 days because of the FRED data reliance on other sources
+oil_ma20,Cross-asset price/trend,macro_regime (FRED/yfinance),SAFE,None - FRED data is always lagged 1+ days,Agree. Make sure to delay everything by 2 days because of the FRED data reliance on other sources
+oil_trend,Cross-asset price/trend,macro_regime (FRED/yfinance),SAFE,None - FRED data is always lagged 1+ days,Agree. Make sure to delay everything by 2 days because of the FRED data reliance on other sources
+wti_crude,Cross-asset price/trend,macro_regime (FRED/yfinance),SAFE,None - FRED data is always lagged 1+ days,Agree. Make sure to delay everything by 2 days because of the FRED data reliance on other sources
+yield_10y,Macro/rates indicator,macro_regime (FRED),SAFE,None - FRED data lagged 1+ days,Agree. Make sure to delay everything by 2 days because of the FRED data reliance on other sources
+yield_10y_chg_21d,Macro/rates indicator,macro_regime (FRED),SAFE,None - FRED data lagged 1+ days,Agree. Make sure to delay everything by 2 days because of the FRED data reliance on other sources
+yield_10y_chg_5d,Macro/rates indicator,macro_regime (FRED),SAFE,None - FRED data lagged 1+ days,Agree. Make sure to delay everything by 2 days because of the FRED data reliance on other sources
+yield_10y_chg_63d,Macro/rates indicator,macro_regime (FRED),SAFE,None - FRED data lagged 1+ days,Agree. Make sure to delay everything by 2 days because of the FRED data reliance on other sources
+yield_2y,Macro/rates indicator,macro_regime (FRED),SAFE,None - FRED data lagged 1+ days,Agree. Make sure to delay everything by 2 days because of the FRED data reliance on other sources
+yield_2y_chg_21d,Macro/rates indicator,macro_regime (FRED),SAFE,None - FRED data lagged 1+ days,Agree. Make sure to delay everything by 2 days because of the FRED data reliance on other sources
+yield_2y_chg_5d,Macro/rates indicator,macro_regime (FRED),SAFE,None - FRED data lagged 1+ days,Agree. Make sure to delay everything by 2 days because of the FRED data reliance on other sources
+yield_2y_chg_63d,Macro/rates indicator,macro_regime (FRED),SAFE,None - FRED data lagged 1+ days,Agree. Make sure to delay everything by 2 days because of the FRED data reliance on other sources
+yield_curve_inverted,Macro/rates indicator,macro_regime (FRED),SAFE,None - FRED data lagged 1+ days,Agree. Make sure to delay everything by 2 days because of the FRED data reliance on other sources
+yield_spread_2y10y,Macro/rates indicator,macro_regime (FRED),SAFE,None - FRED data lagged 1+ days,Agree. Make sure to delay everything by 2 days because of the FRED data reliance on other sources
+yield_spread_2y10y_chg_21d,Macro/rates indicator,macro_regime (FRED),SAFE,None - FRED data lagged 1+ days,Agree. Make sure to delay everything by 2 days because of the FRED data reliance on other sources
+yield_spread_2y10y_chg_5d,Macro/rates indicator,macro_regime (FRED),SAFE,None - FRED data lagged 1+ days,Agree. Make sure to delay everything by 2 days because of the FRED data reliance on other sources
+yield_spread_2y10y_chg_63d,Macro/rates indicator,macro_regime (FRED),SAFE,None - FRED data lagged 1+ days,Agree. Make sure to delay everything by 2 days because of the FRED data reliance on other sources
+christmas_week,Calendar/seasonal flag,presidential_cycles,SAFE,None - static,Agree
+cycle_month,Calendar/seasonal flag,presidential_cycles,SAFE,None - static,Agree
+cycle_year,Calendar/seasonal flag,presidential_cycles,SAFE,None - static,Agree
+day_of_month,Calendar/seasonal flag,presidential_cycles,SAFE,None - static,Agree
+days_into_quarter,Calendar/seasonal flag,presidential_cycles,SAFE,None - static,Agree
+election_year,Calendar/seasonal flag,presidential_cycles,SAFE,None - static,Agree
+first_year,Calendar/seasonal flag,presidential_cycles,SAFE,None - static,Agree
+january_effect,Calendar/seasonal flag,presidential_cycles,SAFE,None - static,Agree
+midterm_year,Calendar/seasonal flag,presidential_cycles,SAFE,None - static,Agree
+near_month_end,Calendar/seasonal flag,presidential_cycles,SAFE,None - static,Agree
+near_qtr_end,Calendar/seasonal flag,presidential_cycles,SAFE,None - static,Agree
+opex_day,Calendar/seasonal flag,presidential_cycles,SAFE,None - static,Agree
+opex_week,Calendar/seasonal flag,presidential_cycles,SAFE,None - static,Agree
+party_dem,Calendar/seasonal flag,presidential_cycles,SAFE,None - static,Agree
+pre_election_year,Calendar/seasonal flag,presidential_cycles,SAFE,None - static,Agree
+q4_rally,Calendar/seasonal flag,presidential_cycles,SAFE,None - static,Agree
+cycle_quarter,Calendar/seasonal flag,presidential_cycles,SAFE,None - static,Agree
+sell_in_may,Calendar/seasonal flag,presidential_cycles,SAFE,None - static,Agree
+thanksgiving_week,Calendar/seasonal flag,presidential_cycles,SAFE,None - static,Agree
+triple_witching,Calendar/seasonal flag,presidential_cycles,SAFE,None - static,Agree
+week_of_year,Calendar/seasonal flag,presidential_cycles,SAFE,None - static,Agree
+vix_vxv_ratio,VIX / VIX3M ratio,breadth_features,LEAK,Shift 1 day,Agree. Change name so clear about calculation
+vix_vxv_zscore_21d,Z-score of VIX/VIX3M over 21d,breadth_features,LEAK,Shift 1 day,What is VIX3M and how is it over 21d?
+vix_term_structure_slope,VIX3M - VIX,breadth_features,LEAK,Shift 1 day,Again what is 3M?
+rsp_spy_ratio,RSP/SPY breadth ratio,breadth_features,LEAK,Shift 1 day - uses today close,Agree. change name to reflect calculation
+rsp_spy_ratio_5d_chg,RSP/SPY breadth ratio,breadth_features,LEAK,Shift 1 day - uses today close,Agree. change name to reflect calculation
+rsp_spy_ratio_20d_chg,RSP/SPY breadth ratio,breadth_features,LEAK,Shift 1 day - uses today close,Agree. change name to reflect calculation
+rsp_spy_ratio_zscore_21d,RSP/SPY breadth ratio,breadth_features,LEAK,Shift 1 day - uses today close,Agree. change name to reflect calculation
+iwm_spy_ret_spread_20d,IWM 20d return - SPY 20d return,cross_asset_features,LEAK,Shift 1 day,Agree. change name to reflect calculation
+xlf_spy_ret_spread_1d,Sector return vs SPY,breadth_features,LEAK,Shift 1 day - uses today return,Agree. change name to reflect calculation
+xlk_spy_ret_spread_1d,Sector return vs SPY,breadth_features,LEAK,Shift 1 day - uses today return,Agree. change name to reflect calculation
+xle_spy_ret_spread_1d,Sector return vs SPY,breadth_features,LEAK,Shift 1 day - uses today return,Agree. change name to reflect calculation
+sector_divergence_count,Sector return vs SPY,breadth_features,LEAK,Shift 1 day - uses today return,Agree. change name to reflect calculation
+sector_divergence_flag,Sector return vs SPY,breadth_features,LEAK,Shift 1 day - uses today return,Agree. change name to reflect calculation
+breadth_thrust_cumulative_5d,Cumulative RSP vs SPY 5d spread,breadth_features,LEAK,Shift 1 day,Agree. change name to reflect calculation
+spx_ret_5d,SPX return over 5d,spx_features_daily,LEAK,Shift 1 day,Agree
+spx_ret_20d,SPX return over 20d,spx_features_daily,SAFE,None - long lookback dilutes 1 day,Shift so it’s accurate
+spx_ret_60d,SPX return over 60d,spx_features_daily,SAFE,None - long lookback dilutes 1 day,Shift so it’s accurate
+spx_iwm_ratio,Cross-asset ratio/momentum,cross_asset_features (yfinance),LEAK,Shift 1 day - yfinance uses today close,Agree. change name to reflect calculation
+spx_iwm_ratio_chg_5d,Cross-asset ratio/momentum,cross_asset_features (yfinance),LEAK,Shift 1 day - yfinance uses today close,Agree. change name to reflect calculation
+spx_iwm_ratio_chg_20d,Cross-asset ratio/momentum,cross_asset_features (yfinance),LEAK,Shift 1 day - yfinance uses today close,Agree. change name to reflect calculation
+qqq_spx_ratio,Cross-asset ratio/momentum,cross_asset_features (yfinance),LEAK,Shift 1 day - yfinance uses today close,Agree. change name to reflect calculation
+qqq_spx_ratio_chg_5d,Cross-asset ratio/momentum,cross_asset_features (yfinance),LEAK,Shift 1 day - yfinance uses today close,Agree. change name to reflect calculation
+qqq_spx_ratio_chg_20d,Cross-asset ratio/momentum,cross_asset_features (yfinance),LEAK,Shift 1 day - yfinance uses today close,Agree. change name to reflect calculation
+iwm_spx_ratio_chg_5d,Cross-asset ratio/momentum,cross_asset_features (yfinance),LEAK,Shift 1 day - yfinance uses today close,Agree. change name to reflect calculation
+iwm_spx_ratio_chg_20d,Cross-asset ratio/momentum,cross_asset_features (yfinance),LEAK,Shift 1 day - yfinance uses today close,Agree. change name to reflect calculation
+eem_spx_ratio,Cross-asset ratio/momentum,cross_asset_features (yfinance),LEAK,Shift 1 day - yfinance uses today close,Agree. change name to reflect calculation
+eem_spx_ratio_chg_5d,Cross-asset ratio/momentum,cross_asset_features (yfinance),LEAK,Shift 1 day - yfinance uses today close,Agree. change name to reflect calculation
+eem_spx_ratio_chg_20d,Cross-asset ratio/momentum,cross_asset_features (yfinance),LEAK,Shift 1 day - yfinance uses today close,Agree. change name to reflect calculation
+tlt_ret_5d,Cross-asset ratio/momentum,cross_asset_features (yfinance),LEAK,Shift 1 day - yfinance uses today close,Agree. change name to reflect calculation
+tlt_ret_20d,Cross-asset ratio/momentum,cross_asset_features (yfinance),LEAK,Shift 1 day - yfinance uses today close,Agree. change name to reflect calculation
+tlt_spx_ratio_chg_5d,Cross-asset ratio/momentum,cross_asset_features (yfinance),LEAK,Shift 1 day - yfinance uses today close,Agree. change name to reflect calculation
+tlt_spx_ratio_chg_20d,Cross-asset ratio/momentum,cross_asset_features (yfinance),LEAK,Shift 1 day - yfinance uses today close,Agree. change name to reflect calculation
+tlt_spx_corr_20d,Cross-asset ratio/momentum,cross_asset_features (yfinance),LEAK,Shift 1 day - yfinance uses today close,Agree. change name to reflect calculation
+vvix_close,VVIX closing value,vol_expansion_features,LEAK,Shift 1 day,Agree
+vvix_ma20,VVIX derived feature,vol_expansion_features,LEAK,Shift 1 day,Agree
+vvix_zscore_21d,VVIX derived feature,vol_expansion_features,LEAK,Shift 1 day,Agree
+vvix_vs_vix_ratio,VVIX derived feature,vol_expansion_features,LEAK,Shift 1 day,Agree
+iv_crush_post_fomc,1 if within 2 days after FOMC,vol_expansion_features,SAFE,None - calendar flag,Agree
+rv_iv_spread_10d,UNKNOWN - needs manual review,UNKNOWN,CHECK,Review source code,Let’s review this
+rv_iv_spread_20d,UNKNOWN - needs manual review,UNKNOWN,CHECK,Review source code,Let’s review this
+vol_regime_persistence,20d autocorrelation of VIX daily changes,vol_expansion_features,LEAK,Shift 1 day,Agree. change name to reflect calculation
+intraday_range_vs_atr,First 30m range / 14d ATR,momentum_features,SAFE,None - uses 30m range + prior ATR,Check if the 14d ATR is correct
+vix1d_vs_vix,VIX1D derived feature,vix1d_daily,LEAK,Shift 1 day - uses VIX1D close,Is this the same value divided by same value? If so we should be doing live vix / prior day close?
+spx_ret_5m,SPX return trailing 5m,intraday_features (live),SAFE,None - computed from live bars,Is this the same as first_15m_return_pct?
+spx_ret_10m,SPX return trailing 10m,intraday_features (live),SAFE,None - computed from live bars,Is this the same as first_15m_return_pct?
+spx_ret_15m,SPX return trailing 15m,intraday_features (live),SAFE,None - computed from live bars,Is this the same as first_15m_return_pct?
+spx_ret_30m,SPX return trailing 30m,intraday_features (live),SAFE,None - computed from live bars,Is this the same as first_15m_return_pct?
+spx_vs_vwap,SPX vs VWAP/MA/SMA,intraday_features (live),SAFE,None - computed live,Agree
+spx_vs_intraday_ma5,SPX vs VWAP/MA/SMA,intraday_features (live),SAFE,None - computed live,Is this current spx price at trade open / 5 min ma of the past 5 previous closes?
+spx_vs_intraday_ma15,SPX vs VWAP/MA/SMA,intraday_features (live),SAFE,None - computed live,Refer to spx_vs_intraday_ma5 for application. It should be the same and naming should be clear
+spx_vs_intraday_ma30,SPX vs VWAP/MA/SMA,intraday_features (live),SAFE,None - computed live,Refer to spx_vs_intraday_ma5 for application. It should be the same and naming should be clear
+spx_vs_sma_7d,SPX vs VWAP/MA/SMA,intraday_features (live),SAFE,None - computed live,Refer to spx_vs_intraday_ma5 for application. It should be the same and naming should be clear
+spx_vs_sma_20d,SPX vs VWAP/MA/SMA,intraday_features (live),SAFE,None - computed live,Refer to spx_vs_intraday_ma5 for application. It should be the same and naming should be clear
+spx_vs_sma_50d,SPX vs VWAP/MA/SMA,intraday_features (live),SAFE,None - computed live,Refer to spx_vs_intraday_ma5 for application. It should be the same and naming should be clear
+spx_vs_sma_180d,SPX vs VWAP/MA/SMA,intraday_features (live),SAFE,None - computed live,Refer to spx_vs_intraday_ma5 for application. It should be the same and naming should be clear
+intraday_ma15_vs_sma_7d,Intraday MA vs daily SMA,intraday_features (live),SAFE,None - computed live,The nomenclature is very clear and should be used going forward. Want to be sure the sma_7d is not using the current trading day
+intraday_ma15_vs_sma_20d,Intraday MA vs daily SMA,intraday_features (live),SAFE,None - computed live,The nomenclature is very clear and should be used going forward. Want to be sure the sma_20d is not using the current trading day
+rvol_5m,Rolling realized vol from 1-min bars,intraday_features (live),SAFE,None - computed live,Is this using the past 5 closing for vol or using minute vol as well?
+rvol_10m,Rolling realized vol from 1-min bars,intraday_features (live),SAFE,None - computed live,Is this using the past 10 closing for vol or using minute vol as well?
+rvol_15m,Rolling realized vol from 1-min bars,intraday_features (live),SAFE,None - computed live,Is this using the past 15 closing for vol or using minute vol as well?
+rvol_30m,Rolling realized vol from 1-min bars,intraday_features (live),SAFE,None - computed live,Is this using the past 30 closing for vol or using minute vol as well?
+garman_klass_rv_30m,GK vol estimator 30 bars,intraday_features (live),SAFE,None,Is this using the past 30 closing for calc or using minute vol as well?
+rvol_intraday_vs_5d,Intraday RV vs daily RV,intraday_features (live),SAFE,None - live RV vs prior daily RV,Is this using the past 5 closing days for calc?
+rvol_intraday_vs_20d,Intraday RV vs daily RV,intraday_features (live),SAFE,None - live RV vs prior daily RV,Is this using the past 20 closing days for calc?
+range_exhaustion,Intraday structure feature,intraday_features (live),SAFE,None,Agree. Fix name so it’s intraday
+intraday_pctB,Intraday structure feature,intraday_features (live),SAFE,None,Agree. Fix name so it’s intraday
+orb_range_pct,Intraday structure feature,intraday_features (live),SAFE,None,Agree. Fix name so it’s intraday
+orb_containment,Intraday structure feature,intraday_features (live),SAFE,None,Agree. Fix name so it’s intraday
+orb_breakout_dir,Intraday structure feature,intraday_features (live),SAFE,None,Agree. Fix name so it’s intraday
+ttm_squeeze,Intraday structure feature,intraday_features (live),SAFE,None,Agree. Fix name so it’s intraday
+bb_squeeze_duration,Intraday structure feature,intraday_features (live),SAFE,None,Agree. Fix name so it’s intraday
+iv_rank_30d,ATM IV percentile over 30d,intraday_features,SAFE,None - uses prior day ATM IVs,"For the 30d, does this use the last 30 trading days and not the current one?"
+iv_rv_ratio,ATM IV / 20d realized vol,intraday_features,LEAK,RV component uses today - shift RV 1 day,Make sure 20d is not inclusive of current day

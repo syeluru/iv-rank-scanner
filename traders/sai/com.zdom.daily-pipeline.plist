@@ -1,0 +1,98 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.zdom.daily-pipeline</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/saiyeluru/Documents/Projects/iv-rank-scanner/ml/zdom_v1_2/1_data_collection/scripts/v1_2/daily_production_pipeline.sh</string>
+        <string>--mode</string>
+        <string>refresh</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/saiyeluru/Documents/Projects/iv-rank-scanner</string>
+
+    <!--
+        Schedule: weekdays only at two times (ET -> UTC)
+        4:30 PM ET = 21:30 UTC  (post-market refresh)
+        9:00 AM ET = 14:00 UTC  (pre-market validation)
+
+        Note: During EDT (Mar-Nov) these fire 1hr early in local time.
+        Adjust Hour values seasonally or use a wrapper if precision matters.
+
+        Weekday = 1 (Mon) through 5 (Fri)
+    -->
+    <key>StartCalendarInterval</key>
+    <array>
+        <!-- 4:30 PM ET (21:30 UTC) Mon-Fri -->
+        <dict>
+            <key>Weekday</key> <integer>1</integer>
+            <key>Hour</key>    <integer>21</integer>
+            <key>Minute</key>  <integer>30</integer>
+        </dict>
+        <dict>
+            <key>Weekday</key> <integer>2</integer>
+            <key>Hour</key>    <integer>21</integer>
+            <key>Minute</key>  <integer>30</integer>
+        </dict>
+        <dict>
+            <key>Weekday</key> <integer>3</integer>
+            <key>Hour</key>    <integer>21</integer>
+            <key>Minute</key>  <integer>30</integer>
+        </dict>
+        <dict>
+            <key>Weekday</key> <integer>4</integer>
+            <key>Hour</key>    <integer>21</integer>
+            <key>Minute</key>  <integer>30</integer>
+        </dict>
+        <dict>
+            <key>Weekday</key> <integer>5</integer>
+            <key>Hour</key>    <integer>21</integer>
+            <key>Minute</key>  <integer>30</integer>
+        </dict>
+        <!-- 9:00 AM ET (14:00 UTC) Mon-Fri -->
+        <dict>
+            <key>Weekday</key> <integer>1</integer>
+            <key>Hour</key>    <integer>14</integer>
+            <key>Minute</key>  <integer>0</integer>
+        </dict>
+        <dict>
+            <key>Weekday</key> <integer>2</integer>
+            <key>Hour</key>    <integer>14</integer>
+            <key>Minute</key>  <integer>0</integer>
+        </dict>
+        <dict>
+            <key>Weekday</key> <integer>3</integer>
+            <key>Hour</key>    <integer>14</integer>
+            <key>Minute</key>  <integer>0</integer>
+        </dict>
+        <dict>
+            <key>Weekday</key> <integer>4</integer>
+            <key>Hour</key>    <integer>14</integer>
+            <key>Minute</key>  <integer>0</integer>
+        </dict>
+        <dict>
+            <key>Weekday</key> <integer>5</integer>
+            <key>Hour</key>    <integer>14</integer>
+            <key>Minute</key>  <integer>0</integer>
+        </dict>
+    </array>
+
+    <key>StandardOutPath</key>
+    <string>/Users/saiyeluru/logs/zdom_daily_pipeline.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/saiyeluru/logs/zdom_daily_pipeline.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/saiyeluru/Documents/Projects/iv-rank-scanner/venv/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+</dict>
+</plist>
