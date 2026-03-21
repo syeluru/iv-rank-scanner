@@ -189,6 +189,10 @@ def extract_term_structure_iv(ts_day, spx_close, risk_free_rate=0.05):
             feats[f"ts_iv_{label}"] = np.nan
         return feats
 
+    # Normalize right column to lowercase (ThetaData may return CALL/PUT)
+    ts_day = ts_day.copy()
+    ts_day["right"] = ts_day["right"].str.lower()
+
     for target_dte, label in [(7, "7dte"), (14, "14dte")]:
         bucket = ts_day[
             (ts_day["dte"] >= target_dte - 3) & (ts_day["dte"] <= target_dte + 3)
