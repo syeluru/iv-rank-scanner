@@ -27,11 +27,11 @@ MASTER_MAX_DATE = pd.Timestamp('2026-03-13')
 JOIN_SPECS = [
     ('spxw_0dte_oi_daily_v1_2.parquet', 'same_day'),
     ('spxw_term_structure_daily_v1_2.parquet', 't1'),
-    ('fred_daily_features_v1_2.parquet', 't2'),
+    ('fred_daily_features_v1_2.parquet', 't1'),
     ('cross_asset_daily_features_v1_2.parquet', 't1'),
     ('breadth_daily_features_v1_2.parquet', 't1'),
     ('vol_context_daily_features_v1_2.parquet', 't1'),
-    ('macro_regime_v1_2.parquet', 't2'),
+    ('macro_regime_v1_2.parquet', 't1'),
     ('presidential_cycles_v1_2.parquet', 'same_day'),
 ]
 
